@@ -98,8 +98,9 @@ impl StateDir {
     }
 
     /// Every valid persisted component, sorted by name. Skips (with a
-    /// warning) files that are unreadable, malformed or misnamed; a missing
-    /// directory holds none.
+    /// warning) directory entries and files that are unreadable, malformed
+    /// or misnamed; a missing directory holds none. Fails only if the
+    /// directory cannot be opened.
     pub fn load(&self) -> io::Result<Vec<Persisted>> {
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
@@ -108,7 +109,13 @@ impl StateDir {
         };
         let mut out = Vec::new();
         for entry in entries {
-            let path = entry?.path();
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(e) => {
+                    warn!(dir = %self.dir.display(), "skipping an unreadable entry: {e}");
+                    continue;
+                }
+            };
             let is_json = path.extension().is_some_and(|e| e == "json")
                 && !path
                     .file_name()

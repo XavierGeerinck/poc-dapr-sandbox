@@ -145,7 +145,9 @@ impl SandboxService {
             }
             match Config::from_properties(&p.properties) {
                 Ok(cfg) => {
-                    info!(component = %p.component, ?cfg, "restoring persisted component");
+                    // Not `?cfg`: `setup` may carry secrets.
+                    info!(component = %p.component, image = %cfg.image,
+                        warm_pool_size = cfg.warm_pool_size, "restoring persisted component");
                     self.replace_pool(&p.component, cfg);
                     started += 1;
                 }
@@ -338,7 +340,9 @@ impl Sandbox for SandboxService {
             .unwrap_or_default();
         let cfg =
             Config::from_properties(&props).map_err(|e| Status::invalid_argument(e.to_string()))?;
-        info!(component = %component, ?cfg, "init");
+        // Not `?cfg`: `setup` may carry secrets.
+        info!(component = %component, image = %cfg.image,
+            warm_pool_size = cfg.warm_pool_size, "init");
         let _init = self.inner.init.lock().unwrap_or_else(|e| e.into_inner());
         // A failure only costs restart recovery: log it, keep the pool.
         if let Some(state) = &self.inner.state

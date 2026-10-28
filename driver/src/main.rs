@@ -24,8 +24,8 @@ const MSB_HOME_ENV: &str = "DAPR_SANDBOX_MSB_HOME";
 const STATE_DIR_ENV: &str = "DAPR_SANDBOX_STATE_DIR";
 /// The driver's directory under the XDG state root.
 const APP_DIR: &str = "dapr-sandbox-microvm";
-/// A shorter one, for when `<state root>/APP_DIR/msb` is too long a
-/// microsandbox home (see [`resolve_paths`]).
+/// A shorter one, for the microsandbox home only, when
+/// `<state root>/APP_DIR/msb` is too long (see [`resolve_paths`]).
 const SHORT_APP_DIR: &str = "dsbm";
 /// How long in-flight calls may finish after a shutdown signal before the
 /// pools are torn down regardless.
@@ -52,9 +52,10 @@ usage: dapr-sandbox-microvm [--socket PATH] [--state-dir DIR] [--msb-home DIR]
   -h, --help         show this help
 
 <base> is $XDG_STATE_HOME/dapr-sandbox-microvm, else
-~/.local/state/dapr-sandbox-microvm; if <base>/msb is too long a microsandbox
-home, <base> is <state root>/dsbm instead. The ambient MSB_HOME is ignored: the
-driver sets it to its microsandbox home.
+~/.local/state/dapr-sandbox-microvm. If <base>/msb is too long a microsandbox
+home, the default home is <state root>/dsbm/msb instead (the state directory
+stays under <base>). The ambient MSB_HOME is ignored: the driver sets it to
+its microsandbox home. --selftest keeps no state.
 
 Logging: RUST_LOG (default: warn,dapr_sandbox_microvm=info; microsandbox logs
 every exec connection at info).";
@@ -118,71 +119,80 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
 /// Where the driver keeps its state.
 #[derive(Debug, PartialEq, Eq)]
 struct Paths {
-    state_dir: PathBuf,
+    /// `None` for `--selftest`, which keeps no state.
+    state_dir: Option<PathBuf>,
     /// `None` when no microsandbox home is needed (fake backend).
     msb_home: Option<PathBuf>,
 }
 
-/// Resolves the state directory and, if `msb_max_len` is set (the
-/// microsandbox backend), the microsandbox home: a flag, else its
-/// environment variable, else `<base>/components` and `<base>/msb`.
+/// Resolves the state directory (unless `--selftest`) and, if
+/// `msb_max_len` is set (the microsandbox backend), the microsandbox home:
+/// a flag, else its environment variable, else `<base>/components` and
+/// `<base>/msb`.
 ///
 /// `<base>` is `<state root>/dapr-sandbox-microvm`, where the state root is
 /// `$XDG_STATE_HOME` (if absolute) or `$HOME/.local/state`. microsandbox
 /// derives Unix socket paths from its home, so a default home longer than
-/// `msb_max_len` bytes switches `<base>` to `<state root>/dsbm`, keeping
-/// both under one base; if even that is too long, an explicit home is
-/// required. Relative paths are made absolute.
+/// `msb_max_len` bytes moves to `<state root>/dsbm/msb`; if even that is
+/// too long, an explicit home is required. The state directory has no such
+/// limit and never moves, so every backend uses the same one. Relative
+/// paths are made absolute.
 fn resolve_paths(
     args: &Args,
     env: impl Fn(&str) -> Option<OsString>,
     msb_max_len: Option<usize>,
 ) -> Result<Paths, String> {
     let nonempty = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    let explicit_state = args.state_dir.clone().or_else(|| nonempty(STATE_DIR_ENV));
-    let explicit_msb = args.msb_home.clone().or_else(|| nonempty(MSB_HOME_ENV));
-    let shorten = msb_max_len.filter(|_| explicit_msb.is_none());
-    let base = || -> Result<PathBuf, String> {
-        let root = nonempty("XDG_STATE_HOME")
+    let root = |explicit: &str| -> Result<PathBuf, String> {
+        nonempty("XDG_STATE_HOME")
             .filter(|p| p.is_absolute())
             .or_else(|| nonempty("HOME").map(|h| h.join(".local").join("state")))
             .ok_or_else(|| {
-                format!(
-                    "no state directory: set $HOME or $XDG_STATE_HOME, or --state-dir \
-                     ({STATE_DIR_ENV}) and --msb-home ({MSB_HOME_ENV})"
-                )
-            })?;
-        let long = root.join(APP_DIR);
-        let Some(max) = shorten else {
-            return Ok(long);
-        };
-        let short = root.join(SHORT_APP_DIR);
-        [long, short]
-            .into_iter()
-            .find(|b| b.join("msb").as_os_str().len() <= max)
-            .ok_or_else(|| {
-                format!(
-                    "the default microsandbox home {} is too long: microsandbox puts Unix \
-                     sockets under it, so it must be at most {max} bytes; set --msb-home \
-                     ({MSB_HOME_ENV}) to a shorter directory",
-                    root.join(APP_DIR).join("msb").display()
-                )
+                format!("{explicit}: there is no default without $HOME or $XDG_STATE_HOME")
             })
     };
     let absolute =
         |p: PathBuf| std::path::absolute(&p).map_err(|e| format!("{}: {e}", p.display()));
-    let state_dir = match explicit_state {
-        Some(dir) => dir,
-        None => base()?.join("components"),
+
+    let state_dir = if args.selftest.is_some() {
+        None
+    } else {
+        let dir = match args.state_dir.clone().or_else(|| nonempty(STATE_DIR_ENV)) {
+            Some(dir) => dir,
+            None => root(&format!("set --state-dir ({STATE_DIR_ENV})"))?
+                .join(APP_DIR)
+                .join("components"),
+        };
+        Some(absolute(dir)?)
     };
-    let msb_home = match (msb_max_len, explicit_msb) {
-        (None, _) => None,
-        (Some(_), Some(home)) => Some(home),
-        (Some(_), None) => Some(base()?.join("msb")),
+
+    let msb_home = match msb_max_len {
+        None => None,
+        Some(max) => {
+            let home = match args.msb_home.clone().or_else(|| nonempty(MSB_HOME_ENV)) {
+                Some(home) => home,
+                None => {
+                    let root = root(&format!("set --msb-home ({MSB_HOME_ENV})"))?;
+                    let long = root.join(APP_DIR).join("msb");
+                    [long.clone(), root.join(SHORT_APP_DIR).join("msb")]
+                        .into_iter()
+                        .find(|h| h.as_os_str().len() <= max)
+                        .ok_or_else(|| {
+                            format!(
+                                "the default microsandbox home {} is too long: microsandbox \
+                                 puts Unix sockets under it, so it must be at most {max} \
+                                 bytes; set --msb-home ({MSB_HOME_ENV}) to a shorter directory",
+                                long.display()
+                            )
+                        })?
+                }
+            };
+            Some(absolute(home)?)
+        }
     };
     Ok(Paths {
-        state_dir: absolute(state_dir)?,
-        msb_home: msb_home.map(absolute).transpose()?,
+        state_dir,
+        msb_home,
     })
 }
 
@@ -255,7 +265,7 @@ fn main() -> ExitCode {
 
     if let Some(image) = args.selftest {
         let home = paths.msb_home.expect("the microsandbox backend has a home");
-        return runtime.block_on(selftest::run(&image, home));
+        return runtime.block_on(selftest(&image, home));
     }
 
     let socket = args
@@ -307,7 +317,7 @@ async fn run(socket: &Path, kind: BackendKind, paths: Paths) -> Result<(), Serve
     // Connections wait in the backlog until the backend is up; pools fill
     // in the background after Init.
     let listener = bind(socket)?;
-    info!(socket = %socket.display(), state_dir = %paths.state_dir.display(),
+    info!(socket = %socket.display(), state_dir = ?paths.state_dir,
         msb_home = ?paths.msb_home, "starting");
     let backend = tokio::select! {
         b = backend(kind, &paths) => match b {
@@ -320,7 +330,11 @@ async fn run(socket: &Path, kind: BackendKind, paths: Paths) -> Result<(), Serve
         _ = sigterm.recv() => { info!("SIGTERM during startup"); return remove_socket(socket); }
         _ = sigint.recv() => { info!("SIGINT during startup"); return remove_socket(socket); }
     };
-    let service = SandboxService::with_state_dir(backend, PoolOptions::default(), &paths.state_dir);
+    let state_dir = paths
+        .state_dir
+        .clone()
+        .ok_or("serving needs a state directory")?;
+    let service = SandboxService::with_state_dir(backend, PoolOptions::default(), state_dir);
     // Before serving, so that no Init races it.
     let restored = service.restore_persisted();
     if restored > 0 {
@@ -410,172 +424,17 @@ fn bind(path: &Path) -> io::Result<UnixListener> {
 }
 
 #[cfg(feature = "microsandbox")]
-mod selftest {
-    //! `--selftest IMAGE`: one template, one restored VM, `echo ok`, timings.
-
-    use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::process::ExitCode;
-    use std::time::{Duration, Instant};
-
-    use dapr_sandbox_microvm::backend::{ExecSpec, VmBackend};
-    use dapr_sandbox_microvm::config::Config;
-    use dapr_sandbox_microvm::microsandbox_backend::MicrosandboxBackend;
-    use dapr_sandbox_microvm::pool::{template_name, vm_name, vm_prefix};
-
-    /// The component name the selftest's VMs and template derive from.
-    const COMPONENT: &str = "dapr-sandbox-microvm-selftest";
-    const RUNS: usize = 20;
-
-    fn ms(d: Duration) -> f64 {
-        d.as_secs_f64() * 1000.0
-    }
-
-    fn percentile(samples: &[Duration], p: f64) -> Duration {
-        let mut s = samples.to_vec();
-        s.sort();
-        let rank = ((p / 100.0) * s.len() as f64).ceil() as usize;
-        s[rank.clamp(1, s.len()) - 1]
-    }
-
-    fn echo_ok() -> ExecSpec {
-        ExecSpec {
-            command: "echo".into(),
-            args: vec!["ok".into()],
-            ..Default::default()
-        }
-    }
-
-    pub async fn run(image: &str, msb_home: PathBuf) -> ExitCode {
-        println!(
-            "selftest: image {image}, microsandbox home {}",
-            msb_home.display()
-        );
-        let start = Instant::now();
-        let b = match MicrosandboxBackend::new(msb_home).await {
-            Ok(b) => b,
-            Err(e) => {
-                println!("selftest: FAILED: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        println!("  backend init       {:9.1} ms", ms(start.elapsed()));
-        let template = template_name(COMPONENT);
-        let vm = vm_name(COMPONENT, 1);
-        let result = steps(&b, image, &template, &vm).await;
-        // Clean up whatever exists, also after a failure.
-        if let Ok(left) = b.list(&vm_prefix(COMPONENT)).await {
-            for name in left {
-                let _ = b.destroy(&name).await;
-            }
-        }
-        if let Err(e) = b.remove_template(&template).await {
-            println!("  (removing the template: {e})");
-        }
-        println!("  total              {:9.1} ms", ms(start.elapsed()));
-        match result {
-            Ok(()) => {
-                println!("selftest: ok");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                println!("selftest: FAILED: {e}");
-                ExitCode::FAILURE
-            }
-        }
-    }
-
-    async fn steps(
-        b: &MicrosandboxBackend,
-        image: &str,
-        template: &str,
-        vm: &str,
-    ) -> Result<(), String> {
-        // Leftovers of an interrupted selftest.
-        for name in b
-            .list(&vm_prefix(COMPONENT))
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            b.destroy(&name).await.map_err(|e| e.to_string())?;
-        }
-        let cfg = Config::from_properties(&HashMap::from([("image".into(), image.to_string())]))
-            .map_err(|e| e.to_string())?;
-
-        let t = Instant::now();
-        b.prepare_template(&cfg, template)
-            .await
-            .map_err(|e| format!("preparing the template: {e}"))?;
-        let prepare = t.elapsed();
-        match b.last_prepare_timings() {
-            Some(p) => println!(
-                "  template prepare   {:9.1} ms  (boot {:.1}, snapshot {:.1}, destroy {:.1} ms; \
-                 snapshot {} MiB)",
-                ms(prepare),
-                ms(p.boot),
-                ms(p.snapshot),
-                ms(p.destroy),
-                p.snapshot_bytes
-                    .map_or_else(|| "?".to_string(), |n| (n >> 20).to_string())
-            ),
-            None => println!("  template prepare   {:9.1} ms", ms(prepare)),
-        }
-
-        let t = Instant::now();
-        b.spawn(&cfg, vm, Some(template))
-            .await
-            .map_err(|e| format!("restoring a VM: {e}"))?;
-        println!("  restore (spawn)    {:9.1} ms", ms(t.elapsed()));
-
-        let t = Instant::now();
-        let r = b
-            .exec(vm, echo_ok())
-            .await
-            .map_err(|e| format!("exec: {e}"))?;
-        let first = t.elapsed();
-        if r.stdout != b"ok\n" || r.exit_code != 0 {
-            return Err(format!("exec echo ok: unexpected result {r:?}"));
-        }
-        println!(
-            "  first exec         {:9.1} ms  (stdout {:?})",
-            ms(first),
-            String::from_utf8_lossy(&r.stdout)
-        );
-
-        let mut samples = Vec::with_capacity(RUNS);
-        for _ in 0..RUNS {
-            let t = Instant::now();
-            let r = b
-                .exec(vm, echo_ok())
-                .await
-                .map_err(|e| format!("exec: {e}"))?;
-            samples.push(t.elapsed());
-            if r.stdout != b"ok\n" {
-                return Err(format!("exec echo ok: unexpected result {r:?}"));
-            }
-        }
-        println!(
-            "  exec echo ok x{RUNS}   p50 {:.2} ms, p90 {:.2} ms, max {:.2} ms",
-            ms(percentile(&samples, 50.0)),
-            ms(percentile(&samples, 90.0)),
-            ms(percentile(&samples, 100.0))
-        );
-
-        let t = Instant::now();
-        b.destroy(vm).await.map_err(|e| format!("destroy: {e}"))?;
-        println!("  destroy            {:9.1} ms", ms(t.elapsed()));
-        Ok(())
+async fn selftest(image: &str, msb_home: PathBuf) -> ExitCode {
+    if dapr_sandbox_microvm::selftest::run(image, msb_home).await {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
 #[cfg(not(feature = "microsandbox"))]
-mod selftest {
-    use std::path::PathBuf;
-    use std::process::ExitCode;
-
-    pub async fn run(_image: &str, _msb_home: PathBuf) -> ExitCode {
-        unreachable!("main rejects --selftest without the microsandbox backend")
-    }
+async fn selftest(_image: &str, _msb_home: PathBuf) -> ExitCode {
+    unreachable!("main rejects --selftest without the microsandbox backend")
 }
 
 #[cfg(test)]
@@ -624,7 +483,7 @@ mod tests {
 
     fn paths(state: &str, msb: Option<&str>) -> Paths {
         Paths {
-            state_dir: PathBuf::from(state),
+            state_dir: Some(PathBuf::from(state)),
             msb_home: msb.map(PathBuf::from),
         }
     }
@@ -657,23 +516,32 @@ mod tests {
         let rel = env(&[("HOME", "/home/u"), ("XDG_STATE_HOME", "st")]);
         assert_eq!(
             resolve_paths(&none, &rel, None).unwrap().state_dir,
-            PathBuf::from("/home/u/.local/state/dapr-sandbox-microvm/components")
+            Some(PathBuf::from(
+                "/home/u/.local/state/dapr-sandbox-microvm/components"
+            ))
         );
         // No HOME and no XDG_STATE_HOME: needs explicit paths.
-        assert!(resolve_paths(&none, env(&[]), None).is_err());
+        let e = resolve_paths(&none, env(&[]), None).unwrap_err();
+        assert!(e.contains("--state-dir"), "{e}");
+        let e = resolve_paths(&none, env(&[]), Some(51)).unwrap_err();
+        assert!(e.contains("--state-dir"), "{e}");
     }
 
     #[test]
     fn long_default_msb_home_falls_back_to_a_shorter_base() {
         let none = Args::default();
-        // As on the development Mac: <base>/msb is 59 bytes.
+        // As on the development Mac: <base>/msb is 59 bytes. Only the
+        // microsandbox home moves; the state dir has no length limit and
+        // stays where R16 puts it, whichever the backend.
         let home = env(&[("HOME", "/Users/xaviergeerinck")]);
+        let state = "/Users/xaviergeerinck/.local/state/dapr-sandbox-microvm/components";
         assert_eq!(
             resolve_paths(&none, &home, Some(51)).unwrap(),
-            paths(
-                "/Users/xaviergeerinck/.local/state/dsbm/components",
-                Some("/Users/xaviergeerinck/.local/state/dsbm/msb")
-            )
+            paths(state, Some("/Users/xaviergeerinck/.local/state/dsbm/msb"))
+        );
+        assert_eq!(
+            resolve_paths(&none, &home, None).unwrap(),
+            paths(state, None)
         );
         // Under a limit it fits, the long base stays.
         let p = resolve_paths(&none, &home, Some(59)).unwrap();
@@ -681,10 +549,11 @@ mod tests {
             p.msb_home.unwrap(),
             PathBuf::from("/Users/xaviergeerinck/.local/state/dapr-sandbox-microvm/msb")
         );
-        // Too long for either base.
+        // Too long for either base: only the microsandbox backend fails.
         let long = env(&[("HOME", "/home/a-very-long-user-name-for-the-test")]);
         let e = resolve_paths(&none, &long, Some(51)).unwrap_err();
         assert!(e.contains("--msb-home"), "{e}");
+        assert!(resolve_paths(&none, &long, None).is_ok());
         // An explicit home is not shortened; the state dir keeps the long base.
         let a = Args {
             msb_home: Some("/m".into()),
@@ -735,7 +604,48 @@ mod tests {
             ..Default::default()
         };
         let p = resolve_paths(&a, env(&[]), Some(51)).unwrap();
-        assert_eq!(p.state_dir, std::env::current_dir().unwrap().join("rel"));
+        assert_eq!(
+            p.state_dir,
+            Some(std::env::current_dir().unwrap().join("rel"))
+        );
+    }
+
+    #[test]
+    fn selftest_needs_no_state_dir() {
+        // The selftest keeps no state: no HOME is fine with a home given.
+        let a = Args {
+            selftest: Some("img".into()),
+            msb_home: Some("/m".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_paths(&a, env(&[]), Some(51)).unwrap(),
+            Paths {
+                state_dir: None,
+                msb_home: Some("/m".into())
+            }
+        );
+        // Without one, the error is about the microsandbox home.
+        let a = Args {
+            selftest: Some("img".into()),
+            ..Default::default()
+        };
+        let e = resolve_paths(&a, env(&[]), Some(51)).unwrap_err();
+        assert!(
+            e.contains("--msb-home") && !e.contains("--state-dir"),
+            "{e}"
+        );
+        // An explicit state dir is not even made absolute.
+        let a = Args {
+            selftest: Some("img".into()),
+            state_dir: Some("/s".into()),
+            msb_home: Some("/m".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_paths(&a, env(&[]), Some(51)).unwrap().state_dir,
+            None
+        );
     }
 
     #[test]

@@ -26,7 +26,9 @@ use dapr_sandbox_microvm::backend::{BackendError, ExecSpec, OUTPUT_CAP, VmBacken
 use dapr_sandbox_microvm::config::Config;
 use dapr_sandbox_microvm::microsandbox_backend::{MAX_MSB_HOME_LEN, MicrosandboxBackend};
 use dapr_sandbox_microvm::pool::{template_name, vm_name, vm_prefix};
+use dapr_sandbox_microvm::selftest::{ms, percentile};
 use dapr_sandbox_microvm::service::SandboxService;
+use sha2::Digest;
 
 const IMAGE: &str = "python:3.12-slim";
 
@@ -88,18 +90,6 @@ fn spec(command: &str, args: &[&str]) -> ExecSpec {
         args: args.iter().map(|a| a.to_string()).collect(),
         ..Default::default()
     }
-}
-
-fn ms(d: Duration) -> f64 {
-    d.as_secs_f64() * 1000.0
-}
-
-/// The `p`-th percentile (nearest rank) of `samples`.
-fn percentile(samples: &[Duration], p: f64) -> Duration {
-    let mut s = samples.to_vec();
-    s.sort();
-    let rank = ((p / 100.0) * s.len() as f64).ceil() as usize;
-    s[rank.clamp(1, s.len()) - 1]
 }
 
 /// RAM images realized for copy-on-write restores (see
@@ -259,6 +249,54 @@ async fn live_session_turn2() {
         .await
         .unwrap_err();
     assert!(matches!(e, BackendError::NotFound(_)), "{e:?}");
+    b.remove_template(&t).await.unwrap();
+}
+
+/// A send with timeout 0 and no `until`, as the service passes for
+/// `timeout_ms: 0`, writes all of a large input however long the guest
+/// takes to read it, and reports no timeout.
+#[tokio::test]
+#[ignore = "boots microVMs"]
+async fn live_session_large_input_zero_timeout() {
+    const LEN: usize = 4 << 20;
+    let _g = LOCK.lock().await;
+    let b = backend().await;
+    let c = cfg(&[]);
+    let t = prepare(&b, "live-input", &c).await;
+    let vm = vm_name("live-input", 1);
+    b.spawn(&c, &vm, Some(&t)).await.unwrap();
+
+    let input: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+    let script = format!("head -c {LEN} > /tmp/got");
+    let sid = b
+        .session_start(&vm, spec("sh", &["-c", &script]))
+        .await
+        .unwrap();
+    let start = Instant::now();
+    let r = b
+        .session_send(&vm, &sid, &input, b"", Duration::ZERO)
+        .await
+        .unwrap();
+    println!("{LEN} bytes, timeout 0: {:.1} ms", ms(start.elapsed()));
+    assert!(!r.timed_out, "timed_out with an empty until");
+
+    // `head` exits once it has read every byte.
+    let r = b
+        .session_send(&vm, &sid, b"", b"never", Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert!(!r.timed_out && r.exit_code == 0, "{r:?}");
+    let r = b.exec(&vm, spec("sha256sum", &["/tmp/got"])).await.unwrap();
+    let want: String = sha2::Sha256::digest(&input)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert!(
+        String::from_utf8_lossy(&r.stdout).starts_with(&want),
+        "{r:?}"
+    );
+    b.session_close(&vm, &sid).await.unwrap();
+    b.destroy(&vm).await.unwrap();
     b.remove_template(&t).await.unwrap();
 }
 

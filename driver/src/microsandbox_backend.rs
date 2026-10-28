@@ -43,7 +43,18 @@
 //! `exec` and `session_*` futures may be dropped at any await. A dropped
 //! `exec` sends SIGKILL to its command (and microsandbox's relay kills a
 //! client's sessions when its connection closes); a dropped session start
-//! kills the new process; a dropped send leaves the session usable.
+//! kills the new process; a dropped send leaves the session usable (a
+//! dropped send's input may arrive in part).
+//!
+//! # Shutdown
+//!
+//! A pool's shutdown waits at most its shutdown bound (20 s by default) for
+//! work in flight, but a `prepare_template` or `spawn` is bounded only by
+//! [`timeouts`] (minutes, for an image pull or `setup`). A SIGTERM during
+//! one can therefore leave the `<t>-tpl` VM or the new VM behind when the
+//! driver exits. Both carry the pool's VM prefix, so the next start's
+//! leftover reaping (`Pool::reap_leftovers`) destroys them, for every
+//! component that is restored from the state directory or initialised again.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -120,6 +131,16 @@ pub mod timeouts {
     /// After killing a command (timeout, session close), how long to wait
     /// for its exit status.
     pub const KILL_GRACE: Duration = Duration::from_secs(5);
+    /// Write one send's input to a session's stdin. microsandbox
+    /// flow-controls stdin, so a write lasts until the process has read
+    /// (almost) all of it; this bounds how long a process may stall reading.
+    /// It is independent of the send's own timeout, which bounds only the
+    /// wait for output, so even a send with timeout 0 writes all its input
+    /// (measured: 4 MiB in ~23 ms).
+    pub const WRITE: Duration = Duration::from_secs(60);
+    /// After a failed session write, how long to wait for the process's
+    /// exit status, to report the exit rather than an error.
+    pub const EXIT_SETTLE: Duration = Duration::from_millis(200);
     /// One page of the VM list, one status probe, the snapshot list.
     pub const QUERY: Duration = Duration::from_secs(30);
 }
@@ -1068,16 +1089,22 @@ impl VmBackend for MicrosandboxBackend {
         }
 
         if !input.is_empty() {
-            match tokio::time::timeout_at(deadline, s.stdin.write(input)).await {
-                Err(_) => return Ok(result(true)),
+            // Bounded by WRITE, not by `deadline`: the send's timeout is for
+            // its output, and a write cut short would deliver only a prefix.
+            match tokio::time::timeout(WRITE, s.stdin.write(input)).await {
+                Err(_) => {
+                    return Err(BackendError::Internal(format!(
+                        "writing {} bytes to session {session:?}: the process did not read \
+                         them within {WRITE:?} (it may have received a prefix)",
+                        input.len()
+                    )));
+                }
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     // A process that exited cannot take input: report the
                     // exit, as the process driver does.
-                    let settle =
-                        deadline.min(tokio::time::Instant::now() + Duration::from_millis(200));
-                    let _ = tokio::time::timeout_at(
-                        settle,
+                    let _ = tokio::time::timeout(
+                        EXIT_SETTLE,
                         s.out.wait_for(|c| c.exit.is_some() || c.ended),
                     )
                     .await;

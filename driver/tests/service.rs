@@ -841,6 +841,7 @@ fn wait_exit(child: &mut std::process::Child) -> std::process::ExitStatus {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn binary_serves_and_exits_on_sigterm() {
+    const SECRET: &str = "s3cr3t-token-in-setup";
     let dir = temp_dir();
     let path: PathBuf = dir.path().join("microvm.sock");
     // A stale socket file from a previous run.
@@ -867,11 +868,13 @@ async fn binary_serves_and_exits_on_sigterm() {
         "{services:?}"
     );
 
-    // The fake backend serves a component end to end.
+    // The fake backend serves a component end to end. `setup` may carry
+    // secrets, so no log line shows it.
     let mut client = SandboxClient::new(channel);
     let properties = HashMap::from([
         ("image".to_string(), "img".to_string()),
         ("warmPoolSize".to_string(), "1".to_string()),
+        ("setup".to_string(), format!("echo {SECRET}")),
     ]);
     let init = SandboxInitRequest {
         metadata: Some(MetadataRequest { properties }),
@@ -918,6 +921,8 @@ async fn binary_serves_and_exits_on_sigterm() {
     assert!(!path.exists(), "socket left behind");
     assert!(stderr.contains("SIGTERM"), "{stderr}");
     assert!(stderr.contains("FakeBackend"), "{stderr}");
+    assert!(stderr.contains("init"), "{stderr}");
+    assert!(!stderr.contains(SECRET), "{stderr}");
 
     // Init persisted the component: a restarted driver serves it at once,
     // without an Init.
@@ -954,6 +959,7 @@ async fn binary_serves_and_exits_on_sigterm() {
     std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
     assert!(status.success(), "{status:?}\n{stderr}");
     assert!(stderr.contains("restored persisted components"), "{stderr}");
+    assert!(!stderr.contains(SECRET), "{stderr}");
 }
 
 #[test]

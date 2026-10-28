@@ -13,6 +13,8 @@ pub mod config;
 pub mod microsandbox_backend;
 pub mod persist;
 pub mod pool;
+#[cfg(feature = "microsandbox")]
+pub mod selftest;
 pub mod service;
 
 /// Generated code for `dapr.proto.components.v1` (Sandbox service and its
