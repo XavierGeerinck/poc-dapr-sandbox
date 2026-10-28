@@ -100,3 +100,52 @@ Each run takes 10 samples per path in one VM.
   - a real session protocol, rather than one FIFO pair shared by all callers;
   - an explanation of the 25 ms mode before anyone claims the saving.
 - As the spec requires, the PoC still only claims a warm disk and page cache.
+
+## Task 14: self-hosted benchmark
+
+Machine: Mac16,7, Apple M4 Pro, 51539607552 bytes RAM (48 GiB), 14 CPUs. macOS 27.0.1 (build 26A434).
+
+Versions: repo HEAD e2032d9; upstream/dapr b83c44a32; microsandbox 0.7.11; image python:3.12-slim; rustc 1.94.0 (4a4ef493e 2026-03-02); go1.26.10 darwin/arm64 (GOTOOLCHAIN=go1.26.10).
+
+Commands, in order (each run preceded by sleep 10; `B=bench/target/release/sandbox-bench`, `R=results/mac/raw`):
+```
+demo/run-selfhosted.sh up; sleep 15
+$B run --path a --component py-fast --count 500 --out $R/path-a-seq.csv
+$B run --path b --component py-fast --count 500 --out $R/path-b-seq.csv
+$B run --path c --component py-restore --count 500 --out $R/path-c-seq.csv
+$B run --path d --component py-boot --count 500 --out $R/path-d-seq.csv
+$B run --path a --component py-fast --workload python --count 200 --out $R/path-a-python-seq.csv
+$B run --path a --component py-fast --workload session-import --count 200 --out $R/path-a-session-import-seq.csv
+$B run --path a --component py-fast --mode rate --rate 20 --duration 60 --host-pods 1 --out $R/path-a-rate20.csv
+$B sweep --component py-fast --rates 10,20,40,80,160 --duration 30 --host-pods 1 --out-dir $R
+$B report --in results/mac/raw --out results/mac
+demo/run-selfhosted.sh down
+```
+
+(A first attempt using `cargo run` in a shell variable failed to launch, so no run happened; the runs above used the built binary.)
+
+Gate line: `GATE PASS (sequential n=500 p99=41.25ms err=0.0% nonpool=0.0%; rate20 n=1800 p99=42.41ms err=0.0% nonpool=0.0% late=0.0%)`. The report also printed: WARNING: 46.6% of path (a) echo rows (2623 of 5627) have acquire_path != POOL; they are excluded from the gate.
+
+Breakdown (ms, p50 / p99, nearest-rank, status-200 rows only for timings; error % counts non-200 rows of all rows; late % = late ticks / expected):
+
+| run | n | status 200 | total p50/p99 | host p50/p99 | activate p50/p99 | exec p50/p99 | client p50/p99 | non-POOL % (200 rows) | error % | late % |
+|---|---|---|---|---|---|---|---|---|---|---|
+| a seq | 500 | 500 | 34.1 / 41.2 | 34.0 / 41.2 | 0.1 / 1.4 | 33.8 / 41.0 | 34.3 / 41.5 | 0.0 | 0.0 | - |
+| b seq | 500 | 500 | 0.8 / 22.0 | 0.8 / 22.0 | 0.0 / 0.0 | 0.8 / 22.0 | 0.9 / 22.2 | - | 0.0 | - |
+| c seq | 500 | 500 | 93.1 / 111.7 | 93.1 / 111.7 | 63.6 / 80.7 | 29.3 / 38.2 | 93.4 / 112.0 | - | 0.0 | - |
+| d seq | 500 | 500 | 187.6 / 209.7 | 187.6 / 209.7 | 154.4 / 175.3 | 34.0 / 37.8 | 187.9 / 210.0 | - | 0.0 | - |
+| a python seq | 200 | 200 | 42.5 / 48.8 | 42.4 / 48.7 | 0.1 / 1.2 | 42.2 / 48.7 | 42.7 / 49.0 | 0.0 | 0.0 | - |
+| a session-import seq | 200 | 200 | 40.4 / 60.7 | 40.4 / 60.6 | 0.0 / 0.0 | 40.4 / 60.6 | 40.7 / 61.1 | n/a (acquire_path empty) | 0.0 | - |
+| a rate20 (60s) | 1200 | 1200 | 35.2 / 42.9 | 35.2 / 42.9 | 0.1 / 4.1 | 34.9 / 42.1 | 35.5 / 43.2 | 0.0 | 0.0 | 0.0 |
+| sweep 10/s | 300 | 300 | 34.7 / 41.9 | 34.6 / 41.8 | 0.1 / 0.3 | 34.5 / 41.7 | 35.0 / 42.2 | 0.0 | 0.0 | 0.0 |
+| sweep 20/s | 600 | 600 | 34.8 / 41.3 | 34.8 / 41.2 | 0.1 / 3.4 | 34.6 / 41.1 | 35.1 / 41.6 | 0.0 | 0.0 | 0.0 |
+| sweep 40/s | 1200 | 999 | 1005.0 / 1177.3 | 1005.0 / 1177.2 | 968.1 / 1142.4 | 35.3 / 61.2 | 1005.4 / 1177.6 | 84.7 | 16.8 | 0.0 |
+| sweep 80/s | 2400 | 1001 | 1038.5 / 1549.5 | 1038.4 / 1549.4 | 1002.5 / 1516.2 | 35.3 / 70.9 | 1038.9 / 1549.7 | 87.5 | 58.3 | 0.2 |
+| sweep 160/s | 4800 | 1027 | 1055.3 / 1247.0 | 1055.3 / 1247.0 | 1018.3 / 1210.6 | 34.9 / 61.3 | 1055.5 / 1247.3 | 87.7 | 78.6 | 2.0 |
+
+Notes on the table: in session-import rows the acquire_path column is empty in the CSV, so non-POOL % is not computable for that run. In sweep 40/80/160 the non-200 rows are status 429 (no acquire_path); the 200 rows there are mostly RESTORE.
+
+Facts:
+1. Path a p99 total is 41.2 ms (sequential n=500) against 100 ms; 42.9 ms in the 60 s rate-20 run.
+2. Path a exec_us p50/p99 is 33.8 / 41.0 ms; path b exec_us p50/p99 is 0.8 / 22.0 ms; difference 33.0 ms at p50 and 19.0 ms at p99. Path a exec_us is 33.8 of 34.1 ms total at p50.
+3. The highest sweep rate with path a rows at least 99% POOL and at most 1% errors is 20/s (10/s and 20/s: 100% POOL, 0% errors; 40/s: 84.7% non-POOL of 200 rows, 16.8% errors).
