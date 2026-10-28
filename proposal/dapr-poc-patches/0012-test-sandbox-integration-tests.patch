@@ -1,7 +1,7 @@
 From 41cbccbb86bd42be0a4a8b6f32b9f732aacc3757 Mon Sep 17 00:00:00 2001
 From: Xavier Geerinck <xavier.geerinck@gmail.com>
 Date: Wed, 28 Oct 2026 21:03:21 +0100
-Subject: [PATCH 12/12] test(sandbox): integration tests
+Subject: [PATCH 12/13] test(sandbox): integration tests
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

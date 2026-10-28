@@ -1,7 +1,7 @@
 From e432520cf7e413b481b9e056e78fe385a8afff6c Mon Sep 17 00:00:00 2001
 From: Xavier Geerinck <xavier.geerinck@gmail.com>
 Date: Wed, 28 Oct 2026 20:13:30 +0100
-Subject: [PATCH 05/12] feat(sandbox): internal actor target backed by sandbox
+Subject: [PATCH 05/13] feat(sandbox): internal actor target backed by sandbox
  drivers
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

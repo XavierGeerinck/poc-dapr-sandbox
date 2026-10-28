@@ -1,7 +1,7 @@
 From 978458d32b91aeda3543f1de9f3e935cadaf8e59 Mon Sep 17 00:00:00 2001
 From: Xavier Geerinck <xavier.geerinck@gmail.com>
 Date: Wed, 28 Oct 2026 19:56:22 +0100
-Subject: [PATCH 04/12] fix(sandbox): per-send session output cap and lifecycle
+Subject: [PATCH 04/13] fix(sandbox): per-send session output cap and lifecycle
  tests
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

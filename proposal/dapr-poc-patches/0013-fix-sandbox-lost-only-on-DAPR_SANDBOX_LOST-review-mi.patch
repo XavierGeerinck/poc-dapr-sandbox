@@ -1,0 +1,263 @@
+From b83c44a329705bf24f15368e03ca60ea18823d0c Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Wed, 28 Oct 2026 21:10:27 +0100
+Subject: [PATCH 13/13] fix(sandbox): lost only on DAPR_SANDBOX_LOST; review
+ minors
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/actors/targets/sandbox/sandbox_test.go    | 68 +++++++++++++++++++
+ pkg/api/universal/sandbox.go                  | 12 +++-
+ pkg/api/universal/sandbox_test.go             | 31 ++++++---
+ .../suite/daprd/sandbox/crossapp.go           | 25 +++++++
+ .../suite/daprd/sandbox/process.go            |  3 +-
+ 5 files changed, 127 insertions(+), 12 deletions(-)
+
+diff --git a/pkg/actors/targets/sandbox/sandbox_test.go b/pkg/actors/targets/sandbox/sandbox_test.go
+index dcf34a4ce..ac548b7dc 100644
+--- a/pkg/actors/targets/sandbox/sandbox_test.go
++++ b/pkg/actors/targets/sandbox/sandbox_test.go
+@@ -58,6 +58,10 @@ type fakeDriver struct {
+ 	execErr      error
+ 	// sessionStartErr, when set, is returned by SessionStart.
+ 	sessionStartErr error
++	// sessionSendErr and sessionCloseErr, when set, are returned by
++	// SessionSend and SessionClose.
++	sessionSendErr  error
++	sessionCloseErr error
+ 	// acquireStarted and acquireBlock, when set, make Acquire signal that it
+ 	// started and wait until acquireBlock is closed.
+ 	acquireStarted chan struct{}
+@@ -150,6 +154,9 @@ func (d *fakeDriver) SessionSend(ctx context.Context, req *compv1pb.SandboxSessi
+ 	if d.execDelay > 0 {
+ 		time.Sleep(d.execDelay)
+ 	}
++	if d.sessionSendErr != nil {
++		return nil, d.sessionSendErr
++	}
+ 	return &compv1pb.SandboxExecResponse{Stdout: append([]byte("echo:"), req.GetInput()...), TimedOut: true}, nil
+ }
+ 
+@@ -157,6 +164,9 @@ func (d *fakeDriver) SessionClose(ctx context.Context, req *compv1pb.SandboxSess
+ 	d.lock.Lock()
+ 	d.closes = append(d.closes, req)
+ 	d.lock.Unlock()
++	if d.sessionCloseErr != nil {
++		return nil, d.sessionCloseErr
++	}
+ 	return &compv1pb.SandboxSessionCloseResponse{}, nil
+ }
+ 
+@@ -440,6 +450,64 @@ func TestDriverUnavailableIsLost(t *testing.T) {
+ 	})
+ }
+ 
++func TestAcquireUnavailableIsNotLost(t *testing.T) {
++	for _, method := range []string{MethodExec, MethodActivate, MethodSessionStart} {
++		t.Run(method, func(t *testing.T) {
++			d := &fakeDriver{acquireErr: status.Error(codes.Unavailable, "connection refused")}
++			f := newFactory(t, d)
++
++			var in proto.Message
++			switch method {
++			case MethodExec:
++				in = &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"}
++			case MethodActivate:
++				in = &runtimev1pb.SandboxCreateRequestAlpha1{}
++			case MethodSessionStart:
++				in = &runtimev1pb.SandboxSessionStartRequestAlpha1{Command: "sh"}
++			}
++			_, err := invoke(t, f, "sb1", method, in)
++			require.Error(t, err)
++			// Nothing was acquired, so nothing was lost: the driver error
++			// keeps its code.
++			assert.Equal(t, codes.Unavailable, status.Code(err))
++			assert.False(t, IsSandboxLost(err))
++			assert.False(t, f.Exists("sb1"))
++			assert.Equal(t, 0, f.Len())
++			assert.Empty(t, f.LiveInstanceIDs())
++			assert.Equal(t, int32(0), d.execCount.Load())
++			assert.Equal(t, int32(0), d.releaseStarted.Load())
++		})
++	}
++}
++
++func TestSessionSendCloseUnavailablePassThrough(t *testing.T) {
++	d := &fakeDriver{}
++	f := newFactory(t, d)
++
++	_, err := invoke(t, f, "sb1", MethodSessionStart, &runtimev1pb.SandboxSessionStartRequestAlpha1{Command: "sh"})
++	require.NoError(t, err)
++
++	// R6: session send and close do not detect a lost sandbox; the driver
++	// error passes through and the sandbox stays.
++	d.sessionSendErr = status.Error(codes.Unavailable, "connection refused")
++	d.sessionCloseErr = status.Error(codes.Unavailable, "connection refused")
++
++	_, err = invoke(t, f, "sb1", MethodSessionSend, &runtimev1pb.SandboxSessionSendRequestAlpha1{SessionId: "sess-1", Input: []byte("x\n")})
++	require.Error(t, err)
++	assert.Equal(t, codes.Unavailable, status.Code(err))
++	assert.False(t, IsSandboxLost(err))
++	assert.True(t, f.Exists("sb1"))
++
++	_, err = invoke(t, f, "sb1", MethodSessionClose, &runtimev1pb.SandboxSessionCloseRequestAlpha1{SessionId: "sess-1"})
++	require.Error(t, err)
++	assert.Equal(t, codes.Unavailable, status.Code(err))
++	assert.False(t, IsSandboxLost(err))
++	assert.True(t, f.Exists("sb1"))
++
++	assert.Equal(t, []string{"inst-1"}, f.LiveInstanceIDs())
++	assert.Equal(t, int32(0), d.releaseStarted.Load())
++}
++
+ func TestDeactivateDoesNotBlock(t *testing.T) {
+ 	block := make(chan struct{})
+ 	t.Cleanup(func() { close(block) })
+diff --git a/pkg/api/universal/sandbox.go b/pkg/api/universal/sandbox.go
+index c0f0bc3e2..8baed677d 100644
+--- a/pkg/api/universal/sandbox.go
++++ b/pkg/api/universal/sandbox.go
+@@ -119,7 +119,7 @@ func (a *Universal) sandboxNotHostedYet(actorType string) bool {
+ 	return !tbl.IsActorTypeHosted(actorType)
+ }
+ 
+-// mapSandboxError maps the gRPC status code of a router error to an API error.
++// mapSandboxError maps the gRPC status of a router error to an API error.
+ func (a *Universal) mapSandboxError(err error) error {
+ 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+ 		if _, ok := status.FromError(err); !ok {
+@@ -134,7 +134,15 @@ func (a *Universal) mapSandboxError(err error) error {
+ 	}
+ 	switch st.Code() {
+ 	case codes.FailedPrecondition:
+-		return messages.ErrSandboxLost
++		// Only the sandbox actor's own error means the sandbox was lost. Any
++		// other FailedPrecondition, such as placement finding no host for
++		// the actor type yet (the hosting app's driver is not ready, or the
++		// app is down), means retry later.
++		if sandboxtarget.IsSandboxLost(err) {
++			return messages.ErrSandboxLost
++		}
++		a.logger.Debugf("sandbox not available yet: %s", st.Message())
++		return messages.ErrSandboxHostFull
+ 	case codes.ResourceExhausted:
+ 		return messages.ErrSandboxHostFull
+ 	case codes.InvalidArgument, codes.NotFound:
+diff --git a/pkg/api/universal/sandbox_test.go b/pkg/api/universal/sandbox_test.go
+index 8ccae6569..307b17e28 100644
+--- a/pkg/api/universal/sandbox_test.go
++++ b/pkg/api/universal/sandbox_test.go
+@@ -37,6 +37,7 @@ import (
+ 	routerfake "github.com/dapr/dapr/pkg/actors/router/fake"
+ 	"github.com/dapr/dapr/pkg/actors/table"
+ 	tablefake "github.com/dapr/dapr/pkg/actors/table/fake"
++	sandboxtarget "github.com/dapr/dapr/pkg/actors/targets/sandbox"
+ 	"github.com/dapr/dapr/pkg/components/sandbox"
+ 	"github.com/dapr/dapr/pkg/messages"
+ 	commonv1 "github.com/dapr/dapr/pkg/proto/common/v1"
+@@ -174,20 +175,23 @@ func TestSandboxCreateGivesUp(t *testing.T) {
+ 
+ func TestSandboxErrorMapping(t *testing.T) {
+ 	tests := map[string]struct {
+-		code codes.Code
++		err  error
+ 		want error
+ 	}{
+-		"lost":     {codes.FailedPrecondition, messages.ErrSandboxLost},
+-		"full":     {codes.ResourceExhausted, messages.ErrSandboxHostFull},
+-		"invalid":  {codes.InvalidArgument, messages.ErrSandboxInvalidRequest},
+-		"notfound": {codes.NotFound, messages.ErrSandboxInvalidRequest},
+-		"internal": {codes.Internal, messages.ErrSandboxExec},
+-		"unknown":  {codes.Unavailable, messages.ErrSandboxExec},
++		"lost":            {sandboxtarget.ErrSandboxLost(), messages.ErrSandboxLost},
++		"lost via router": {fmt.Errorf("failed to call actor: %w", sandboxtarget.ErrSandboxLost()), messages.ErrSandboxLost},
++		// Placement's "no host for this actor type yet", for example.
++		"precondition without lost info": {status.Error(codes.FailedPrecondition, "did not find address"), messages.ErrSandboxHostFull},
++		"full":                           {status.Error(codes.ResourceExhausted, "boom"), messages.ErrSandboxHostFull},
++		"invalid":                        {status.Error(codes.InvalidArgument, "boom"), messages.ErrSandboxInvalidRequest},
++		"notfound":                       {status.Error(codes.NotFound, "boom"), messages.ErrSandboxInvalidRequest},
++		"internal":                       {status.Error(codes.Internal, "boom"), messages.ErrSandboxExec},
++		"unknown":                        {status.Error(codes.Unavailable, "boom"), messages.ErrSandboxExec},
+ 	}
+ 	for name, tc := range tests {
+ 		t.Run(name, func(t *testing.T) {
+ 			u, rec := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
+-				return nil, status.Error(tc.code, "boom")
++				return nil, tc.err
+ 			})
+ 			_, err := u.SandboxExecAlpha1(t.Context(), &runtimev1pb.SandboxExecRequestAlpha1{Component: "py", SandboxId: "sb", Command: "x"})
+ 			require.ErrorIs(t, err, tc.want)
+@@ -239,10 +243,19 @@ func TestSandboxRequestReachesActor(t *testing.T) {
+ 
+ func TestSandboxLostMapsToSandboxLost(t *testing.T) {
+ 	u, _ := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
+-		return nil, status.Error(codes.FailedPrecondition, "")
++		return nil, sandboxtarget.ErrSandboxLost()
+ 	})
+ 	_, err := u.SandboxExecAlpha1(t.Context(), &runtimev1pb.SandboxExecRequestAlpha1{Component: "py", SandboxId: "sb", Command: "x"})
+ 	require.ErrorIs(t, err, messages.ErrSandboxLost)
++
++	t.Run("a FailedPrecondition without the lost reason is not lost", func(t *testing.T) {
++		u, _ := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
++			return nil, status.Error(codes.FailedPrecondition, "did not find address for actor")
++		})
++		_, err := u.SandboxExecAlpha1(t.Context(), &runtimev1pb.SandboxExecRequestAlpha1{Component: "py", SandboxId: "sb", Command: "x"})
++		require.ErrorIs(t, err, messages.ErrSandboxHostFull)
++		require.NotErrorIs(t, err, messages.ErrSandboxLost)
++	})
+ }
+ 
+ func TestSandboxValidation(t *testing.T) {
+diff --git a/tests/integration/suite/daprd/sandbox/crossapp.go b/tests/integration/suite/daprd/sandbox/crossapp.go
+index 187542bcd..b370399dd 100644
+--- a/tests/integration/suite/daprd/sandbox/crossapp.go
++++ b/tests/integration/suite/daprd/sandbox/crossapp.go
+@@ -152,6 +152,31 @@ func (c *crossapp) Run(t *testing.T, ctx context.Context) {
+ 		assert.Len(t, childPIDs(t, callerPID), callerBefore)
+ 	})
+ 
++	t.Run("a stale activation is lost across apps", func(t *testing.T) {
++		// The lost error's details survive the hop between the sidecars.
++		r := call(t, ctx, httpClient, http.MethodPost, sandboxURL(c.caller, "py", "sb-x", "exec"),
++			execBody{Command: "echo", Args: []string{"x"}, ExpectedActivation: "stale"}, viaPool...)
++		assert.Equal(t, http.StatusGone, r.status, r.String())
++		assert.Equal(t, "ERR_SANDBOX_LOST", r.errorCode())
++	})
++
++	t.Run("a sandbox type the pool app does not host is retry later", func(t *testing.T) {
++		// No sidecar hosts the actor type of component "nope" on the pool
++		// app, which placement sees the same way as a pool whose driver is
++		// not ready yet: the router retries the lookup for about 5 s and
++		// then fails with a FailedPrecondition that is not "sandbox lost".
++		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
++		defer cancel()
++		start := time.Now()
++		r := call(t, cctx, httpClient, http.MethodPost, sandboxURL(c.caller, "nope", "sb-x", "exec"),
++			execBody{Command: "echo", Args: []string{"hi"}}, viaPool...)
++		elapsed := time.Since(start)
++		t.Logf("exec on a type nobody hosts: %s after %s", r, elapsed)
++		assert.Less(t, elapsed, 10*time.Second)
++		assert.Equal(t, http.StatusTooManyRequests, r.status, r.String())
++		assert.Equal(t, "ERR_SANDBOX_HOST_FULL", r.errorCode())
++	})
++
+ 	t.Run("caller has no sandbox component of its own", func(t *testing.T) {
+ 		r := call(t, ctx, httpClient, http.MethodPost, sandboxURL(c.caller, "py", "sb-x", "exec"),
+ 			execBody{Command: "echo", Args: []string{"hi"}})
+diff --git a/tests/integration/suite/daprd/sandbox/process.go b/tests/integration/suite/daprd/sandbox/process.go
+index ef33b7b02..17d682458 100644
+--- a/tests/integration/suite/daprd/sandbox/process.go
++++ b/tests/integration/suite/daprd/sandbox/process.go
+@@ -164,7 +164,8 @@ func (p *process) Run(t *testing.T, ctx context.Context) {
+ 	})
+ 
+ 	t.Run("an unknown component fails fast", func(t *testing.T) {
+-		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
++		// The deadline is past the bound, so the bound is what is checked.
++		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+ 		defer cancel()
+ 		start := time.Now()
+ 		r := call(t, cctx, httpClient, http.MethodPost, sandboxURL(p.daprd, "nope", "sb-1", "exec"),
+-- 
+2.47.0
+

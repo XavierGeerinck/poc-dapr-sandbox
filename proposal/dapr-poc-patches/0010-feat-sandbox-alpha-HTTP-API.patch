@@ -1,7 +1,7 @@
 From 78cd2c0c61373c95402a79af5bf98678b6dff24e Mon Sep 17 00:00:00 2001
 From: Xavier Geerinck <xavier.geerinck@gmail.com>
 Date: Wed, 28 Oct 2026 20:48:03 +0100
-Subject: [PATCH 10/12] feat(sandbox): alpha HTTP API
+Subject: [PATCH 10/13] feat(sandbox): alpha HTTP API
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

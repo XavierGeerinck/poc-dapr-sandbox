@@ -1,7 +1,7 @@
 From 5b3e9ae9bb1d8cee30323ff48e737080b94bba1c Mon Sep 17 00:00:00 2001
 From: Xavier Geerinck <xavier.geerinck@gmail.com>
 Date: Wed, 28 Oct 2026 19:54:07 +0100
-Subject: [PATCH 03/12] feat(sandbox): built-in process driver for tests
+Subject: [PATCH 03/13] feat(sandbox): built-in process driver for tests
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

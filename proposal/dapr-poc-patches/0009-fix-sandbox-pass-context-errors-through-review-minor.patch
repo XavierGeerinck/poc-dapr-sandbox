@@ -1,7 +1,7 @@
 From c55bd148d3b21370d792802903bcc2f819bf1c87 Mon Sep 17 00:00:00 2001
 From: Xavier Geerinck <xavier.geerinck@gmail.com>
 Date: Wed, 28 Oct 2026 20:43:40 +0100
-Subject: [PATCH 09/12] fix(sandbox): pass context errors through; review
+Subject: [PATCH 09/13] fix(sandbox): pass context errors through; review
  minors
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
