@@ -1,0 +1,422 @@
+//! The `dapr.proto.components.v1.Sandbox` gRPC service.
+//!
+//! daprd sets the [`COMPONENT_HEADER`] to the component name on every call;
+//! the service keeps one [`Pool`] per component, which `Init` creates and
+//! starts. Status codes follow the contract and the Go process driver:
+//!
+//! | Situation | Code |
+//! |---|---|
+//! | unknown instance or session (also: component never initialized) | `NOT_FOUND` |
+//! | host at `maxSandboxesPerHost` | `RESOURCE_EXHAUSTED` |
+//! | bad metadata or exec spec | `INVALID_ARGUMENT` |
+//! | Acquire before `Init` or after shutdown | `UNAVAILABLE` |
+//! | backend failure | `INTERNAL` |
+//!
+//! `FAILED_PRECONDITION` is never used: daprd reserves it for "sandbox lost".
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+use tokio::net::UnixListener;
+use tokio_stream::wrappers::UnixListenerStream;
+use tokio_util::task::TaskTracker;
+use tonic::{Request, Response, Status};
+use tracing::{debug, info, warn};
+
+use crate::backend::{BackendError, ExecResult, ExecSpec, OUTPUT_CAP, VmBackend};
+use crate::config::Config;
+use crate::pool::{AcquirePath, Pool, PoolError, PoolOptions};
+use crate::proto::sandbox_server::{Sandbox, SandboxServer};
+use crate::proto::*;
+
+/// The request header daprd sets to the component name on every call.
+pub const COMPONENT_HEADER: &str = "x-component-instance";
+
+/// SessionSend timeout when `until` is set and `timeout_ms` is 0 (as in the
+/// Go process driver).
+pub const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Largest request the server decodes.
+pub const MAX_REQUEST_SIZE: usize = 64 << 20;
+
+/// How long [`SandboxService::shutdown`] waits for pools that `Init`
+/// replaced and is still shutting down.
+const REPLACED_POOLS_TIMEOUT: Duration = Duration::from_secs(20);
+
+impl From<BackendError> for Status {
+    fn from(e: BackendError) -> Self {
+        match e {
+            BackendError::NotFound(m) => Status::not_found(m),
+            BackendError::InvalidArgument(m) => Status::invalid_argument(m),
+            BackendError::Internal(m) => Status::internal(m),
+        }
+    }
+}
+
+impl From<PoolError> for Status {
+    fn from(e: PoolError) -> Self {
+        match e {
+            PoolError::HostFull { .. } => Status::resource_exhausted(e.to_string()),
+            PoolError::NotFound(_) => Status::not_found(e.to_string()),
+            PoolError::Closed => Status::unavailable(e.to_string()),
+            PoolError::Backend(b) => b.into(),
+        }
+    }
+}
+
+struct Inner {
+    backend: Arc<dyn VmBackend>,
+    opts: PoolOptions,
+    /// Never held across an await.
+    pools: RwLock<HashMap<String, Arc<Pool>>>,
+    /// Shutdowns of pools that a repeated `Init` replaced.
+    replaced: TaskTracker,
+}
+
+/// The Sandbox service: one [`Pool`] per component.
+#[derive(Clone)]
+pub struct SandboxService {
+    inner: Arc<Inner>,
+}
+
+impl SandboxService {
+    pub fn new(backend: Arc<dyn VmBackend>) -> Self {
+        Self::with_pool_options(backend, PoolOptions::default())
+    }
+
+    pub fn with_pool_options(backend: Arc<dyn VmBackend>, opts: PoolOptions) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                backend,
+                opts,
+                pools: RwLock::new(HashMap::new()),
+                replaced: TaskTracker::new(),
+            }),
+        }
+    }
+
+    /// The pool of a component, if `Init` created one.
+    pub fn pool(&self, component: &str) -> Option<Arc<Pool>> {
+        self.inner
+            .pools
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(component)
+            .cloned()
+    }
+
+    pub fn into_server(self) -> SandboxServer<Self> {
+        SandboxServer::new(self)
+    }
+
+    /// Shuts down every pool (destroying all VMs), concurrently, including
+    /// pools that a repeated `Init` replaced. Bounded by the pools'
+    /// `shutdown_timeout` (and [`REPLACED_POOLS_TIMEOUT`]).
+    pub async fn shutdown(&self) {
+        let pools: Vec<Arc<Pool>> = self
+            .inner
+            .pools
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, p)| p)
+            .collect();
+        let mut set = tokio::task::JoinSet::new();
+        for pool in pools {
+            set.spawn(async move { pool.shutdown().await });
+        }
+        let replaced = self.inner.replaced.clone();
+        replaced.close();
+        set.spawn(async move {
+            if tokio::time::timeout(REPLACED_POOLS_TIMEOUT, replaced.wait())
+                .await
+                .is_err()
+            {
+                warn!("replaced pools did not finish shutting down");
+            }
+        });
+        while set.join_next().await.is_some() {}
+    }
+
+    fn pool_for<T>(&self, req: &Request<T>) -> (String, Option<Arc<Pool>>) {
+        let component = component(req);
+        let pool = self.pool(&component);
+        (component, pool)
+    }
+
+    /// The pool of the caller's component holding `instance_id`, or
+    /// `NOT_FOUND`.
+    fn instance_pool<T>(&self, req: &Request<T>, instance_id: &str) -> Result<Arc<Pool>, Status> {
+        let (component, pool) = self.pool_for(req);
+        let pool = pool.ok_or_else(|| {
+            Status::not_found(format!(
+                "unknown instance {instance_id:?}: component {component:?} is not initialized"
+            ))
+        })?;
+        pool.check(instance_id)?;
+        Ok(pool)
+    }
+}
+
+/// The component name from the request header; empty if absent.
+fn component<T>(req: &Request<T>) -> String {
+    req.metadata()
+        .get(COMPONENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn exec_spec(spec: Option<SandboxExecSpec>) -> Result<ExecSpec, Status> {
+    let spec = spec.unwrap_or_default();
+    if spec.command.is_empty() {
+        return Err(Status::invalid_argument("command is required"));
+    }
+    Ok(ExecSpec {
+        command: spec.command,
+        args: spec.args,
+        env: spec.env,
+        cwd: spec.cwd,
+        stdin: spec.stdin,
+        timeout_ms: spec.timeout_ms,
+    })
+}
+
+fn micros(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Applies the contract to a backend result: the per-stream output cap, a
+/// non-zero exit on timeout, and an elapsed time.
+fn exec_response(mut r: ExecResult, measured: Duration) -> SandboxExecResponse {
+    r.enforce_cap(OUTPUT_CAP);
+    if r.timed_out && r.exit_code == 0 {
+        r.exit_code = -1;
+    }
+    SandboxExecResponse {
+        stdout: r.stdout,
+        stderr: r.stderr,
+        exit_code: r.exit_code,
+        truncated: r.truncated,
+        timed_out: r.timed_out,
+        elapsed_us: if r.elapsed_us > 0 {
+            r.elapsed_us
+        } else {
+            micros(measured)
+        },
+    }
+}
+
+/// An error from [`serve`].
+pub type ServeError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Serves `service` plus gRPC reflection (v1, and v1alpha, which daprd's
+/// pluggable component discovery uses) on `listener` until `shutdown`
+/// resolves.
+pub async fn serve<F>(
+    listener: UnixListener,
+    service: SandboxService,
+    shutdown: F,
+) -> Result<(), ServeError>
+where
+    F: std::future::Future<Output = ()> + Send,
+{
+    let reflection_v1 = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+        .build_v1()?;
+    let reflection_v1alpha = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+        .build_v1alpha()?;
+    // tonic's default 4 MiB decode limit must not be what rejects a large
+    // stdin or session input; daprd's own body limit applies first.
+    let sandbox = service
+        .into_server()
+        .max_decoding_message_size(MAX_REQUEST_SIZE);
+    tonic::transport::Server::builder()
+        .add_service(sandbox)
+        .add_service(reflection_v1)
+        .add_service(reflection_v1alpha)
+        .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
+        .await?;
+    Ok(())
+}
+
+#[tonic::async_trait]
+impl Sandbox for SandboxService {
+    /// Parses the metadata and creates and starts the component's pool. It
+    /// returns at once; the pool fills in the background and `Ready` reports
+    /// progress. A pool that already exists for the component (daprd
+    /// restarted) is shut down first.
+    async fn init(
+        &self,
+        req: Request<SandboxInitRequest>,
+    ) -> Result<Response<SandboxInitResponse>, Status> {
+        let component = component(&req);
+        let props = req
+            .into_inner()
+            .metadata
+            .map(|m| m.properties)
+            .unwrap_or_default();
+        let cfg =
+            Config::from_properties(&props).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        info!(component = %component, ?cfg, "init");
+
+        let pool = Pool::with_options(
+            &component,
+            cfg,
+            Arc::clone(&self.inner.backend),
+            self.inner.opts.clone(),
+        );
+        let old = self
+            .inner
+            .pools
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(component.clone(), Arc::clone(&pool));
+        match old {
+            // The old pool's VMs share the new pool's names: destroy them
+            // before the new pool lists leftovers and starts numbering.
+            Some(old) => {
+                info!(component = %component, "replacing the existing pool");
+                self.inner.replaced.spawn(async move {
+                    old.shutdown().await;
+                    pool.start();
+                });
+            }
+            None => pool.start(),
+        }
+        Ok(Response::new(SandboxInitResponse {}))
+    }
+
+    async fn features(
+        &self,
+        _req: Request<FeaturesRequest>,
+    ) -> Result<Response<FeaturesResponse>, Status> {
+        Ok(Response::new(FeaturesResponse { features: vec![] }))
+    }
+
+    async fn ping(&self, _req: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
+        Ok(Response::new(PingResponse {}))
+    }
+
+    async fn ready(
+        &self,
+        req: Request<SandboxReadyRequest>,
+    ) -> Result<Response<SandboxReadyResponse>, Status> {
+        let (component, pool) = self.pool_for(&req);
+        let (ready, reason) = match pool {
+            Some(pool) => pool.ready(),
+            None => (false, format!("component {component:?} is not initialized")),
+        };
+        Ok(Response::new(SandboxReadyResponse { ready, reason }))
+    }
+
+    async fn acquire(
+        &self,
+        req: Request<SandboxAcquireRequest>,
+    ) -> Result<Response<SandboxAcquireResponse>, Status> {
+        let (component, pool) = self.pool_for(&req);
+        let pool = pool.ok_or_else(|| {
+            Status::unavailable(format!("component {component:?} is not initialized"))
+        })?;
+        let r = req.into_inner();
+        let a = pool.acquire().await.inspect_err(
+            |e| debug!(component = %component, sandbox = %r.sandbox_id, "acquire failed: {e}"),
+        )?;
+        debug!(component = %component, sandbox = %r.sandbox_id, activation = %r.activation_id,
+            instance = %a.instance_id, path = ?a.path, elapsed_us = micros(a.elapsed), "acquired");
+        let path = match a.path {
+            AcquirePath::Pool => SandboxAcquirePath::Pool,
+            AcquirePath::Restore => SandboxAcquirePath::Restore,
+            AcquirePath::Boot => SandboxAcquirePath::Boot,
+        };
+        Ok(Response::new(SandboxAcquireResponse {
+            instance_id: a.instance_id,
+            path: path.into(),
+            elapsed_us: micros(a.elapsed),
+        }))
+    }
+
+    async fn exec(
+        &self,
+        req: Request<SandboxExecRequest>,
+    ) -> Result<Response<SandboxExecResponse>, Status> {
+        self.instance_pool(&req, &req.get_ref().instance_id)?;
+        let r = req.into_inner();
+        let spec = exec_spec(r.spec)?;
+        let start = Instant::now();
+        let res = self.inner.backend.exec(&r.instance_id, spec).await?;
+        Ok(Response::new(exec_response(res, start.elapsed())))
+    }
+
+    async fn session_start(
+        &self,
+        req: Request<SandboxSessionStartRequest>,
+    ) -> Result<Response<SandboxSessionStartResponse>, Status> {
+        self.instance_pool(&req, &req.get_ref().instance_id)?;
+        let r = req.into_inner();
+        let spec = exec_spec(r.spec)?;
+        let session_id = self
+            .inner
+            .backend
+            .session_start(&r.instance_id, spec)
+            .await?;
+        Ok(Response::new(SandboxSessionStartResponse { session_id }))
+    }
+
+    async fn session_send(
+        &self,
+        req: Request<SandboxSessionSendRequest>,
+    ) -> Result<Response<SandboxExecResponse>, Status> {
+        self.instance_pool(&req, &req.get_ref().instance_id)?;
+        let r = req.into_inner();
+        let timeout = if r.timeout_ms == 0 && !r.until.is_empty() {
+            DEFAULT_SEND_TIMEOUT
+        } else {
+            Duration::from_millis(r.timeout_ms.into())
+        };
+        let start = Instant::now();
+        let res = self
+            .inner
+            .backend
+            .session_send(&r.instance_id, &r.session_id, &r.input, &r.until, timeout)
+            .await?;
+        Ok(Response::new(exec_response(res, start.elapsed())))
+    }
+
+    async fn session_close(
+        &self,
+        req: Request<SandboxSessionCloseRequest>,
+    ) -> Result<Response<SandboxSessionCloseResponse>, Status> {
+        self.instance_pool(&req, &req.get_ref().instance_id)?;
+        let r = req.into_inner();
+        self.inner
+            .backend
+            .session_close(&r.instance_id, &r.session_id)
+            .await?;
+        Ok(Response::new(SandboxSessionCloseResponse {}))
+    }
+
+    /// Returns at once; the VM is destroyed in the background.
+    async fn release(
+        &self,
+        req: Request<SandboxReleaseRequest>,
+    ) -> Result<Response<SandboxReleaseResponse>, Status> {
+        let pool = self.instance_pool(&req, &req.get_ref().instance_id)?;
+        pool.release(&req.get_ref().instance_id)?;
+        Ok(Response::new(SandboxReleaseResponse {}))
+    }
+
+    async fn reconcile(
+        &self,
+        req: Request<SandboxReconcileRequest>,
+    ) -> Result<Response<SandboxReconcileResponse>, Status> {
+        let (_, pool) = self.pool_for(&req);
+        let released = match pool {
+            Some(pool) => pool.reconcile(&req.get_ref().live_instance_ids),
+            None => 0,
+        };
+        Ok(Response::new(SandboxReconcileResponse { released }))
+    }
+}
