@@ -1,0 +1,6 @@
+upstream/
+target/
+.kube/
+results/*/raw/*.csv.tmp
+demo/.run/
+demo/.pids
