@@ -1,0 +1,27 @@
+[package]
+name = "sandbox-bench"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Latency harness and gate report for the Dapr sandbox building block"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "sandbox_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sandbox-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+plotters = { version = "0.3.7", default-features = false, features = ["svg_backend", "line_series"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+uuid = { version = "1", features = ["v4"] }
