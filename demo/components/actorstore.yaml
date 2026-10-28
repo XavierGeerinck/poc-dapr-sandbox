@@ -1,0 +1,11 @@
+# Sandboxes are Dapr actors; the actor runtime needs a state store.
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: actorstore
+spec:
+  type: state.in-memory
+  version: v1
+  metadata:
+  - name: actorStateStore
+    value: "true"

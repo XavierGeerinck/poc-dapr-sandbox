@@ -1,0 +1,16 @@
+# Path (a): a warm pool of 8 VMs restored from a snapshot of python:3.12-slim.
+# An activation takes a VM that is already running (acquirePath POOL).
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: py-fast
+spec:
+  type: sandbox.microvm
+  version: v1
+  metadata:
+  - name: image
+    value: python:3.12-slim
+  - name: warmPoolSize
+    value: "8"
+  - name: refillConcurrency
+    value: "4"

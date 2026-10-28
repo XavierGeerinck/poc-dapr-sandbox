@@ -1,0 +1,16 @@
+# Path (d): no warm pool and no template; each activation boots a VM from
+# the image (acquirePath BOOT).
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: py-boot
+spec:
+  type: sandbox.microvm
+  version: v1
+  metadata:
+  - name: image
+    value: python:3.12-slim
+  - name: warmPoolSize
+    value: "0"
+  - name: template
+    value: none

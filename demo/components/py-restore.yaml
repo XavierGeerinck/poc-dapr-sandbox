@@ -1,0 +1,14 @@
+# Path (c): no warm pool; each activation restores a VM from the template
+# snapshot on demand (acquirePath RESTORE).
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: py-restore
+spec:
+  type: sandbox.microvm
+  version: v1
+  metadata:
+  - name: image
+    value: python:3.12-slim
+  - name: warmPoolSize
+    value: "0"
