@@ -4,9 +4,10 @@
 use crate::stats::percentile;
 use anyhow::{Context, Result, bail};
 use plotters::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const GATE_US: u64 = 100_000;
 pub const GATE_RATE: u64 = 20;
@@ -79,25 +80,106 @@ pub struct Report {
     pub warnings: Vec<String>,
 }
 
-pub fn read_dir(dir: &Path) -> Result<Vec<Row>> {
+/// The sidecar `run` writes next to each CSV (`<csv>.meta.json`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct Meta {
+    pub mode: String,
+    pub rate: u64,
+    pub host_pods: u64,
+    pub duration_s: u64,
+    pub expected: u64,
+    pub fired: u64,
+    pub late: u64,
+    pub max_late_ms: u64,
+    pub request_timeout_ms: u64,
+    /// Requests still in flight at the end that were aborted (status-0 rows).
+    pub aborted: u64,
+    /// Timing values that could not be decoded (counted as 0).
+    pub malformed_timing: u64,
+}
+
+pub fn meta_path(csv: &Path) -> PathBuf {
+    let mut p = csv.as_os_str().to_owned();
+    p.push(".meta.json");
+    PathBuf::from(p)
+}
+
+/// One CSV that was read.
+#[derive(Debug)]
+pub struct FileInfo {
+    pub name: String,
+    pub rows: usize,
+    /// Has rate-mode rows.
+    pub has_rate: bool,
+    /// Has path (a) echo rate=20 rate-mode rows (the gate's rate set).
+    pub gate_rate: bool,
+    pub meta: Option<Meta>,
+}
+
+pub struct Loaded {
+    pub rows: Vec<Row>,
+    pub files: Vec<FileInfo>,
+}
+
+pub fn load(dir: &Path) -> Result<Loaded> {
     let mut files: Vec<_> = std::fs::read_dir(dir)
         .with_context(|| format!("reading {}", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "csv"))
         .collect();
     files.sort();
-    let mut rows = Vec::new();
+    let mut out = Loaded {
+        rows: Vec::new(),
+        files: Vec::new(),
+    };
     for f in files {
         let text = std::fs::read_to_string(&f)?;
+        let before = out.rows.len();
         for (i, line) in text.lines().enumerate() {
             if i == 0 && line.starts_with("path,") || line.trim().is_empty() {
                 continue;
             }
-            rows.push(Row::parse(line).with_context(|| format!("{}:{}", f.display(), i + 1))?);
+            out.rows
+                .push(Row::parse(line).with_context(|| format!("{}:{}", f.display(), i + 1))?);
         }
+        let mine = &out.rows[before..];
+        let mp = meta_path(&f);
+        let meta = if mp.exists() {
+            let t = std::fs::read_to_string(&mp)?;
+            Some(serde_json::from_str(&t).with_context(|| format!("parsing {}", mp.display()))?)
+        } else {
+            None
+        };
+        out.files.push(FileInfo {
+            name: f
+                .file_name()
+                .map(|n| n.to_string_lossy().into())
+                .unwrap_or_default(),
+            rows: mine.len(),
+            has_rate: mine.iter().any(|r| r.mode == "rate"),
+            gate_rate: mine
+                .iter()
+                .any(|r| is_gate_set(r) && r.mode == "rate" && r.rate == GATE_RATE),
+            meta,
+        });
     }
-    Ok(rows)
+    Ok(out)
 }
+
+pub fn read_dir(dir: &Path) -> Result<Vec<Row>> {
+    Ok(load(dir)?.rows)
+}
+
+/// How the numbers are measured; printed in summary.md and `--help`.
+pub const MEASUREMENT_BASIS: &str = "\
+The gate metric is the server-side timing.totalUs, measured by the caller's daprd.
+client_us is the harness's wall clock around the HTTP request. It starts at the actual
+send time, not at the scheduled tick time, so client-side queueing (an overloaded
+harness) does not show up in either figure. It shows up only as late ticks, which is
+why the gate also fails on more than 1% late ticks in rate mode.
+A 200 response with timedOut=true is recorded as status 504; a transport error or
+request timeout is recorded as status 0. Both count as errors in the gate.";
 
 fn sorted(rows: &[&Row], f: impl Fn(&Row) -> u64) -> Vec<u64> {
     let mut v: Vec<u64> = rows.iter().map(|r| f(r)).collect();
@@ -109,52 +191,177 @@ fn ms(us: u64) -> String {
     format!("{:.2}", us as f64 / 1000.0)
 }
 
-fn is_gate_row(r: &Row) -> bool {
-    r.path == "a" && r.workload == "echo" && r.status == 200 && r.acquire_path == "POOL"
+fn is_gate_set(r: &Row) -> bool {
+    r.path == "a" && r.workload == "echo"
 }
 
-/// p99 of the gate rows selected by `sel`, or `None` if there are none.
-fn gate_p99(rows: &[Row], sel: impl Fn(&Row) -> bool) -> Option<(usize, u64)> {
-    let g: Vec<&Row> = rows.iter().filter(|r| is_gate_row(r) && sel(r)).collect();
-    if g.is_empty() {
-        return None;
+fn is_gate_row(r: &Row) -> bool {
+    is_gate_set(r) && r.status == 200 && r.acquire_path == "POOL"
+}
+
+pub const MIN_GATE_ROWS: usize = 100;
+
+/// One gate set (sequential, or rate=20).
+struct SetStats {
+    name: &'static str,
+    requests: usize,
+    errors: usize,
+    pool_ok: usize,
+    nonpool: usize,
+    p99: Option<u64>,
+}
+
+impl SetStats {
+    fn of(name: &'static str, rows: &[Row], sel: impl Fn(&Row) -> bool) -> SetStats {
+        let set: Vec<&Row> = rows.iter().filter(|r| is_gate_set(r) && sel(r)).collect();
+        let errors = set.iter().filter(|r| r.status != 200).count();
+        let pool: Vec<&Row> = set.iter().copied().filter(|r| is_gate_row(r)).collect();
+        let ok200 = set.len() - errors;
+        SetStats {
+            name,
+            requests: set.len(),
+            errors,
+            pool_ok: pool.len(),
+            nonpool: ok200 - pool.len(),
+            p99: (!pool.is_empty()).then(|| percentile(&sorted(&pool, |r| r.total_us), 99.0)),
+        }
     }
-    Some((g.len(), percentile(&sorted(&g, |r| r.total_us), 99.0)))
+
+    fn pct(a: usize, b: usize) -> f64 {
+        if b == 0 {
+            0.0
+        } else {
+            100.0 * a as f64 / b as f64
+        }
+    }
+
+    fn err_pct(&self) -> f64 {
+        Self::pct(self.errors, self.requests)
+    }
+
+    fn line(&self, late: Option<Option<f64>>) -> String {
+        if self.requests == 0 {
+            return format!("{} n=0", self.name);
+        }
+        let mut s = format!(
+            "{} n={} p99={}ms err={:.1}% nonpool={:.1}%",
+            self.name,
+            self.pool_ok,
+            self.p99.map_or("-".into(), ms),
+            self.err_pct(),
+            Self::pct(self.nonpool, self.requests - self.errors),
+        );
+        match late {
+            Some(Some(l)) => s.push_str(&format!(" late={l:.1}%")),
+            Some(None) => s.push_str(" late=unknown"),
+            None => {}
+        }
+        s
+    }
+
+    /// Reasons this set fails the gate.
+    fn reasons(&self, late: Option<f64>) -> Vec<String> {
+        let mut r = Vec::new();
+        if let Some(p) = self.p99
+            && p >= GATE_US
+        {
+            r.push(format!("{} p99 {}ms >= 100ms", self.name, ms(p)));
+        }
+        if self.errors * 100 > self.requests {
+            r.push(format!(
+                "{} err {:.1}% > 1% (non-200 incl. status 0)",
+                self.name,
+                self.err_pct()
+            ));
+        }
+        if self.pool_ok < MIN_GATE_ROWS {
+            r.push(format!(
+                "{} fewer than {MIN_GATE_ROWS} POOL rows ({})",
+                self.name, self.pool_ok
+            ));
+        }
+        if let Some(l) = late
+            && l > 1.0
+        {
+            r.push(format!("{} late {l:.1}% > 1%", self.name));
+        }
+        r
+    }
 }
 
 pub fn generate(in_dir: &Path, out_dir: &Path) -> Result<Report> {
-    let rows = read_dir(in_dir)?;
+    let loaded = load(in_dir)?;
+    let rows = loaded.rows;
     std::fs::create_dir_all(out_dir)?;
     let mut warnings = Vec::new();
 
-    // Gate.
-    let seq = gate_p99(&rows, |r| r.mode == "sequential");
-    let rate = gate_p99(&rows, |r| r.mode == "rate" && r.rate == GATE_RATE);
-    let mut reasons = Vec::new();
-    let mut detail = Vec::new();
-    match seq {
-        None => reasons.push("no sequential rows".to_string()),
-        Some((n, p)) => {
-            detail.push(format!("sequential p99={}ms (n={n})", ms(p)));
-            if p >= GATE_US {
-                reasons.push(format!("sequential p99 {}ms >= 100ms", ms(p)));
+    // Late ticks of the rate=20 set, from the sidecars; None when unknown.
+    let rate_files: Vec<&FileInfo> = loaded.files.iter().filter(|f| f.gate_rate).collect();
+    for f in loaded
+        .files
+        .iter()
+        .filter(|f| f.has_rate && f.meta.is_none())
+    {
+        warnings.push(format!(
+            "WARNING: {} has no sidecar {}.meta.json; late ticks are unknown",
+            f.name, f.name
+        ));
+    }
+    for f in &loaded.files {
+        if let Some(m) = &f.meta {
+            if m.malformed_timing > 0 {
+                warnings.push(format!(
+                    "WARNING: {}: {} malformed timing values (counted as 0)",
+                    f.name, m.malformed_timing
+                ));
+            }
+            if m.aborted > 0 {
+                warnings.push(format!(
+                    "WARNING: {}: {} requests aborted at the end of the run",
+                    f.name, m.aborted
+                ));
             }
         }
     }
-    match rate {
-        None => reasons.push(format!("no rate={GATE_RATE} rows")),
-        Some((n, p)) => {
-            detail.push(format!("rate={GATE_RATE} p99={}ms (n={n})", ms(p)));
-            if p >= GATE_US {
-                reasons.push(format!("rate={GATE_RATE} p99 {}ms >= 100ms", ms(p)));
-            }
-        }
+    let late_pct = if rate_files.iter().all(|f| f.meta.is_some()) {
+        let fired: u64 = rate_files
+            .iter()
+            .filter_map(|f| f.meta.as_ref())
+            .map(|m| m.fired)
+            .sum();
+        let late: u64 = rate_files
+            .iter()
+            .filter_map(|f| f.meta.as_ref())
+            .map(|m| m.late)
+            .sum();
+        Some(if fired == 0 {
+            0.0
+        } else {
+            100.0 * late as f64 / fired as f64
+        })
+    } else {
+        None
+    };
+
+    let seq = SetStats::of("sequential", &rows, |r| r.mode == "sequential");
+    let rate = SetStats::of("rate20", &rows, |r| r.mode == "rate" && r.rate == GATE_RATE);
+    let mut reasons = Vec::new();
+    if seq.requests == 0 {
+        reasons.push("no sequential rows".to_string());
+    } else {
+        reasons.extend(seq.reasons(None));
+    }
+    if rate.requests == 0 {
+        reasons.push(format!("no rate={GATE_RATE} rows"));
+    } else {
+        reasons.extend(rate.reasons(late_pct));
     }
     let pass = reasons.is_empty();
+    let stats = format!("{}; {}", seq.line(None), rate.line(Some(late_pct)));
     let verdict = if pass {
-        format!("GATE PASS: {}", detail.join(", "))
+        format!("GATE PASS ({stats})")
     } else {
-        format!("GATE FAIL: {}", reasons.join("; "))
+        format!("GATE FAIL ({stats}): {}", reasons.join("; "))
     };
 
     // Path (a) accounting.
@@ -175,6 +382,37 @@ pub fn generate(in_dir: &Path, out_dir: &Path) -> Result<Report> {
     let mut s = String::new();
     writeln!(s, "# Sandbox latency summary\n")?;
     writeln!(s, "{verdict}\n")?;
+    writeln!(s, "## Measurement basis\n\n{MEASUREMENT_BASIS}\n")?;
+    writeln!(s, "## Input files\n")?;
+    for f in &loaded.files {
+        write!(s, "- {}: {} rows", f.name, f.rows)?;
+        match &f.meta {
+            Some(m) => {
+                let pct = if m.fired == 0 {
+                    0.0
+                } else {
+                    100.0 * m.late as f64 / m.fired as f64
+                };
+                write!(
+                    s,
+                    "; {} rate {} x {} hosts: expected {}, fired {}, late {} ({pct:.1}%), max lateness {} ms, request timeout {} ms, aborted {}, malformed timing values {}",
+                    m.mode,
+                    m.rate,
+                    m.host_pods,
+                    m.expected,
+                    m.fired,
+                    m.late,
+                    m.max_late_ms,
+                    m.request_timeout_ms,
+                    m.aborted,
+                    m.malformed_timing
+                )?;
+            }
+            None => write!(s, "; no sidecar")?,
+        }
+        writeln!(s)?;
+    }
+    writeln!(s)?;
     for w in &warnings {
         writeln!(s, "{w}\n")?;
     }

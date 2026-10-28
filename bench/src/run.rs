@@ -1,13 +1,15 @@
 //! `run`: the request loops (sequential and open-loop rate) against daprd's
 //! alpha Sandbox HTTP API.
 
-use crate::report::{CSV_HEADER, Row};
+use crate::report::{CSV_HEADER, Meta, Row, meta_path};
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
+use std::io::Write as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -37,6 +39,8 @@ pub struct Config {
     /// `a`, `b`, `c` or `d`.
     pub path: String,
     pub workload: Workload,
+    /// Per HTTP request; a timeout is a status-0 row.
+    pub request_timeout_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -52,19 +56,27 @@ pub enum Mode {
     },
 }
 
-/// protojson renders uint64 as a JSON string; accept a number too.
+/// Timing values that could not be decoded (counted as 0, reported).
+static MALFORMED: AtomicU64 = AtomicU64::new(0);
+
+/// Malformed timing values seen since the run started.
+pub fn malformed_count() -> u64 {
+    MALFORMED.load(Ordering::Relaxed)
+}
+
+/// protojson renders uint64 as a JSON string; accept a number too. Anything
+/// else is counted in `MALFORMED` and read as 0.
 fn u64_lenient<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum V {
-        S(String),
-        N(u64),
-    }
-    match Option::<V>::deserialize(d)? {
-        None => Ok(0),
-        Some(V::N(n)) => Ok(n),
-        Some(V::S(s)) => s.parse().map_err(serde::de::Error::custom),
-    }
+    let v = match Value::deserialize(d)? {
+        Value::Null => Some(0),
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    };
+    Ok(v.unwrap_or_else(|| {
+        MALFORMED.fetch_add(1, Ordering::Relaxed);
+        0
+    }))
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -105,6 +117,10 @@ struct Ctx {
     cleanups: Mutex<Vec<JoinHandle<()>>>,
     /// The warmed sandbox of path b.
     fixed_id: Option<String>,
+    /// The CSV, appended and flushed per row so a killed run keeps its rows.
+    csv: Mutex<std::fs::File>,
+    timeout: Duration,
+    aborted: AtomicU64,
 }
 
 impl Ctx {
@@ -129,7 +145,12 @@ impl Ctx {
         let bytes = res.bytes().await?;
         let client_us = start.elapsed().as_micros() as u64;
         // An error body is not an exec response: keep the status, default the rest.
-        let resp = serde_json::from_slice(&bytes).unwrap_or_default();
+        let resp = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            if status == 200 {
+                MALFORMED.fetch_add(1, Ordering::Relaxed);
+            }
+            Resp::default()
+        });
         Ok(Call {
             status,
             resp,
@@ -158,10 +179,22 @@ impl Ctx {
         c.len() - 1
     }
 
+    /// Waits for the cleanups, at most `timeout + 10 s`; aborts and counts the rest.
     async fn drain_cleanups(&self) {
         let hs: Vec<_> = std::mem::take(&mut *self.cleanups.lock().unwrap());
-        for h in hs {
-            let _ = h.await;
+        let deadline = tokio::time::Instant::now() + self.timeout + Duration::from_secs(10);
+        for mut h in hs {
+            if tokio::time::timeout_at(deadline, &mut h).await.is_err() {
+                h.abort();
+                self.aborted.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn write_row(&self, r: &Row) {
+        let mut f = self.csv.lock().unwrap();
+        if let Err(e) = writeln!(f, "{}", r.to_csv()) {
+            eprintln!("writing the CSV: {e}");
         }
     }
 
@@ -176,13 +209,19 @@ impl Ctx {
 
 fn row(ctx: &Ctx, mode: &str, rate: u64, seq: u64, c: Option<&Call>, path: &str) -> Row {
     let t = c.and_then(|c| c.resp.timing.as_ref());
+    // A 200 that timed out inside the sandbox is an error: status 504.
+    let status = match c {
+        Some(c) if c.status == 200 && c.resp.timed_out => 504,
+        Some(c) => c.status,
+        None => 0,
+    };
     Row {
         path: ctx.cfg.path.clone(),
         workload: ctx.cfg.workload.name().into(),
         mode: mode.into(),
         rate,
         seq,
-        status: c.map_or(0, |c| c.status),
+        status,
         acquire_path: path.into(),
         total_us: t.map_or(0, |t| t.total_us),
         host_us: t.map_or(0, |t| t.host_us),
@@ -202,14 +241,16 @@ fn path_of(c: &Call) -> String {
 
 /// Runs one measured request and schedules its cleanup.
 async fn one(ctx: &Ctx, mode: &str, rate: u64, seq: u64) -> Row {
-    match one_inner(ctx, mode, rate, seq).await {
+    let r = match one_inner(ctx, mode, rate, seq).await {
         Ok(r) => r,
-        // A transport error is a row with status 0, never an abort.
+        // A transport error or timeout is a row with status 0, never an abort.
         Err(e) => {
             eprintln!("seq {seq}: {e:#}");
             row(ctx, mode, rate, seq, None, "")
         }
-    }
+    };
+    ctx.write_row(&r);
+    r
 }
 
 async fn one_inner(ctx: &Ctx, mode: &str, rate: u64, seq: u64) -> Result<Row> {
@@ -295,16 +336,33 @@ async fn session_import(ctx: &Ctx, mode: &str, rate: u64, seq: u64) -> Result<Ro
 }
 
 pub async fn run(cfg: Config, mode: Mode, out: &Path) -> Result<Vec<Row>> {
+    let timeout = Duration::from_millis(cfg.request_timeout_ms);
     let http = reqwest::Client::builder()
         .pool_max_idle_per_host(256)
         .pool_idle_timeout(Duration::from_secs(90))
         .tcp_nodelay(true)
+        .timeout(timeout)
         .build()?;
+    if let Some(p) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(p)?;
+    }
+    let mut file =
+        std::fs::File::create(out).with_context(|| format!("writing {}", out.display()))?;
+    writeln!(file, "{CSV_HEADER}")?;
+    MALFORMED.store(0, Ordering::Relaxed);
+    let calls: u32 = if cfg.workload == Workload::SessionImport {
+        3
+    } else {
+        1
+    };
     let mut ctx = Ctx {
         http,
         cfg,
         cleanups: Mutex::new(Vec::new()),
         fixed_id: None,
+        csv: Mutex::new(file),
+        timeout,
+        aborted: AtomicU64::new(0),
     };
 
     // Warm keep-alive connections untimed.
@@ -341,10 +399,17 @@ pub async fn run(cfg: Config, mode: Mode, out: &Path) -> Result<Vec<Row>> {
     let ctx = Arc::new(ctx);
 
     let mut rows: Vec<Row> = Vec::new();
+    let mut meta = Meta {
+        request_timeout_ms: ctx.cfg.request_timeout_ms,
+        ..Meta::default()
+    };
     match mode {
         Mode::Sequential { count } => {
+            meta.mode = "sequential".into();
+            meta.expected = count;
             for seq in 0..count {
                 rows.push(one(&ctx, "sequential", 0, seq).await);
+                meta.fired += 1;
                 ctx.drain_cleanups().await;
             }
         }
@@ -355,30 +420,53 @@ pub async fn run(cfg: Config, mode: Mode, out: &Path) -> Result<Vec<Row>> {
         } => {
             let interval = Duration::from_secs_f64(1.0 / (rate * hosts) as f64);
             let total = (duration.as_secs_f64() * (rate * hosts) as f64).round() as u64;
+            meta.mode = "rate".into();
+            meta.rate = rate;
+            meta.host_pods = hosts;
+            meta.duration_s = duration.as_secs();
+            meta.expected = total;
             let t0 = tokio::time::Instant::now();
             let mut handles = Vec::with_capacity(total as usize);
-            let (mut late, mut max_late) = (0u64, Duration::ZERO);
+            let mut max_late = Duration::ZERO;
             for seq in 0..total {
                 // Fixed schedule: a late tick fires immediately and the ones
                 // after it keep their original slots, so none is dropped.
-                let due = t0 + interval * seq as u32;
+                let due = t0 + interval.mul_f64(seq as f64);
                 tokio::time::sleep_until(due).await;
                 let lag = due.elapsed();
                 if lag > interval / 2 {
-                    late += 1;
+                    meta.late += 1;
                     max_late = max_late.max(lag);
                 }
                 let c = ctx.clone();
-                handles.push(tokio::spawn(
-                    async move { one(&c, "rate", rate, seq).await },
+                handles.push((
+                    seq,
+                    tokio::spawn(async move { one(&c, "rate", rate, seq).await }),
                 ));
+                meta.fired += 1;
             }
-            for h in handles {
-                rows.push(h.await?);
+            meta.max_late_ms = max_late.as_millis() as u64;
+            // Bounded wait: every request has the client timeout, so a task
+            // still running after this has hung; abort it and record status 0.
+            let deadline = tokio::time::Instant::now() + timeout * calls + Duration::from_secs(10);
+            for (seq, mut h) in handles {
+                match tokio::time::timeout_at(deadline, &mut h).await {
+                    Ok(Ok(r)) => rows.push(r),
+                    failed => {
+                        if failed.is_err() {
+                            h.abort();
+                            ctx.aborted.fetch_add(1, Ordering::Relaxed);
+                        }
+                        eprintln!("seq {seq}: task did not finish (panicked or hung)");
+                        let r = row(&ctx, "rate", rate, seq, None, "");
+                        ctx.write_row(&r);
+                        rows.push(r);
+                    }
+                }
             }
             eprintln!(
-                "rate {rate}/s x {hosts} hosts: fired {total} requests, {late} late ticks (max lateness {} ms)",
-                max_late.as_millis()
+                "rate {rate}/s x {hosts} hosts: fired {} of {total} requests, {} late ticks (max lateness {} ms)",
+                meta.fired, meta.late, meta.max_late_ms
             );
         }
     }
@@ -394,19 +482,22 @@ pub async fn run(cfg: Config, mode: Mode, out: &Path) -> Result<Vec<Row>> {
     }
     ctx.drain_cleanups().await;
 
-    write_csv(out, &rows)?;
+    meta.aborted = ctx.aborted.load(Ordering::Relaxed);
+    meta.malformed_timing = MALFORMED.load(Ordering::Relaxed);
+    if meta.malformed_timing > 0 {
+        eprintln!(
+            "warning: {} malformed timing values (counted as 0)",
+            meta.malformed_timing
+        );
+    }
+    if meta.aborted > 0 {
+        eprintln!(
+            "warning: {} requests/cleanups aborted at the end",
+            meta.aborted
+        );
+    }
+    let mp = meta_path(out);
+    std::fs::write(&mp, serde_json::to_string_pretty(&meta)?)
+        .with_context(|| format!("writing {}", mp.display()))?;
     Ok(rows)
-}
-
-pub fn write_csv(out: &Path, rows: &[Row]) -> Result<()> {
-    let mut s = String::from(CSV_HEADER);
-    s.push('\n');
-    for r in rows {
-        s.push_str(&r.to_csv());
-        s.push('\n');
-    }
-    if let Some(p) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(p)?;
-    }
-    std::fs::write(out, s).with_context(|| format!("writing {}", out.display()))
 }

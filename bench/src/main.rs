@@ -46,6 +46,9 @@ struct Target {
     app_id: String,
     #[arg(long, value_enum, default_value = "echo")]
     workload: WorkloadArg,
+    /// Per-request timeout; a timeout is recorded as a status-0 row.
+    #[arg(long, default_value_t = 30000)]
+    request_timeout_ms: u64,
 }
 
 #[derive(Subcommand)]
@@ -130,6 +133,7 @@ async fn main() -> Result<()> {
                 component: path_component(&path, &component),
                 path,
                 workload: target.workload.into(),
+                request_timeout_ms: target.request_timeout_ms,
             };
             let mode = match mode {
                 ModeArg::Sequential => Mode::Sequential { count },
@@ -162,6 +166,7 @@ async fn main() -> Result<()> {
                     component: component.clone(),
                     path: "a".into(),
                     workload: target.workload.into(),
+                    request_timeout_ms: target.request_timeout_ms,
                 };
                 let mode = Mode::Rate {
                     rate,

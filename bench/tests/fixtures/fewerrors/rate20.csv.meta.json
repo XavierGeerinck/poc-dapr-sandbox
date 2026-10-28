@@ -1,0 +1,1 @@
+{"mode": "rate", "rate": 20, "host_pods": 1, "duration_s": 10, "expected": 200, "fired": 200, "late": 0, "max_late_ms": 0, "request_timeout_ms": 30000}
