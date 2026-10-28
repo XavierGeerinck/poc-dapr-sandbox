@@ -1,0 +1,272 @@
+From a7292f11fbe5ad52daeb2a86bafcc70bcd42653b Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Wed, 28 Oct 2026 21:03:21 +0100
+Subject: [PATCH 11/12] fix(sandbox): treat unavailable driver as lost; fail
+ fast before ready
+
+A driver call on an acquired instance that fails with Unavailable now
+means the sandbox is lost, like NotFound: the driver itself is gone (for
+example a crashed pluggable driver) and took the VM with it. The target
+is removed and the caller gets ERR_SANDBOX_LOST.
+
+A call to a sandbox component of this app whose actor type is not
+registered yet (its driver is not ready) now fails at once with
+ERR_SANDBOX_HOST_FULL (retry later). Before, it went through the
+placement lookup retries for about 5 s and then failed with
+ERR_SANDBOX_LOST. The check asks the actor table with a done context,
+so it never blocks; while the actor runtime itself is not ready the
+call takes the normal route.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/actors/targets/sandbox/sandbox.go      |  6 +-
+ pkg/actors/targets/sandbox/sandbox_test.go | 49 +++++++++++++++
+ pkg/api/universal/sandbox.go               | 31 ++++++++-
+ pkg/api/universal/sandbox_test.go          | 73 ++++++++++++++++++++++
+ 4 files changed, 156 insertions(+), 3 deletions(-)
+
+diff --git a/pkg/actors/targets/sandbox/sandbox.go b/pkg/actors/targets/sandbox/sandbox.go
+index 6c1d27c08..a7c081324 100644
+--- a/pkg/actors/targets/sandbox/sandbox.go
++++ b/pkg/actors/targets/sandbox/sandbox.go
+@@ -421,9 +421,11 @@ func (t *target) acquire(ctx context.Context, method string, timing *runtimev1pb
+ }
+ 
+ // instanceErr maps a driver error for a call on the instance itself: NotFound
+-// means the VM is gone, so the sandbox is lost and the target is removed.
++// means the VM is gone and Unavailable means the driver itself is gone (for
++// example a crashed pluggable driver), taking the VM with it. Either way the
++// sandbox is lost and the target is removed.
+ func (t *target) instanceErr(op string, err error) error {
+-	if status.Code(err) == codes.NotFound {
++	if code := status.Code(err); code == codes.NotFound || code == codes.Unavailable {
+ 		log.Debugf("Sandbox actor '%s' lost its instance: %v", t.Key(), err)
+ 		t.factory.remove(t)
+ 		return ErrSandboxLost()
+diff --git a/pkg/actors/targets/sandbox/sandbox_test.go b/pkg/actors/targets/sandbox/sandbox_test.go
+index 58b0f5fb7..dcf34a4ce 100644
+--- a/pkg/actors/targets/sandbox/sandbox_test.go
++++ b/pkg/actors/targets/sandbox/sandbox_test.go
+@@ -391,6 +391,55 @@ func TestDriverNotFoundIsLost(t *testing.T) {
+ 	assert.NotEqual(t, first.(*target).activation, res.GetActivation())
+ }
+ 
++func TestDriverUnavailableIsLost(t *testing.T) {
++	t.Run("exec", func(t *testing.T) {
++		d := &fakeDriver{}
++		f := newFactory(t, d)
++
++		first := execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++
++		// The driver went away (for example a crashed pluggable driver).
++		d.execErr = status.Error(codes.Unavailable, "connection refused")
++		_, err := invoke(t, f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++		requireLost(t, err)
++		assert.False(t, f.Exists("sb1"))
++		assert.Empty(t, f.LiveInstanceIDs())
++		// The instance is still handed back, in case the driver returns.
++		assert.Eventually(t, func() bool { return d.releaseCount.Load() == 1 }, 5*time.Second, 10*time.Millisecond)
++		assert.Equal(t, []string{"inst-1"}, d.releasedIDs())
++
++		// A later call starts over with a new activation.
++		d.execErr = nil
++		res := execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++		assert.Equal(t, int32(2), d.acquireCount.Load())
++		assert.NotEqual(t, first.GetActivation(), res.GetActivation())
++	})
++
++	t.Run("session start", func(t *testing.T) {
++		d := &fakeDriver{sessionStartErr: status.Error(codes.Unavailable, "connection refused")}
++		f := newFactory(t, d)
++
++		_, err := invoke(t, f, "sb1", MethodSessionStart, &runtimev1pb.SandboxSessionStartRequestAlpha1{Command: "sh"})
++		requireLost(t, err)
++		assert.False(t, f.Exists("sb1"))
++		assert.Eventually(t, func() bool { return d.releaseCount.Load() == 1 }, 5*time.Second, 10*time.Millisecond)
++	})
++
++	t.Run("other driver errors keep the sandbox", func(t *testing.T) {
++		d := &fakeDriver{}
++		f := newFactory(t, d)
++
++		execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++		d.execErr = status.Error(codes.Internal, "boom")
++		_, err := invoke(t, f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++		require.Error(t, err)
++		assert.Equal(t, codes.Internal, status.Code(err))
++		assert.False(t, IsSandboxLost(err))
++		assert.True(t, f.Exists("sb1"))
++		assert.Equal(t, []string{"inst-1"}, f.LiveInstanceIDs())
++	})
++}
++
+ func TestDeactivateDoesNotBlock(t *testing.T) {
+ 	block := make(chan struct{})
+ 	t.Cleanup(func() { close(block) })
+diff --git a/pkg/api/universal/sandbox.go b/pkg/api/universal/sandbox.go
+index 54c5839cf..c0f0bc3e2 100644
+--- a/pkg/api/universal/sandbox.go
++++ b/pkg/api/universal/sandbox.go
+@@ -42,6 +42,13 @@ const (
+ 	sandboxTimeoutGrace = 30 * time.Second
+ )
+ 
++// doneCtx is an already cancelled context, for calls that must not block.
++var doneCtx = func() context.Context {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	return ctx
++}()
++
+ // sandboxCall routes a sandbox actor method call and returns the raw response
+ // data. Errors are already mapped to API errors.
+ func (a *Universal) sandboxCall(ctx context.Context, component, appID, sandboxID, method string, timeoutMs uint32, req proto.Message) ([]byte, error) {
+@@ -53,12 +60,21 @@ func (a *Universal) sandboxCall(ctx context.Context, component, appID, sandboxID
+ 	if target == "" {
+ 		target = a.appID
+ 	}
++	actorType := sandboxhost.ActorType(a.namespace, target, component)
+ 	if target == a.appID {
+ 		if _, ok := a.compStore.GetSandbox(component); !ok {
+ 			err := messages.ErrSandboxNotFound.WithFormat(component)
+ 			a.logger.Debug(err)
+ 			return nil, err
+ 		}
++		// The component exists but its actor type is not registered yet,
++		// because the driver is not ready. Routing would retry the placement
++		// lookup for a host that does not exist yet and then fail, so tell
++		// the caller to retry later instead.
++		if a.sandboxNotHostedYet(actorType) {
++			a.logger.Debugf("sandbox component %s is not ready yet", component)
++			return nil, messages.ErrSandboxHostFull
++		}
+ 	}
+ 
+ 	data, err := proto.Marshal(req)
+@@ -79,7 +95,7 @@ func (a *Universal) sandboxCall(ctx context.Context, component, appID, sandboxID
+ 
+ 	ireq := internalsv1pb.
+ 		NewInternalInvokeRequest(method).
+-		WithActor(sandboxhost.ActorType(a.namespace, target, component), sandboxID).
++		WithActor(actorType, sandboxID).
+ 		WithData(data).
+ 		WithContentType("application/x-protobuf")
+ 
+@@ -90,6 +106,19 @@ func (a *Universal) sandboxCall(ctx context.Context, component, appID, sandboxID
+ 	return res.GetMessage().GetData().GetValue(), nil
+ }
+ 
++// sandboxNotHostedYet reports whether this sidecar's actor runtime is ready
++// but does not host actorType. It never blocks: Table is asked with a done
++// context, which still returns the table of a ready runtime. While the actor
++// runtime itself is not ready (or is disabled) it reports false, so the call
++// takes the normal route and gets the actor runtime's own behaviour.
++func (a *Universal) sandboxNotHostedYet(actorType string) bool {
++	tbl, err := a.actors.Table(doneCtx)
++	if err != nil || tbl == nil {
++		return false
++	}
++	return !tbl.IsActorTypeHosted(actorType)
++}
++
+ // mapSandboxError maps the gRPC status code of a router error to an API error.
+ func (a *Universal) mapSandboxError(err error) error {
+ 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+diff --git a/pkg/api/universal/sandbox_test.go b/pkg/api/universal/sandbox_test.go
+index 2c4d64a96..8ccae6569 100644
+--- a/pkg/api/universal/sandbox_test.go
++++ b/pkg/api/universal/sandbox_test.go
+@@ -21,6 +21,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"sync"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ 
+@@ -34,6 +35,8 @@ import (
+ 	actorsfake "github.com/dapr/dapr/pkg/actors/fake"
+ 	"github.com/dapr/dapr/pkg/actors/router"
+ 	routerfake "github.com/dapr/dapr/pkg/actors/router/fake"
++	"github.com/dapr/dapr/pkg/actors/table"
++	tablefake "github.com/dapr/dapr/pkg/actors/table/fake"
+ 	"github.com/dapr/dapr/pkg/components/sandbox"
+ 	"github.com/dapr/dapr/pkg/messages"
+ 	commonv1 "github.com/dapr/dapr/pkg/proto/common/v1"
+@@ -294,3 +297,73 @@ func TestSandboxDeleteAndSessionMethods(t *testing.T) {
+ 	assert.Equal(t, "session.start", rec.reqs[1].GetMessage().GetMethod())
+ 	assert.Equal(t, "session.close", rec.reqs[2].GetMessage().GetMethod())
+ }
++
++// withSandboxTable makes the Universal's actor runtime return tbl (or err)
++// from Table, recording whether every call came with a done context.
++func withSandboxTable(t *testing.T, u *Universal, tbl table.Interface, err error) *atomic.Bool {
++	t.Helper()
++	blocking := new(atomic.Bool)
++	u.actors.(*actorsfake.Fake).WithTable(func(ctx context.Context) (table.Interface, error) {
++		if ctx.Err() == nil {
++			blocking.Store(true)
++		}
++		return tbl, err
++	})
++	return blocking
++}
++
++func TestSandboxSelfNotHostedYetFailsFast(t *testing.T) {
++	const actorType = "dapr.internal.default.me.sandbox.py"
++	okFn := func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
++		return &runtimev1pb.SandboxExecResponseAlpha1{Stdout: []byte("hi")}, nil
++	}
++
++	t.Run("type not hosted: host full, router not called", func(t *testing.T) {
++		u, rec := newSandboxUniversal(t, true, okFn)
++		var asked []string
++		tbl := tablefake.New().WithIsActorTypeHosted(func(at string) bool {
++			asked = append(asked, at)
++			return false
++		})
++		blocking := withSandboxTable(t, u, tbl, nil)
++
++		_, err := u.SandboxExecAlpha1(t.Context(), &runtimev1pb.SandboxExecRequestAlpha1{Component: "py", SandboxId: "sb1", Command: "x"})
++		require.ErrorIs(t, err, messages.ErrSandboxHostFull)
++		assert.Equal(t, 0, rec.len())
++		assert.Equal(t, []string{actorType}, asked)
++		assert.False(t, blocking.Load(), "Table must be asked with a done context so it never blocks")
++
++		// Create gives up after its attempts without reaching the router.
++		_, err = u.SandboxCreateAlpha1(t.Context(), &runtimev1pb.SandboxCreateRequestAlpha1{Component: "py"})
++		require.ErrorIs(t, err, messages.ErrSandboxHostFull)
++		assert.Equal(t, 0, rec.len())
++	})
++
++	t.Run("type hosted: routed", func(t *testing.T) {
++		u, rec := newSandboxUniversal(t, true, okFn)
++		withSandboxTable(t, u, tablefake.New().WithIsActorTypeHosted(func(at string) bool { return at == actorType }), nil)
++
++		res, err := u.SandboxExecAlpha1(t.Context(), &runtimev1pb.SandboxExecRequestAlpha1{Component: "py", SandboxId: "sb1", Command: "x"})
++		require.NoError(t, err)
++		assert.Equal(t, "hi", string(res.GetStdout()))
++		assert.Equal(t, 1, rec.len())
++	})
++
++	t.Run("actor runtime not ready: routed as before", func(t *testing.T) {
++		u, rec := newSandboxUniversal(t, true, okFn)
++		withSandboxTable(t, u, nil, messages.ErrActorRuntimeNotFound)
++
++		_, err := u.SandboxExecAlpha1(t.Context(), &runtimev1pb.SandboxExecRequestAlpha1{Component: "py", SandboxId: "sb1", Command: "x"})
++		require.NoError(t, err)
++		assert.Equal(t, 1, rec.len())
++	})
++
++	t.Run("other app: no local check", func(t *testing.T) {
++		u, rec := newSandboxUniversal(t, false, okFn)
++		withSandboxTable(t, u, tablefake.New(), nil)
++
++		_, err := u.SandboxExecAlpha1(t.Context(), &runtimev1pb.SandboxExecRequestAlpha1{Component: "py", SandboxId: "sb1", AppId: "pool", Command: "x"})
++		require.NoError(t, err)
++		assert.Equal(t, 1, rec.len())
++	})
++}
+-- 
+2.47.0
+

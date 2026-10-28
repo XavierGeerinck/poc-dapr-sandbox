@@ -1,0 +1,930 @@
+From 5b3e9ae9bb1d8cee30323ff48e737080b94bba1c Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Wed, 28 Oct 2026 19:54:07 +0100
+Subject: [PATCH 03/12] feat(sandbox): built-in process driver for tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmd/daprd/components/sandbox_process.go       |  27 +
+ pkg/components/sandbox/process/process.go     | 670 ++++++++++++++++++
+ .../sandbox/process/process_test.go           | 197 +++++
+ 3 files changed, 894 insertions(+)
+ create mode 100644 cmd/daprd/components/sandbox_process.go
+ create mode 100644 pkg/components/sandbox/process/process.go
+ create mode 100644 pkg/components/sandbox/process/process_test.go
+
+diff --git a/cmd/daprd/components/sandbox_process.go b/cmd/daprd/components/sandbox_process.go
+new file mode 100644
+index 000000000..f421e1d02
+--- /dev/null
++++ b/cmd/daprd/components/sandbox_process.go
+@@ -0,0 +1,27 @@
++//go:build (allcomponents || stablecomponents) && !windows
++
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package components
++
++import (
++	"github.com/dapr/dapr/pkg/components/sandbox"
++	"github.com/dapr/dapr/pkg/components/sandbox/process"
++)
++
++func init() {
++	sandbox.DefaultRegistry.RegisterComponent(process.New, "process")
++}
+diff --git a/pkg/components/sandbox/process/process.go b/pkg/components/sandbox/process/process.go
+new file mode 100644
+index 000000000..df414df6f
+--- /dev/null
++++ b/pkg/components/sandbox/process/process.go
+@@ -0,0 +1,670 @@
++//go:build !windows
++
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package process is a built-in sandbox driver that runs commands as plain
++// host processes.
++//
++// It provides NO isolation whatsoever: commands run with the privileges of
++// the daprd process and can see the entire host filesystem and network. Each
++// "sandbox instance" is merely a temporary directory used as the default
++// working directory. It exists for tests and CI and as the reference
++// implementation of the sandbox driver contract; never use it to run
++// untrusted code.
++//
++// Error contract: Exec, SessionStart, SessionSend, SessionClose and Release
++// return codes.NotFound for an unknown instance (or session) id. Release of an
++// unknown id therefore also returns NotFound; callers that want idempotent
++// release should treat NotFound as success.
++package process
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"time"
++
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++
++	"github.com/dapr/components-contrib/metadata"
++	"github.com/dapr/dapr/pkg/components/sandbox"
++	proto "github.com/dapr/dapr/pkg/proto/components/v1"
++	"github.com/dapr/kit/logger"
++)
++
++const (
++	// outputCap is the per-stream output cap for Exec and per-session buffers.
++	outputCap = 4 * 1024 * 1024
++	// defaultSendTimeout applies to SessionSend when `until` is set and no
++	// timeout_ms is given.
++	defaultSendTimeout = 30 * time.Second
++	waitDelay          = time.Second
++)
++
++// Process is the host-process sandbox driver.
++type Process struct {
++	log logger.Logger
++	cfg sandbox.Config
++
++	// refillDelay delays background refills triggered by Acquire (tests only).
++	refillDelay time.Duration
++
++	ctx    context.Context
++	cancel context.CancelFunc
++	wg     sync.WaitGroup
++
++	lock     sync.Mutex
++	closed   bool
++	pool     []*instance
++	inflight int
++	live     map[string]*instance
++}
++
++type instance struct {
++	id     string
++	dir    string
++	ctx    context.Context
++	cancel context.CancelFunc
++
++	lock     sync.Mutex
++	sessions map[string]*session
++	seq      int
++}
++
++// New returns a new process driver.
++func New(l logger.Logger) sandbox.Sandbox {
++	return &Process{log: l, live: make(map[string]*instance)}
++}
++
++func (p *Process) Init(_ context.Context, md metadata.Base) error {
++	cfg, err := sandbox.ParseConfig(md.Properties)
++	if err != nil {
++		return err
++	}
++	p.cfg = cfg
++	p.ctx, p.cancel = context.WithCancel(context.Background())
++	p.topUp(0)
++	return nil
++}
++
++func (p *Process) newInstance() (*instance, error) {
++	dir, err := os.MkdirTemp("", "dapr-sandbox-")
++	if err != nil {
++		return nil, err
++	}
++	ctx, cancel := context.WithCancel(p.ctx)
++	return &instance{id: filepath.Base(dir), dir: dir, ctx: ctx, cancel: cancel, sessions: make(map[string]*session)}, nil
++}
++
++// topUp starts background workers to bring the warm pool up to size.
++func (p *Process) topUp(delay time.Duration) {
++	p.lock.Lock()
++	defer p.lock.Unlock()
++	conc := int(p.cfg.RefillConcurrency)
++	if conc < 1 {
++		conc = 1
++	}
++	for !p.closed && p.inflight < conc && len(p.pool)+p.inflight < int(p.cfg.WarmPoolSize) {
++		p.inflight++
++		p.wg.Add(1)
++		go p.fill(delay)
++	}
++}
++
++func (p *Process) fill(delay time.Duration) {
++	defer p.wg.Done()
++	if delay > 0 {
++		select {
++		case <-time.After(delay):
++		case <-p.ctx.Done():
++		}
++	}
++	var inst *instance
++	var err error
++	if p.ctx.Err() == nil {
++		inst, err = p.newInstance()
++		if err != nil {
++			p.log.Errorf("sandbox process: refill failed: %v", err)
++		}
++	}
++	p.lock.Lock()
++	p.inflight--
++	if inst != nil {
++		if p.closed {
++			go func() { inst.destroy() }()
++		} else {
++			p.pool = append(p.pool, inst)
++		}
++	}
++	p.lock.Unlock()
++	if err == nil {
++		p.topUp(0)
++	}
++}
++
++func (p *Process) Ready(_ context.Context, _ *proto.SandboxReadyRequest) (*proto.SandboxReadyResponse, error) {
++	p.lock.Lock()
++	defer p.lock.Unlock()
++	have, want := len(p.pool), int(p.cfg.WarmPoolSize)
++	if have >= want {
++		return &proto.SandboxReadyResponse{Ready: true}, nil
++	}
++	return &proto.SandboxReadyResponse{Reason: fmt.Sprintf("warm pool filling: %d/%d", have, want)}, nil
++}
++
++func (p *Process) Acquire(_ context.Context, _ *proto.SandboxAcquireRequest) (*proto.SandboxAcquireResponse, error) {
++	start := time.Now()
++	p.lock.Lock()
++	if p.closed {
++		p.lock.Unlock()
++		return nil, status.Error(codes.Unavailable, "sandbox driver is closed")
++	}
++	if max := int(p.cfg.MaxSandboxesPerHost); max > 0 && len(p.live) >= max {
++		p.lock.Unlock()
++		return nil, status.Errorf(codes.ResourceExhausted, "host is full: %d sandboxes", max)
++	}
++	var inst *instance
++	path := proto.SandboxAcquirePath_POOL
++	if n := len(p.pool); n > 0 {
++		inst = p.pool[n-1]
++		p.pool = p.pool[:n-1]
++	} else {
++		var err error
++		inst, err = p.newInstance()
++		if err != nil {
++			p.lock.Unlock()
++			return nil, status.Errorf(codes.Internal, "creating instance: %v", err)
++		}
++		path = proto.SandboxAcquirePath_BOOT
++	}
++	p.live[inst.id] = inst
++	p.lock.Unlock()
++
++	p.topUp(p.refillDelay)
++	return &proto.SandboxAcquireResponse{
++		InstanceId: inst.id,
++		Path:       path,
++		ElapsedUs:  uint64(time.Since(start).Microseconds()),
++	}, nil
++}
++
++func (p *Process) get(id string) (*instance, error) {
++	p.lock.Lock()
++	defer p.lock.Unlock()
++	inst, ok := p.live[id]
++	if !ok {
++		return nil, status.Errorf(codes.NotFound, "unknown instance %q", id)
++	}
++	return inst, nil
++}
++
++func (i *instance) destroy() {
++	i.cancel()
++	i.lock.Lock()
++	sessions := make([]*session, 0, len(i.sessions))
++	for _, s := range i.sessions {
++		sessions = append(sessions, s)
++	}
++	i.sessions = map[string]*session{}
++	i.lock.Unlock()
++	for _, s := range sessions {
++		s.kill()
++		<-s.done
++	}
++	_ = os.RemoveAll(i.dir)
++}
++
++func (p *Process) Release(_ context.Context, req *proto.SandboxReleaseRequest) (*proto.SandboxReleaseResponse, error) {
++	p.lock.Lock()
++	inst, ok := p.live[req.GetInstanceId()]
++	if ok {
++		delete(p.live, inst.id)
++	}
++	closed := p.closed
++	p.lock.Unlock()
++	if !ok {
++		return nil, status.Errorf(codes.NotFound, "unknown instance %q", req.GetInstanceId())
++	}
++	if closed {
++		inst.destroy()
++	} else {
++		p.wg.Add(1)
++		go func() {
++			defer p.wg.Done()
++			inst.destroy()
++		}()
++	}
++	return &proto.SandboxReleaseResponse{}, nil
++}
++
++func (p *Process) Reconcile(_ context.Context, req *proto.SandboxReconcileRequest) (*proto.SandboxReconcileResponse, error) {
++	keep := make(map[string]struct{}, len(req.GetLiveInstanceIds()))
++	for _, id := range req.GetLiveInstanceIds() {
++		keep[id] = struct{}{}
++	}
++	var drop []*instance
++	p.lock.Lock()
++	for id, inst := range p.live {
++		if _, ok := keep[id]; !ok {
++			delete(p.live, id)
++			drop = append(drop, inst)
++		}
++	}
++	p.lock.Unlock()
++	for _, inst := range drop {
++		p.wg.Add(1)
++		go func() {
++			defer p.wg.Done()
++			inst.destroy()
++		}()
++	}
++	return &proto.SandboxReconcileResponse{Released: uint32(len(drop))}, nil
++}
++
++// Close releases everything synchronously and stops refilling.
++func (p *Process) Close() error {
++	p.lock.Lock()
++	if p.closed {
++		p.lock.Unlock()
++		return nil
++	}
++	p.closed = true
++	all := append([]*instance(nil), p.pool...)
++	for _, inst := range p.live {
++		all = append(all, inst)
++	}
++	p.pool, p.live = nil, map[string]*instance{}
++	p.lock.Unlock()
++
++	if p.cancel != nil {
++		p.cancel()
++	}
++	for _, inst := range all {
++		inst.destroy()
++	}
++	p.wg.Wait()
++	return nil
++}
++
++// --- command execution ---
++
++func baseEnv(dir string, extra map[string]string) []string {
++	path := os.Getenv("PATH")
++	if path == "" {
++		path = "/usr/local/bin:/usr/bin:/bin"
++	}
++	env := map[string]string{"PATH": path, "HOME": dir, "TMPDIR": dir, "LANG": "C.UTF-8"}
++	for k, v := range extra {
++		env[k] = v
++	}
++	out := make([]string, 0, len(env))
++	for k, v := range env {
++		out = append(out, k+"="+v)
++	}
++	return out
++}
++
++func (i *instance) command(spec *proto.SandboxExecSpec) (*exec.Cmd, error) {
++	if spec == nil || spec.GetCommand() == "" {
++		return nil, status.Error(codes.InvalidArgument, "command is required")
++	}
++	dir := i.dir
++	if cwd := spec.GetCwd(); cwd != "" {
++		if filepath.IsAbs(cwd) {
++			dir = cwd
++		} else {
++			dir = filepath.Join(i.dir, cwd)
++			if rel, err := filepath.Rel(i.dir, dir); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
++				return nil, status.Errorf(codes.InvalidArgument, "cwd %q escapes the instance directory", cwd)
++			}
++		}
++	}
++	cmd := exec.Command(spec.GetCommand(), spec.GetArgs()...)
++	cmd.Dir = dir
++	cmd.Env = baseEnv(i.dir, spec.GetEnv())
++	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
++	cmd.WaitDelay = waitDelay
++	return cmd, nil
++}
++
++func killGroup(cmd *exec.Cmd) {
++	if cmd.Process != nil {
++		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
++	}
++}
++
++// capBuffer keeps at most outputCap bytes and discards (but accepts) the rest
++// so the producing child never blocks on a full pipe.
++type capBuffer struct {
++	lock      sync.Mutex
++	buf       bytes.Buffer
++	truncated bool
++}
++
++func (c *capBuffer) Write(b []byte) (int, error) {
++	c.lock.Lock()
++	defer c.lock.Unlock()
++	room := outputCap - c.buf.Len()
++	if room > len(b) {
++		room = len(b)
++	}
++	if room > 0 {
++		c.buf.Write(b[:room])
++	}
++	if room < len(b) {
++		c.truncated = true
++	}
++	return len(b), nil
++}
++
++func exitCode(cmd *exec.Cmd, err error) int32 {
++	if cmd.ProcessState != nil {
++		if c := cmd.ProcessState.ExitCode(); c != 0 {
++			return int32(c)
++		}
++		if err == nil {
++			return 0
++		}
++	}
++	return -1
++}
++
++func (p *Process) Exec(ctx context.Context, req *proto.SandboxExecRequest) (*proto.SandboxExecResponse, error) {
++	inst, err := p.get(req.GetInstanceId())
++	if err != nil {
++		return nil, err
++	}
++	spec := req.GetSpec()
++	cmd, err := inst.command(spec)
++	if err != nil {
++		return nil, err
++	}
++	var stdout, stderr capBuffer
++	cmd.Stdout, cmd.Stderr = &stdout, &stderr
++	if len(spec.GetStdin()) > 0 {
++		cmd.Stdin = bytes.NewReader(spec.GetStdin())
++	}
++
++	start := time.Now()
++	if err := cmd.Start(); err != nil {
++		return nil, status.Errorf(codes.InvalidArgument, "starting %q: %v", spec.GetCommand(), err)
++	}
++
++	var timedOut atomic.Bool
++	finished := make(chan struct{})
++	var timeout <-chan time.Time
++	if ms := spec.GetTimeoutMs(); ms > 0 {
++		t := time.NewTimer(time.Duration(ms) * time.Millisecond)
++		defer t.Stop()
++		timeout = t.C
++	}
++	killerDone := make(chan struct{})
++	go func() {
++		defer close(killerDone)
++		select {
++		case <-finished:
++		case <-timeout:
++			timedOut.Store(true)
++			killGroup(cmd)
++		case <-ctx.Done():
++			killGroup(cmd)
++		case <-inst.ctx.Done():
++			killGroup(cmd)
++		}
++	}()
++	waitErr := cmd.Wait()
++	close(finished)
++	<-killerDone
++
++	if err := ctx.Err(); err != nil {
++		return nil, status.FromContextError(err).Err()
++	}
++	code := exitCode(cmd, waitErr)
++	if timedOut.Load() && code == 0 {
++		code = -1
++	}
++	stdout.lock.Lock()
++	stderr.lock.Lock()
++	defer stdout.lock.Unlock()
++	defer stderr.lock.Unlock()
++	return &proto.SandboxExecResponse{
++		Stdout:    stdout.buf.Bytes(),
++		Stderr:    stderr.buf.Bytes(),
++		ExitCode:  code,
++		Truncated: stdout.truncated || stderr.truncated,
++		TimedOut:  timedOut.Load(),
++		ElapsedUs: uint64(time.Since(start).Microseconds()),
++	}, nil
++}
++
++// --- sessions ---
++
++type session struct {
++	cmd   *exec.Cmd
++	stdin interface {
++		Write([]byte) (int, error)
++		Close() error
++	}
++	sendLock sync.Mutex // serialises SessionSend calls
++
++	lock      sync.Mutex
++	out, errb []byte
++	truncated bool
++	changed   chan struct{}
++	exit      int32
++
++	done chan struct{} // closed once the process exited and output is drained
++}
++
++type sessionStream struct {
++	s   *session
++	dst func(*session) *[]byte
++}
++
++func (w sessionStream) Write(b []byte) (int, error) {
++	w.s.lock.Lock()
++	defer w.s.lock.Unlock()
++	dst := w.dst(w.s)
++	room := outputCap - len(*dst)
++	if room > len(b) {
++		room = len(b)
++	}
++	if room > 0 {
++		*dst = append(*dst, b[:room]...)
++	}
++	if room < len(b) {
++		w.s.truncated = true
++	}
++	close(w.s.changed)
++	w.s.changed = make(chan struct{})
++	return len(b), nil
++}
++
++func (s *session) kill() {
++	killGroup(s.cmd)
++	_ = s.stdin.Close()
++}
++
++func (p *Process) SessionStart(_ context.Context, req *proto.SandboxSessionStartRequest) (*proto.SandboxSessionStartResponse, error) {
++	inst, err := p.get(req.GetInstanceId())
++	if err != nil {
++		return nil, err
++	}
++	cmd, err := inst.command(req.GetSpec())
++	if err != nil {
++		return nil, err
++	}
++	s := &session{cmd: cmd, changed: make(chan struct{}), done: make(chan struct{})}
++	cmd.Stdout = sessionStream{s, func(s *session) *[]byte { return &s.out }}
++	cmd.Stderr = sessionStream{s, func(s *session) *[]byte { return &s.errb }}
++	stdin, err := cmd.StdinPipe()
++	if err != nil {
++		return nil, status.Errorf(codes.Internal, "stdin pipe: %v", err)
++	}
++	s.stdin = stdin
++	if err := cmd.Start(); err != nil {
++		return nil, status.Errorf(codes.InvalidArgument, "starting %q: %v", req.GetSpec().GetCommand(), err)
++	}
++	go func() {
++		werr := cmd.Wait()
++		s.lock.Lock()
++		s.exit = exitCode(cmd, werr)
++		s.lock.Unlock()
++		close(s.done)
++		s.lock.Lock()
++		close(s.changed)
++		s.changed = make(chan struct{})
++		s.lock.Unlock()
++	}()
++
++	inst.lock.Lock()
++	if inst.ctx.Err() != nil {
++		inst.lock.Unlock()
++		s.kill()
++		return nil, status.Errorf(codes.NotFound, "instance %q was released", inst.id)
++	}
++	inst.seq++
++	id := "s" + strconv.Itoa(inst.seq)
++	inst.sessions[id] = s
++	inst.lock.Unlock()
++	return &proto.SandboxSessionStartResponse{SessionId: id}, nil
++}
++
++func (i *instance) session(id string) (*session, error) {
++	i.lock.Lock()
++	defer i.lock.Unlock()
++	s, ok := i.sessions[id]
++	if !ok {
++		return nil, status.Errorf(codes.NotFound, "unknown session %q", id)
++	}
++	return s, nil
++}
++
++// SessionSend writes input to the session and returns the output produced
++// since the call started, once `until` appears in stdout or stderr, the
++// process exits, or timeout_ms elapses (timed_out=true, no error). With an
++// empty `until` it simply waits timeout_ms. Output produced between sends is
++// not returned by the following send.
++func (p *Process) SessionSend(ctx context.Context, req *proto.SandboxSessionSendRequest) (*proto.SandboxExecResponse, error) {
++	inst, err := p.get(req.GetInstanceId())
++	if err != nil {
++		return nil, err
++	}
++	s, err := inst.session(req.GetSessionId())
++	if err != nil {
++		return nil, err
++	}
++	s.sendLock.Lock()
++	defer s.sendLock.Unlock()
++
++	start := time.Now()
++	until := req.GetUntil()
++	timeout := time.Duration(req.GetTimeoutMs()) * time.Millisecond
++	if timeout == 0 && len(until) > 0 {
++		timeout = defaultSendTimeout
++	}
++	timer := time.NewTimer(timeout)
++	defer timer.Stop()
++
++	s.lock.Lock()
++	startOut, startErr := len(s.out), len(s.errb)
++	s.lock.Unlock()
++
++	if in := req.GetInput(); len(in) > 0 {
++		werr := make(chan error, 1)
++		go func() { _, err := s.stdin.Write(in); werr <- err }()
++		select {
++		case err := <-werr:
++			if err != nil {
++				select {
++				case <-s.done: // process exited; fall through and report it
++				default:
++					return nil, status.Errorf(codes.FailedPrecondition, "writing to session: %v", err)
++				}
++			}
++		case <-timer.C:
++			return p.collect(s, startOut, startErr, true, start), nil
++		case <-ctx.Done():
++			return nil, status.FromContextError(ctx.Err()).Err()
++		}
++	}
++
++	timedOut := false
++	for {
++		s.lock.Lock()
++		o, e, changed := s.out[startOut:], s.errb[startErr:], s.changed
++		matched := len(until) > 0 && (bytes.Contains(o, until) || bytes.Contains(e, until))
++		s.lock.Unlock()
++		if matched {
++			break
++		}
++		select {
++		case <-changed:
++			continue
++		case <-s.done:
++		case <-timer.C:
++			timedOut = len(until) > 0
++		case <-ctx.Done():
++			return nil, status.FromContextError(ctx.Err()).Err()
++		}
++		break
++	}
++	return p.collect(s, startOut, startErr, timedOut, start), nil
++}
++
++func (p *Process) collect(s *session, so, se int, timedOut bool, start time.Time) *proto.SandboxExecResponse {
++	s.lock.Lock()
++	defer s.lock.Unlock()
++	res := &proto.SandboxExecResponse{
++		Stdout:    append([]byte(nil), s.out[so:]...),
++		Stderr:    append([]byte(nil), s.errb[se:]...),
++		Truncated: s.truncated,
++		TimedOut:  timedOut,
++		ElapsedUs: uint64(time.Since(start).Microseconds()),
++	}
++	select {
++	case <-s.done:
++		res.ExitCode = s.exit
++	default:
++	}
++	return res
++}
++
++func (p *Process) SessionClose(_ context.Context, req *proto.SandboxSessionCloseRequest) (*proto.SandboxSessionCloseResponse, error) {
++	inst, err := p.get(req.GetInstanceId())
++	if err != nil {
++		return nil, err
++	}
++	inst.lock.Lock()
++	s, ok := inst.sessions[req.GetSessionId()]
++	delete(inst.sessions, req.GetSessionId())
++	inst.lock.Unlock()
++	if !ok {
++		return nil, status.Errorf(codes.NotFound, "unknown session %q", req.GetSessionId())
++	}
++	s.kill()
++	<-s.done
++	return &proto.SandboxSessionCloseResponse{}, nil
++}
+diff --git a/pkg/components/sandbox/process/process_test.go b/pkg/components/sandbox/process/process_test.go
+new file mode 100644
+index 000000000..f68f8a2ba
+--- /dev/null
++++ b/pkg/components/sandbox/process/process_test.go
+@@ -0,0 +1,197 @@
++//go:build !windows && unit
++
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package process
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++
++	"github.com/dapr/components-contrib/metadata"
++	proto "github.com/dapr/dapr/pkg/proto/components/v1"
++	"github.com/dapr/kit/logger"
++)
++
++func newDriver(t *testing.T, props map[string]string) *Process {
++	t.Helper()
++	return newDriverDelay(t, props, 0)
++}
++
++func newDriverDelay(t *testing.T, props map[string]string, refillDelay time.Duration) *Process {
++	t.Helper()
++	p := map[string]string{"image": "ignored"}
++	for k, v := range props {
++		p[k] = v
++	}
++	d := New(logger.NewLogger("test")).(*Process)
++	d.refillDelay = refillDelay
++	require.NoError(t, d.Init(t.Context(), metadata.Base{Properties: p}))
++	t.Cleanup(func() { _ = d.Close() })
++	deadline := time.Now().Add(5 * time.Second)
++	for {
++		r, err := d.Ready(t.Context(), &proto.SandboxReadyRequest{})
++		require.NoError(t, err)
++		if r.GetReady() {
++			break
++		}
++		require.False(t, time.Now().After(deadline), "not ready: %s", r.GetReason())
++		time.Sleep(5 * time.Millisecond)
++	}
++	return d
++}
++
++func acquire(t *testing.T, d *Process) *proto.SandboxAcquireResponse {
++	t.Helper()
++	r, err := d.Acquire(t.Context(), &proto.SandboxAcquireRequest{SandboxId: "s", ActivationId: "a"})
++	require.NoError(t, err)
++	return r
++}
++
++func run(t *testing.T, d *Process, id string, spec *proto.SandboxExecSpec) *proto.SandboxExecResponse {
++	t.Helper()
++	r, err := d.Exec(t.Context(), &proto.SandboxExecRequest{InstanceId: id, Spec: spec})
++	require.NoError(t, err)
++	return r
++}
++
++func TestAcquirePoolThenBoot(t *testing.T) {
++	d := newDriverDelay(t, map[string]string{"warmPoolSize": "1", "refillConcurrency": "1"}, time.Hour)
++	a := acquire(t, d)
++	assert.Equal(t, proto.SandboxAcquirePath_POOL, a.GetPath())
++	b := acquire(t, d)
++	assert.Equal(t, proto.SandboxAcquirePath_BOOT, b.GetPath())
++	assert.NotEqual(t, a.GetInstanceId(), b.GetInstanceId())
++}
++
++func TestHostFull(t *testing.T) {
++	d := newDriver(t, map[string]string{"maxSandboxesPerHost": "1", "warmPoolSize": "1"})
++	acquire(t, d)
++	_, err := d.Acquire(t.Context(), &proto.SandboxAcquireRequest{SandboxId: "s2"})
++	require.Error(t, err)
++	assert.Equal(t, codes.ResourceExhausted, status.Code(err))
++}
++
++func TestExecEcho(t *testing.T) {
++	d := newDriver(t, nil)
++	a := acquire(t, d)
++	r := run(t, d, a.GetInstanceId(), &proto.SandboxExecSpec{Command: "echo", Args: []string{"hi"}})
++	assert.Equal(t, "hi\n", string(r.GetStdout()))
++	assert.Equal(t, int32(0), r.GetExitCode())
++}
++
++func TestExecTimeout(t *testing.T) {
++	d := newDriver(t, nil)
++	a := acquire(t, d)
++	r := run(t, d, a.GetInstanceId(), &proto.SandboxExecSpec{Command: "sleep", Args: []string{"5"}, TimeoutMs: 200})
++	assert.True(t, r.GetTimedOut())
++	assert.NotZero(t, r.GetExitCode())
++	assert.Less(t, r.GetElapsedUs(), uint64(time.Second/time.Microsecond))
++
++	r = run(t, d, a.GetInstanceId(), &proto.SandboxExecSpec{Command: "echo", Args: []string{"ok"}})
++	assert.Equal(t, "ok\n", string(r.GetStdout()))
++}
++
++func TestExecOutputCap(t *testing.T) {
++	d := newDriver(t, nil)
++	a := acquire(t, d)
++	r := run(t, d, a.GetInstanceId(), &proto.SandboxExecSpec{Command: "head", Args: []string{"-c", "10485760", "/dev/zero"}})
++	assert.Len(t, r.GetStdout(), 4194304)
++	assert.True(t, r.GetTruncated())
++	assert.Equal(t, int32(0), r.GetExitCode())
++}
++
++func TestExecCwdEnvStdin(t *testing.T) {
++	d := newDriver(t, nil)
++	a := acquire(t, d)
++	r := run(t, d, a.GetInstanceId(), &proto.SandboxExecSpec{Command: "sh", Args: []string{"-c", "echo $FOO; pwd; cat"}, Env: map[string]string{"FOO": "bar"}, Stdin: []byte("in")})
++	assert.Contains(t, string(r.GetStdout()), "bar\n")
++	assert.Contains(t, string(r.GetStdout()), "in")
++	run(t, d, a.GetInstanceId(), &proto.SandboxExecSpec{Command: "mkdir", Args: []string{"sub"}})
++	r = run(t, d, a.GetInstanceId(), &proto.SandboxExecSpec{Command: "pwd", Cwd: "sub"})
++	assert.Contains(t, string(r.GetStdout()), "/sub\n")
++}
++
++func TestSessionKeepsState(t *testing.T) {
++	d := newDriver(t, nil)
++	a := acquire(t, d)
++	s, err := d.SessionStart(t.Context(), &proto.SandboxSessionStartRequest{
++		InstanceId: a.GetInstanceId(), Spec: &proto.SandboxExecSpec{Command: "sh", Args: []string{"-i"}},
++	})
++	require.NoError(t, err)
++	_, err = d.SessionSend(t.Context(), &proto.SandboxSessionSendRequest{
++		InstanceId: a.GetInstanceId(), SessionId: s.GetSessionId(), Input: []byte("X=42\n"), TimeoutMs: 100,
++	})
++	require.NoError(t, err)
++	r, err := d.SessionSend(t.Context(), &proto.SandboxSessionSendRequest{
++		InstanceId: a.GetInstanceId(), SessionId: s.GetSessionId(), Input: []byte("echo $X\n"), Until: []byte("42"), TimeoutMs: 5000,
++	})
++	require.NoError(t, err)
++	assert.Contains(t, string(r.GetStdout())+string(r.GetStderr()), "42")
++	assert.False(t, r.GetTimedOut())
++
++	// timeout returns collected output with no error
++	r, err = d.SessionSend(t.Context(), &proto.SandboxSessionSendRequest{
++		InstanceId: a.GetInstanceId(), SessionId: s.GetSessionId(), Input: []byte("true\n"), Until: []byte("never-appears"), TimeoutMs: 100,
++	})
++	require.NoError(t, err)
++	assert.True(t, r.GetTimedOut())
++
++	_, err = d.SessionClose(t.Context(), &proto.SandboxSessionCloseRequest{InstanceId: a.GetInstanceId(), SessionId: s.GetSessionId()})
++	require.NoError(t, err)
++	_, err = d.SessionSend(t.Context(), &proto.SandboxSessionSendRequest{InstanceId: a.GetInstanceId(), SessionId: s.GetSessionId()})
++	assert.Equal(t, codes.NotFound, status.Code(err))
++}
++
++func TestUnknownInstance(t *testing.T) {
++	d := newDriver(t, nil)
++	_, err := d.Exec(t.Context(), &proto.SandboxExecRequest{InstanceId: "nope", Spec: &proto.SandboxExecSpec{Command: "echo"}})
++	assert.Equal(t, codes.NotFound, status.Code(err))
++	_, err = d.SessionStart(t.Context(), &proto.SandboxSessionStartRequest{InstanceId: "nope", Spec: &proto.SandboxExecSpec{Command: "cat"}})
++	assert.Equal(t, codes.NotFound, status.Code(err))
++	_, err = d.Release(t.Context(), &proto.SandboxReleaseRequest{InstanceId: "nope"})
++	assert.Equal(t, codes.NotFound, status.Code(err))
++}
++
++func TestReleaseFreesSlot(t *testing.T) {
++	d := newDriver(t, map[string]string{"maxSandboxesPerHost": "1", "warmPoolSize": "0"})
++	a := acquire(t, d)
++	_, err := d.Release(context.Background(), &proto.SandboxReleaseRequest{InstanceId: a.GetInstanceId()})
++	require.NoError(t, err)
++	b := acquire(t, d)
++	assert.Equal(t, proto.SandboxAcquirePath_BOOT, b.GetPath())
++	assert.Eventually(t, func() bool {
++		_, err := d.Exec(t.Context(), &proto.SandboxExecRequest{InstanceId: a.GetInstanceId(), Spec: &proto.SandboxExecSpec{Command: "true"}})
++		return status.Code(err) == codes.NotFound
++	}, 2*time.Second, 10*time.Millisecond)
++}
++
++func TestReconcile(t *testing.T) {
++	d := newDriver(t, map[string]string{"warmPoolSize": "0"})
++	a := acquire(t, d)
++	acquire(t, d)
++	acquire(t, d)
++	r, err := d.Reconcile(t.Context(), &proto.SandboxReconcileRequest{LiveInstanceIds: []string{a.GetInstanceId()}})
++	require.NoError(t, err)
++	assert.Equal(t, uint32(2), r.GetReleased())
++	run(t, d, a.GetInstanceId(), &proto.SandboxExecSpec{Command: "true"})
++}
+-- 
+2.47.0
+

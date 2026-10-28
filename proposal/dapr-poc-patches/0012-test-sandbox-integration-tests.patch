@@ -1,0 +1,1063 @@
+From 41cbccbb86bd42be0a4a8b6f32b9f732aacc3757 Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Wed, 28 Oct 2026 21:03:21 +0100
+Subject: [PATCH 12/12] test(sandbox): integration tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../framework/process/sandbox/sandbox.go      | 317 ++++++++++++++++++
+ tests/integration/suite/daprd/daprd.go        |   1 +
+ .../suite/daprd/sandbox/crossapp.go           | 217 ++++++++++++
+ .../suite/daprd/sandbox/pluggable.go          | 157 +++++++++
+ .../suite/daprd/sandbox/process.go            | 177 ++++++++++
+ .../suite/daprd/sandbox/sandbox.go            | 130 +++++++
+ 6 files changed, 999 insertions(+)
+ create mode 100644 tests/integration/framework/process/sandbox/sandbox.go
+ create mode 100644 tests/integration/suite/daprd/sandbox/crossapp.go
+ create mode 100644 tests/integration/suite/daprd/sandbox/pluggable.go
+ create mode 100644 tests/integration/suite/daprd/sandbox/process.go
+ create mode 100644 tests/integration/suite/daprd/sandbox/sandbox.go
+
+diff --git a/tests/integration/framework/process/sandbox/sandbox.go b/tests/integration/framework/process/sandbox/sandbox.go
+new file mode 100644
+index 000000000..7f67455d2
+--- /dev/null
++++ b/tests/integration/framework/process/sandbox/sandbox.go
+@@ -0,0 +1,317 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package sandbox runs a fake pluggable sandbox driver over a unix socket for
++// integration tests. It keeps its "instances" in memory and runs nothing.
++package sandbox
++
++import (
++	"context"
++	"net"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/credentials/insecure"
++	"google.golang.org/grpc/reflection"
++	"google.golang.org/grpc/status"
++
++	compv1pb "github.com/dapr/dapr/pkg/proto/components/v1"
++	"github.com/dapr/dapr/tests/integration/framework/socket"
++)
++
++// Option configures the fake driver.
++type Option func(*options)
++
++type options struct {
++	socket *socket.Socket
++	ready  bool
++}
++
++// WithSocket sets the socket directory the driver listens in. Required.
++func WithSocket(s *socket.Socket) Option {
++	return func(o *options) {
++		o.socket = s
++	}
++}
++
++// WithReady sets whether the driver reports ready from the start. Defaults
++// to true; use SetReady to change it later.
++func WithReady(ready bool) Option {
++	return func(o *options) {
++		o.ready = ready
++	}
++}
++
++// Sandbox is a fake pluggable sandbox driver.
++type Sandbox struct {
++	listener   net.Listener
++	socketName string
++	server     *grpc.Server
++	driver     *driver
++
++	srvErrCh chan error
++	started  atomic.Bool
++	stopOnce sync.Once
++}
++
++// New creates the driver and starts listening on a new socket file in the
++// socket directory, so daprd can discover it as `sandbox.<SocketName()>`.
++func New(t *testing.T, fopts ...Option) *Sandbox {
++	t.Helper()
++
++	opts := options{ready: true}
++	for _, fopt := range fopts {
++		fopt(&opts)
++	}
++
++	require.NotNil(t, opts.socket)
++
++	// Start the listener in New so we can squat on the path immediately, and
++	// keep it for the entire test case.
++	socketFile := opts.socket.File(t)
++	listener, err := net.Listen("unix", socketFile.Filename())
++	require.NoError(t, err)
++
++	d := &driver{instances: make(map[string]*instance)}
++	d.ready.Store(opts.ready)
++
++	server := grpc.NewServer()
++	compv1pb.RegisterSandboxServer(server, d)
++	reflection.Register(server)
++
++	return &Sandbox{
++		listener:   listener,
++		socketName: socketFile.Name(),
++		server:     server,
++		driver:     d,
++		srvErrCh:   make(chan error, 1),
++	}
++}
++
++// SocketName is the component type suffix: `sandbox.<SocketName()>`.
++func (s *Sandbox) SocketName() string {
++	return s.socketName
++}
++
++func (s *Sandbox) Run(t *testing.T, ctx context.Context) {
++	s.started.Store(true)
++	go func() {
++		s.srvErrCh <- s.server.Serve(s.listener)
++	}()
++
++	conn, err := grpc.DialContext(ctx, "unix://"+s.listener.Addr().String(), //nolint:staticcheck
++		grpc.WithTransportCredentials(insecure.NewCredentials()),
++		grpc.WithBlock(), //nolint:staticcheck
++	)
++	require.NoError(t, err)
++
++	client := compv1pb.NewSandboxClient(conn)
++	assert.EventuallyWithT(t, func(c *assert.CollectT) {
++		_, err = client.Ping(ctx, new(compv1pb.PingRequest))
++		assert.NoError(c, err)
++	}, 10*time.Second, 10*time.Millisecond)
++	require.NoError(t, conn.Close())
++}
++
++// Cleanup stops the driver if Kill did not already.
++func (s *Sandbox) Cleanup(t *testing.T) {
++	s.stop(t)
++}
++
++// Kill stops the driver abruptly, as if it crashed: open connections are
++// closed and the socket file is removed.
++func (s *Sandbox) Kill(t *testing.T) {
++	t.Helper()
++	s.stop(t)
++}
++
++func (s *Sandbox) stop(t *testing.T) {
++	s.stopOnce.Do(func() {
++		if !s.started.Load() {
++			// Never served: only the listener (and its socket file) is open.
++			require.NoError(t, s.listener.Close())
++			return
++		}
++		// Stop closes the listener, which removes the socket file.
++		s.server.Stop()
++		require.NoError(t, <-s.srvErrCh)
++	})
++}
++
++// SetReady sets what the driver's Ready call reports.
++func (s *Sandbox) SetReady(ready bool) {
++	s.driver.ready.Store(ready)
++}
++
++// ReadyCalls returns how many times daprd asked the driver whether it is
++// ready.
++func (s *Sandbox) ReadyCalls() int64 {
++	return s.driver.readyCalls.Load()
++}
++
++// Acquires returns how many instances daprd acquired.
++func (s *Sandbox) Acquires() int64 {
++	return s.driver.acquires.Load()
++}
++
++// LiveInstances returns the number of instances acquired and not released.
++func (s *Sandbox) LiveInstances() int {
++	s.driver.lock.Lock()
++	defer s.driver.lock.Unlock()
++	return len(s.driver.instances)
++}
++
++type instance struct {
++	sessions map[string]struct{}
++	seq      int
++}
++
++// driver implements the Sandbox gRPC service. Exec echoes the command line
++// it was given; a session echoes its input.
++type driver struct {
++	compv1pb.UnimplementedSandboxServer
++
++	ready      atomic.Bool
++	readyCalls atomic.Int64
++	acquires   atomic.Int64
++
++	lock      sync.Mutex
++	nextID    int
++	instances map[string]*instance
++}
++
++func (d *driver) Init(context.Context, *compv1pb.SandboxInitRequest) (*compv1pb.SandboxInitResponse, error) {
++	return new(compv1pb.SandboxInitResponse), nil
++}
++
++func (d *driver) Features(context.Context, *compv1pb.FeaturesRequest) (*compv1pb.FeaturesResponse, error) {
++	return new(compv1pb.FeaturesResponse), nil
++}
++
++func (d *driver) Ping(context.Context, *compv1pb.PingRequest) (*compv1pb.PingResponse, error) {
++	return new(compv1pb.PingResponse), nil
++}
++
++func (d *driver) Ready(context.Context, *compv1pb.SandboxReadyRequest) (*compv1pb.SandboxReadyResponse, error) {
++	d.readyCalls.Add(1)
++	if d.ready.Load() {
++		return &compv1pb.SandboxReadyResponse{Ready: true}, nil
++	}
++	return &compv1pb.SandboxReadyResponse{Reason: "fake driver is not ready"}, nil
++}
++
++func (d *driver) Acquire(context.Context, *compv1pb.SandboxAcquireRequest) (*compv1pb.SandboxAcquireResponse, error) {
++	d.acquires.Add(1)
++	d.lock.Lock()
++	defer d.lock.Unlock()
++	d.nextID++
++	id := "fake-" + strconv.Itoa(d.nextID)
++	d.instances[id] = &instance{sessions: make(map[string]struct{})}
++	return &compv1pb.SandboxAcquireResponse{
++		InstanceId: id,
++		Path:       compv1pb.SandboxAcquirePath_POOL,
++	}, nil
++}
++
++func (d *driver) get(id string) (*instance, error) {
++	inst, ok := d.instances[id]
++	if !ok {
++		return nil, status.Errorf(codes.NotFound, "unknown instance %q", id)
++	}
++	return inst, nil
++}
++
++func (d *driver) Exec(_ context.Context, req *compv1pb.SandboxExecRequest) (*compv1pb.SandboxExecResponse, error) {
++	d.lock.Lock()
++	defer d.lock.Unlock()
++	if _, err := d.get(req.GetInstanceId()); err != nil {
++		return nil, err
++	}
++	line := append([]string{req.GetSpec().GetCommand()}, req.GetSpec().GetArgs()...)
++	return &compv1pb.SandboxExecResponse{Stdout: []byte(strings.Join(line, " ") + "\n")}, nil
++}
++
++func (d *driver) SessionStart(_ context.Context, req *compv1pb.SandboxSessionStartRequest) (*compv1pb.SandboxSessionStartResponse, error) {
++	d.lock.Lock()
++	defer d.lock.Unlock()
++	inst, err := d.get(req.GetInstanceId())
++	if err != nil {
++		return nil, err
++	}
++	inst.seq++
++	id := "s" + strconv.Itoa(inst.seq)
++	inst.sessions[id] = struct{}{}
++	return &compv1pb.SandboxSessionStartResponse{SessionId: id}, nil
++}
++
++func (d *driver) SessionSend(_ context.Context, req *compv1pb.SandboxSessionSendRequest) (*compv1pb.SandboxExecResponse, error) {
++	d.lock.Lock()
++	defer d.lock.Unlock()
++	inst, err := d.get(req.GetInstanceId())
++	if err != nil {
++		return nil, err
++	}
++	if _, ok := inst.sessions[req.GetSessionId()]; !ok {
++		return nil, status.Errorf(codes.NotFound, "unknown session %q", req.GetSessionId())
++	}
++	return &compv1pb.SandboxExecResponse{Stdout: req.GetInput()}, nil
++}
++
++func (d *driver) SessionClose(_ context.Context, req *compv1pb.SandboxSessionCloseRequest) (*compv1pb.SandboxSessionCloseResponse, error) {
++	d.lock.Lock()
++	defer d.lock.Unlock()
++	inst, err := d.get(req.GetInstanceId())
++	if err != nil {
++		return nil, err
++	}
++	if _, ok := inst.sessions[req.GetSessionId()]; !ok {
++		return nil, status.Errorf(codes.NotFound, "unknown session %q", req.GetSessionId())
++	}
++	delete(inst.sessions, req.GetSessionId())
++	return new(compv1pb.SandboxSessionCloseResponse), nil
++}
++
++func (d *driver) Release(_ context.Context, req *compv1pb.SandboxReleaseRequest) (*compv1pb.SandboxReleaseResponse, error) {
++	d.lock.Lock()
++	defer d.lock.Unlock()
++	if _, err := d.get(req.GetInstanceId()); err != nil {
++		return nil, err
++	}
++	delete(d.instances, req.GetInstanceId())
++	return new(compv1pb.SandboxReleaseResponse), nil
++}
++
++func (d *driver) Reconcile(_ context.Context, req *compv1pb.SandboxReconcileRequest) (*compv1pb.SandboxReconcileResponse, error) {
++	keep := make(map[string]struct{}, len(req.GetLiveInstanceIds()))
++	for _, id := range req.GetLiveInstanceIds() {
++		keep[id] = struct{}{}
++	}
++	d.lock.Lock()
++	defer d.lock.Unlock()
++	var released uint32
++	for id := range d.instances {
++		if _, ok := keep[id]; !ok {
++			delete(d.instances, id)
++			released++
++		}
++	}
++	return &compv1pb.SandboxReconcileResponse{Released: released}, nil
++}
+diff --git a/tests/integration/suite/daprd/daprd.go b/tests/integration/suite/daprd/daprd.go
+index 664b29d2c..4f544e947 100644
+--- a/tests/integration/suite/daprd/daprd.go
++++ b/tests/integration/suite/daprd/daprd.go
+@@ -36,6 +36,7 @@ import (
+ 	_ "github.com/dapr/dapr/tests/integration/suite/daprd/resiliency"
+ 	_ "github.com/dapr/dapr/tests/integration/suite/daprd/resources"
+ 	_ "github.com/dapr/dapr/tests/integration/suite/daprd/routes"
++	_ "github.com/dapr/dapr/tests/integration/suite/daprd/sandbox"
+ 	_ "github.com/dapr/dapr/tests/integration/suite/daprd/scheduler"
+ 	_ "github.com/dapr/dapr/tests/integration/suite/daprd/search"
+ 	_ "github.com/dapr/dapr/tests/integration/suite/daprd/secret"
+diff --git a/tests/integration/suite/daprd/sandbox/crossapp.go b/tests/integration/suite/daprd/sandbox/crossapp.go
+new file mode 100644
+index 000000000..187542bcd
+--- /dev/null
++++ b/tests/integration/suite/daprd/sandbox/crossapp.go
+@@ -0,0 +1,217 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"context"
++	"net/http"
++	"os/exec"
++	"runtime"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
++	"github.com/dapr/dapr/tests/integration/framework"
++	"github.com/dapr/dapr/tests/integration/framework/client"
++	"github.com/dapr/dapr/tests/integration/framework/process/daprd"
++	"github.com/dapr/dapr/tests/integration/framework/process/placement"
++	"github.com/dapr/dapr/tests/integration/framework/process/scheduler"
++	"github.com/dapr/dapr/tests/integration/suite"
++)
++
++func init() {
++	suite.Register(new(crossapp))
++}
++
++// crossapp checks that a caller without a sandbox component reaches the
++// sandbox component of another app, and that the sandbox runs there.
++//
++// Sandbox processes are counted as the child processes of each daprd: the
++// process driver starts every command as a direct child of daprd, and daprd
++// starts no other children. A session keeps one such process alive while
++// the counts are taken.
++type crossapp struct {
++	pool   *daprd.Daprd
++	caller *daprd.Daprd
++	place  *placement.Placement
++	sched  *scheduler.Scheduler
++}
++
++func (c *crossapp) Setup(t *testing.T) []framework.Option {
++	if runtime.GOOS == "windows" {
++		t.Skip("the process sandbox driver is not available on windows")
++	}
++
++	c.place = placement.New(t)
++	c.sched = scheduler.New(t)
++	c.pool = daprd.New(t,
++		daprd.WithAppID("pool"),
++		daprd.WithPlacementAddresses(c.place.Address()),
++		daprd.WithSchedulerAddresses(c.sched.Address()),
++		daprd.WithInMemoryActorStateStore("mystore"),
++		daprd.WithResourceFiles(`
++apiVersion: dapr.io/v1alpha1
++kind: Component
++metadata:
++  name: py
++spec:
++  type: sandbox.process
++  version: v1
++  metadata:
++  - name: image
++    value: local
++  - name: template
++    value: none
++  - name: warmPoolSize
++    value: "2"
++`),
++	)
++	c.caller = daprd.New(t,
++		daprd.WithAppID("caller"),
++		daprd.WithPlacementAddresses(c.place.Address()),
++		daprd.WithSchedulerAddresses(c.sched.Address()),
++		daprd.WithInMemoryActorStateStore("mystore"),
++	)
++
++	return []framework.Option{
++		framework.WithProcesses(c.place, c.sched, c.pool, c.caller),
++	}
++}
++
++func (c *crossapp) Run(t *testing.T, ctx context.Context) {
++	c.place.WaitUntilRunning(t, ctx)
++	c.sched.WaitUntilRunning(t, ctx)
++	c.pool.WaitUntilRunning(t, ctx)
++	c.caller.WaitUntilRunning(t, ctx)
++	c.pool.WaitUntilActorTypeHosted(t, ctx, actorType(c.pool, "py"))
++
++	poolPID := daprdPID(t, c.pool)
++	callerPID := daprdPID(t, c.caller)
++	require.NotEqual(t, poolPID, callerPID)
++
++	httpClient := client.HTTP(t)
++	viaPool := []string{"dapr-app-id", "pool"}
++
++	poolBefore := len(childPIDs(t, poolPID))
++	callerBefore := len(childPIDs(t, callerPID))
++
++	t.Run("caller execs in the pool app's sandbox", func(t *testing.T) {
++		// Retry until placement has told the caller where the type lives.
++		var res runtimev1pb.SandboxExecResponseAlpha1
++		require.EventuallyWithT(t, func(col *assert.CollectT) {
++			r := call(col, ctx, httpClient, http.MethodPost, sandboxURL(c.caller, "py", "sb-x", "exec"),
++				execBody{Command: "echo", Args: []string{"hi"}, TimeoutMs: 5000}, viaPool...)
++			if assert.Equal(col, http.StatusOK, r.status, r.String()) {
++				decode(col, r, &res)
++			}
++		}, 20*time.Second, 100*time.Millisecond)
++		assert.Equal(t, "hi\n", string(res.GetStdout()))
++		assert.Equal(t, "POOL", res.GetTiming().GetAcquirePath())
++
++		// The command's parent is the pool daprd.
++		decode(t, call(t, ctx, httpClient, http.MethodPost, sandboxURL(c.caller, "py", "sb-x", "exec"),
++			execBody{Command: "sh", Args: []string{"-c", "echo $PPID"}}, viaPool...), &res)
++		assert.Equal(t, strconv.Itoa(poolPID), strings.TrimSpace(string(res.GetStdout())))
++	})
++
++	t.Run("sandbox processes run in the pool app only", func(t *testing.T) {
++		// `cat` waits on its stdin, so the session keeps it alive.
++		var started runtimev1pb.SandboxSessionStartResponseAlpha1
++		decode(t, call(t, ctx, httpClient, http.MethodPost, sandboxURL(c.caller, "py", "sb-x", "sessions"),
++			sessionStartBody{Command: "cat"}, viaPool...), &started)
++
++		assert.EventuallyWithT(t, func(col *assert.CollectT) {
++			assert.Greater(col, len(childPIDs(col, poolPID)), poolBefore)
++		}, 5*time.Second, 50*time.Millisecond)
++		assert.Len(t, childPIDs(t, callerPID), callerBefore)
++		t.Logf("sandbox processes: pool %d -> %d, caller %d -> %d",
++			poolBefore, len(childPIDs(t, poolPID)), callerBefore, len(childPIDs(t, callerPID)))
++
++		r := call(t, ctx, httpClient, http.MethodDelete,
++			sandboxURL(c.caller, "py", "sb-x", "sessions", started.GetSessionId()), nil, viaPool...)
++		assert.Equal(t, http.StatusOK, r.status, r.String())
++		assert.EventuallyWithT(t, func(col *assert.CollectT) {
++			assert.Len(col, childPIDs(col, poolPID), poolBefore)
++		}, 5*time.Second, 50*time.Millisecond)
++		assert.Len(t, childPIDs(t, callerPID), callerBefore)
++	})
++
++	t.Run("caller has no sandbox component of its own", func(t *testing.T) {
++		r := call(t, ctx, httpClient, http.MethodPost, sandboxURL(c.caller, "py", "sb-x", "exec"),
++			execBody{Command: "echo", Args: []string{"hi"}})
++		assert.Equal(t, http.StatusBadRequest, r.status, r.String())
++		assert.Equal(t, "ERR_SANDBOX_NOT_FOUND", r.errorCode())
++	})
++}
++
++// psRow is one line of `ps`.
++type psRow struct {
++	pid, ppid int
++	args      []string
++}
++
++func listProcesses(t assert.TestingT) []psRow {
++	out, err := exec.Command("ps", "-A", "-ww", "-o", "pid=,ppid=,command=").Output()
++	if !assert.NoError(t, err) {
++		return nil
++	}
++	var rows []psRow
++	for _, line := range strings.Split(string(out), "\n") {
++		f := strings.Fields(line)
++		if len(f) < 3 {
++			continue
++		}
++		pid, err1 := strconv.Atoi(f[0])
++		ppid, err2 := strconv.Atoi(f[1])
++		if err1 != nil || err2 != nil {
++			continue
++		}
++		rows = append(rows, psRow{pid: pid, ppid: ppid, args: f[2:]})
++	}
++	return rows
++}
++
++// daprdPID finds the daprd process by its HTTP port flag, which is unique to
++// each daprd.
++func daprdPID(t *testing.T, d *daprd.Daprd) int {
++	t.Helper()
++	flag := "--dapr-http-port=" + strconv.Itoa(d.HTTPPort())
++	var pids []int
++	for _, row := range listProcesses(t) {
++		for _, a := range row.args {
++			if a == flag {
++				pids = append(pids, row.pid)
++				break
++			}
++		}
++	}
++	require.Len(t, pids, 1, "daprd processes with %s", flag)
++	return pids[0]
++}
++
++// childPIDs returns the PIDs of the direct children of pid.
++func childPIDs(t assert.TestingT, pid int) []int {
++	var pids []int
++	for _, row := range listProcesses(t) {
++		if row.ppid == pid {
++			pids = append(pids, row.pid)
++		}
++	}
++	return pids
++}
+diff --git a/tests/integration/suite/daprd/sandbox/pluggable.go b/tests/integration/suite/daprd/sandbox/pluggable.go
+new file mode 100644
+index 000000000..5733754c5
+--- /dev/null
++++ b/tests/integration/suite/daprd/sandbox/pluggable.go
+@@ -0,0 +1,157 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"context"
++	"net/http"
++	"runtime"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
++	"github.com/dapr/dapr/tests/integration/framework"
++	"github.com/dapr/dapr/tests/integration/framework/client"
++	"github.com/dapr/dapr/tests/integration/framework/process/daprd"
++	"github.com/dapr/dapr/tests/integration/framework/process/placement"
++	procsandbox "github.com/dapr/dapr/tests/integration/framework/process/sandbox"
++	"github.com/dapr/dapr/tests/integration/framework/process/scheduler"
++	"github.com/dapr/dapr/tests/integration/framework/socket"
++	"github.com/dapr/dapr/tests/integration/suite"
++)
++
++func init() {
++	suite.Register(new(pluggable))
++}
++
++// pluggable drives a fake pluggable sandbox driver through not ready, ready
++// and crashed.
++type pluggable struct {
++	daprd  *daprd.Daprd
++	place  *placement.Placement
++	sched  *scheduler.Scheduler
++	driver *procsandbox.Sandbox
++}
++
++// notReadyFor is how long the driver reports not ready at least.
++const notReadyFor = time.Second
++
++func (p *pluggable) Setup(t *testing.T) []framework.Option {
++	if runtime.GOOS == "windows" {
++		t.Skip("skipping unix socket based test on windows")
++	}
++
++	sock := socket.New(t)
++	p.driver = procsandbox.New(t,
++		procsandbox.WithSocket(sock),
++		procsandbox.WithReady(false),
++	)
++	p.place = placement.New(t)
++	p.sched = scheduler.New(t)
++	p.daprd = daprd.New(t,
++		daprd.WithSocket(t, sock),
++		daprd.WithPlacementAddresses(p.place.Address()),
++		daprd.WithSchedulerAddresses(p.sched.Address()),
++		daprd.WithInMemoryActorStateStore("mystore"),
++		daprd.WithResourceFiles(`
++apiVersion: dapr.io/v1alpha1
++kind: Component
++metadata:
++  name: fake
++spec:
++  type: sandbox.`+p.driver.SocketName()+`
++  version: v1
++  metadata:
++  - name: image
++    value: local
++`),
++	)
++
++	return []framework.Option{
++		framework.WithProcesses(p.driver, p.place, p.sched, p.daprd),
++	}
++}
++
++func (p *pluggable) Run(t *testing.T, ctx context.Context) {
++	notReadySince := time.Now()
++
++	p.place.WaitUntilRunning(t, ctx)
++	p.sched.WaitUntilRunning(t, ctx)
++	p.daprd.WaitUntilRunning(t, ctx)
++
++	// The actor runtime is up, and daprd polls the driver until it is ready.
++	require.EventuallyWithT(t, func(c *assert.CollectT) {
++		assert.True(c, p.daprd.GetMetaActorRuntime(c, ctx).HostReady)
++	}, 10*time.Second, 10*time.Millisecond)
++	require.Eventually(t, func() bool { return p.driver.ReadyCalls() > 0 }, 10*time.Second, 10*time.Millisecond)
++
++	httpClient := client.HTTP(t)
++	execURL := sandboxURL(p.daprd, "fake", "sb-1", "exec")
++
++	t.Run("exec before the driver is ready fails fast", func(t *testing.T) {
++		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
++		defer cancel()
++		start := time.Now()
++		r := call(t, cctx, httpClient, http.MethodPost, execURL, execBody{Command: "echo", Args: []string{"hi"}})
++		elapsed := time.Since(start)
++		t.Logf("exec before ready: %s after %s", r, elapsed)
++		assert.Less(t, elapsed, 5*time.Second)
++		assert.True(t, strings.HasPrefix(r.errorCode(), "ERR_"), r.String())
++		// The actor type is not registered yet: retry later.
++		assert.Equal(t, http.StatusTooManyRequests, r.status, r.String())
++		assert.Equal(t, "ERR_SANDBOX_HOST_FULL", r.errorCode())
++		assert.Zero(t, p.driver.Acquires())
++
++		// daprd is still running.
++		p.daprd.WaitUntilRunning(t, ctx)
++	})
++
++	// Keep the driver not ready for at least notReadyFor overall.
++	time.Sleep(time.Until(notReadySince.Add(notReadyFor)))
++	p.driver.SetReady(true)
++	p.daprd.WaitUntilActorTypeHosted(t, ctx, actorType(p.daprd, "fake"))
++
++	t.Run("exec after the driver is ready succeeds", func(t *testing.T) {
++		var res runtimev1pb.SandboxExecResponseAlpha1
++		require.EventuallyWithT(t, func(c *assert.CollectT) {
++			r := call(c, ctx, httpClient, http.MethodPost, execURL, execBody{Command: "echo", Args: []string{"hi"}})
++			if assert.Equal(c, http.StatusOK, r.status, r.String()) {
++				decode(c, r, &res)
++			}
++		}, 20*time.Second, 100*time.Millisecond)
++		assert.Equal(t, "echo hi\n", string(res.GetStdout()))
++		assert.Equal(t, "POOL", res.GetTiming().GetAcquirePath())
++		assert.Equal(t, 1, p.driver.LiveInstances())
++	})
++
++	t.Run("exec after the driver died is lost", func(t *testing.T) {
++		p.driver.Kill(t)
++
++		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
++		defer cancel()
++		start := time.Now()
++		r := call(t, cctx, httpClient, http.MethodPost, execURL, execBody{Command: "echo", Args: []string{"hi"}})
++		elapsed := time.Since(start)
++		assert.Less(t, elapsed, 5*time.Second)
++		assert.Equal(t, http.StatusGone, r.status, r.String())
++		assert.Equal(t, "ERR_SANDBOX_LOST", r.errorCode())
++
++		// daprd is still running.
++		p.daprd.WaitUntilRunning(t, ctx)
++	})
++}
+diff --git a/tests/integration/suite/daprd/sandbox/process.go b/tests/integration/suite/daprd/sandbox/process.go
+new file mode 100644
+index 000000000..ef33b7b02
+--- /dev/null
++++ b/tests/integration/suite/daprd/sandbox/process.go
+@@ -0,0 +1,177 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"context"
++	"net/http"
++	"runtime"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
++	"github.com/dapr/dapr/tests/integration/framework"
++	"github.com/dapr/dapr/tests/integration/framework/client"
++	"github.com/dapr/dapr/tests/integration/framework/process/daprd"
++	"github.com/dapr/dapr/tests/integration/framework/process/placement"
++	"github.com/dapr/dapr/tests/integration/framework/process/scheduler"
++	"github.com/dapr/dapr/tests/integration/suite"
++)
++
++func init() {
++	suite.Register(new(process))
++}
++
++// process runs the built-in process driver in a single daprd and drives the
++// sandbox HTTP API through exec, sessions, create and the error paths.
++type process struct {
++	daprd *daprd.Daprd
++	place *placement.Placement
++	sched *scheduler.Scheduler
++}
++
++func (p *process) Setup(t *testing.T) []framework.Option {
++	if runtime.GOOS == "windows" {
++		t.Skip("the process sandbox driver is not available on windows")
++	}
++
++	p.place = placement.New(t)
++	p.sched = scheduler.New(t)
++	p.daprd = daprd.New(t,
++		daprd.WithPlacementAddresses(p.place.Address()),
++		daprd.WithSchedulerAddresses(p.sched.Address()),
++		daprd.WithInMemoryActorStateStore("mystore"),
++		daprd.WithResourceFiles(`
++apiVersion: dapr.io/v1alpha1
++kind: Component
++metadata:
++  name: py
++spec:
++  type: sandbox.process
++  version: v1
++  metadata:
++  - name: image
++    value: local
++  - name: template
++    value: none
++  - name: warmPoolSize
++    value: "2"
++`),
++	)
++
++	return []framework.Option{
++		framework.WithProcesses(p.place, p.sched, p.daprd),
++	}
++}
++
++func (p *process) Run(t *testing.T, ctx context.Context) {
++	p.place.WaitUntilRunning(t, ctx)
++	p.sched.WaitUntilRunning(t, ctx)
++	p.daprd.WaitUntilRunning(t, ctx)
++	// The type is registered once the warm pool is full and actors are ready.
++	p.daprd.WaitUntilActorTypeHosted(t, ctx, actorType(p.daprd, "py"))
++
++	httpClient := client.HTTP(t)
++
++	// The first exec on an ID can race the placement table that announces
++	// the new type, so retry it until it succeeds.
++	var first runtimev1pb.SandboxExecResponseAlpha1
++	t.Run("exec on a new ID takes a warm sandbox", func(t *testing.T) {
++		require.EventuallyWithT(t, func(c *assert.CollectT) {
++			r := call(c, ctx, httpClient, http.MethodPost, sandboxURL(p.daprd, "py", "sb-1", "exec"),
++				execBody{Command: "echo", Args: []string{"hi"}, TimeoutMs: 5000})
++			if assert.Equal(c, http.StatusOK, r.status, r.String()) {
++				decode(c, r, &first)
++			}
++		}, 20*time.Second, 100*time.Millisecond)
++
++		assert.Equal(t, "sb-1", first.GetSandboxId())
++		assert.Equal(t, "hi\n", string(first.GetStdout()))
++		assert.NotEmpty(t, first.GetActivation())
++		assert.Equal(t, "POOL", first.GetTiming().GetAcquirePath())
++		assert.Positive(t, first.GetTiming().GetTotalUs())
++	})
++
++	t.Run("a second exec reuses the activation", func(t *testing.T) {
++		var res runtimev1pb.SandboxExecResponseAlpha1
++		decode(t, call(t, ctx, httpClient, http.MethodPost, sandboxURL(p.daprd, "py", "sb-1", "exec"),
++			execBody{Command: "echo", Args: []string{"again"}, ExpectedActivation: first.GetActivation()}), &res)
++		assert.Equal(t, first.GetActivation(), res.GetActivation())
++		assert.Equal(t, "again\n", string(res.GetStdout()))
++		// Only the call that acquired the sandbox reports a path.
++		assert.Empty(t, res.GetTiming().GetAcquirePath())
++	})
++
++	t.Run("a session keeps shell state between sends", func(t *testing.T) {
++		var started runtimev1pb.SandboxSessionStartResponseAlpha1
++		decode(t, call(t, ctx, httpClient, http.MethodPost, sandboxURL(p.daprd, "py", "sb-1", "sessions"),
++			sessionStartBody{Command: "sh", Args: []string{"-i"}}), &started)
++		require.NotEmpty(t, started.GetSessionId())
++		assert.Equal(t, first.GetActivation(), started.GetActivation())
++		sessionURL := sandboxURL(p.daprd, "py", "sb-1", "sessions", started.GetSessionId())
++
++		// No `until`: the send returns once timeoutMs has passed.
++		var set runtimev1pb.SandboxExecResponseAlpha1
++		decode(t, call(t, ctx, httpClient, http.MethodPost, sessionURL,
++			sessionSendBody{Input: []byte("X=42\n"), TimeoutMs: 200}), &set)
++
++		var echo runtimev1pb.SandboxExecResponseAlpha1
++		decode(t, call(t, ctx, httpClient, http.MethodPost, sessionURL,
++			sessionSendBody{Input: []byte("echo $X\n"), Until: []byte("42"), TimeoutMs: 10000}), &echo)
++		assert.Contains(t, string(echo.GetStdout()), "42")
++		assert.False(t, echo.GetTimedOut(), "stdout=%q stderr=%q", echo.GetStdout(), echo.GetStderr())
++
++		r := call(t, ctx, httpClient, http.MethodDelete, sessionURL, nil)
++		assert.Equal(t, http.StatusOK, r.status, r.String())
++	})
++
++	t.Run("a stale expected activation is lost", func(t *testing.T) {
++		r := call(t, ctx, httpClient, http.MethodPost, sandboxURL(p.daprd, "py", "sb-1", "exec"),
++			execBody{Command: "echo", Args: []string{"x"}, ExpectedActivation: "stale-" + first.GetActivation()})
++		assert.Equal(t, http.StatusGone, r.status, r.String())
++		assert.Equal(t, "ERR_SANDBOX_LOST", r.errorCode())
++	})
++
++	t.Run("create returns an ID that can exec", func(t *testing.T) {
++		var created runtimev1pb.SandboxCreateResponseAlpha1
++		decode(t, call(t, ctx, httpClient, http.MethodPost, sandboxURL(p.daprd, "py"), nil), &created)
++		require.NotEmpty(t, created.GetSandboxId())
++		require.NotEmpty(t, created.GetActivation())
++
++		var res runtimev1pb.SandboxExecResponseAlpha1
++		decode(t, call(t, ctx, httpClient, http.MethodPost, sandboxURL(p.daprd, "py", created.GetSandboxId(), "exec"),
++			execBody{Command: "echo", Args: []string{"created"}, ExpectedActivation: created.GetActivation()}), &res)
++		assert.Equal(t, created.GetSandboxId(), res.GetSandboxId())
++		assert.Equal(t, created.GetActivation(), res.GetActivation())
++		assert.Equal(t, "created\n", string(res.GetStdout()))
++
++		r := call(t, ctx, httpClient, http.MethodDelete, sandboxURL(p.daprd, "py", created.GetSandboxId()), nil)
++		assert.Equal(t, http.StatusOK, r.status, r.String())
++	})
++
++	t.Run("an unknown component fails fast", func(t *testing.T) {
++		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
++		defer cancel()
++		start := time.Now()
++		r := call(t, cctx, httpClient, http.MethodPost, sandboxURL(p.daprd, "nope", "sb-1", "exec"),
++			execBody{Command: "echo", Args: []string{"hi"}})
++		assert.Less(t, time.Since(start), 5*time.Second)
++		assert.GreaterOrEqual(t, r.status, 400, r.String())
++		assert.Less(t, r.status, 500, r.String())
++		assert.Equal(t, "ERR_SANDBOX_NOT_FOUND", r.errorCode())
++	})
++}
+diff --git a/tests/integration/suite/daprd/sandbox/sandbox.go b/tests/integration/suite/daprd/sandbox/sandbox.go
+new file mode 100644
+index 000000000..a37c9ceb3
+--- /dev/null
++++ b/tests/integration/suite/daprd/sandbox/sandbox.go
+@@ -0,0 +1,130 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package sandbox tests the alpha Sandbox building block end to end: sandbox
++// components hosted as internal actors and reached over the HTTP API.
++package sandbox
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/protobuf/encoding/protojson"
++	"google.golang.org/protobuf/proto"
++
++	"github.com/dapr/dapr/tests/integration/framework/process/daprd"
++)
++
++// unmarshalOpts decodes the API's protojson responses.
++var unmarshalOpts = protojson.UnmarshalOptions{DiscardUnknown: true}
++
++// actorType is the internal actor type of a sandbox component hosted by d.
++func actorType(d *daprd.Daprd, component string) string {
++	return "dapr.internal." + d.Namespace() + "." + d.AppID() + ".sandbox." + component
++}
++
++// sandboxURL builds an API URL under /v1.0-alpha1/sandboxes on d; parts are
++// path-escaped.
++func sandboxURL(d *daprd.Daprd, parts ...string) string {
++	u := "http://" + d.HTTPAddress() + "/v1.0-alpha1/sandboxes"
++	for _, p := range parts {
++		u += "/" + url.PathEscape(p)
++	}
++	return u
++}
++
++// result is the outcome of one API call.
++type result struct {
++	status int
++	body   []byte
++}
++
++// errorCode returns the Dapr error code of an error response, or "".
++func (r result) errorCode() string {
++	var e struct {
++		ErrorCode string `json:"errorCode"`
++	}
++	_ = json.Unmarshal(r.body, &e)
++	return e.ErrorCode
++}
++
++func (r result) String() string {
++	return fmt.Sprintf("%d %s", r.status, r.body)
++}
++
++// call sends a request with a JSON body (nil for none) and returns the
++// response. headers are key/value pairs. It reports transport failures
++// through t, so it is safe inside EventuallyWithT.
++func call(t assert.TestingT, ctx context.Context, client *http.Client, method, u string, body any, headers ...string) result {
++	var rd io.Reader
++	if body != nil {
++		b, err := json.Marshal(body)
++		if !assert.NoError(t, err) {
++			return result{}
++		}
++		rd = bytes.NewReader(b)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, u, rd)
++	if !assert.NoError(t, err) {
++		return result{}
++	}
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	for i := 0; i+1 < len(headers); i += 2 {
++		req.Header.Set(headers[i], headers[i+1])
++	}
++	resp, err := client.Do(req)
++	if !assert.NoError(t, err) {
++		return result{}
++	}
++	defer resp.Body.Close()
++	b, err := io.ReadAll(resp.Body)
++	assert.NoError(t, err)
++	return result{status: resp.StatusCode, body: b}
++}
++
++// decode requires a 200 response and decodes its body into msg.
++func decode(t require.TestingT, r result, msg proto.Message) {
++	require.Equal(t, http.StatusOK, r.status, r.String())
++	require.NoError(t, unmarshalOpts.Unmarshal(r.body, msg), r.String())
++}
++
++// execBody is the JSON body of an exec request.
++type execBody struct {
++	Command            string   `json:"command"`
++	Args               []string `json:"args,omitempty"`
++	TimeoutMs          uint32   `json:"timeoutMs,omitempty"`
++	ExpectedActivation string   `json:"expectedActivation,omitempty"`
++}
++
++// sessionStartBody is the JSON body of a session start request.
++type sessionStartBody struct {
++	Command string   `json:"command"`
++	Args    []string `json:"args,omitempty"`
++}
++
++// sessionSendBody is the JSON body of a session send request. Bytes fields
++// are base64 in protojson, which is how encoding/json marshals []byte.
++type sessionSendBody struct {
++	Input     []byte `json:"input,omitempty"`
++	Until     []byte `json:"until,omitempty"`
++	TimeoutMs uint32 `json:"timeoutMs,omitempty"`
++}
+-- 
+2.47.0
+

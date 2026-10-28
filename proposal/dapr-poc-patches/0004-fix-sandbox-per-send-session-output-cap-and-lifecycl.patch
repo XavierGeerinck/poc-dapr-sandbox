@@ -1,0 +1,166 @@
+From 978458d32b91aeda3543f1de9f3e935cadaf8e59 Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Wed, 28 Oct 2026 19:56:22 +0100
+Subject: [PATCH 04/12] fix(sandbox): per-send session output cap and lifecycle
+ tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/components/sandbox/process/process.go     |   9 +-
+ .../sandbox/process/process_test.go           | 103 +++++++++++++++++-
+ 2 files changed, 107 insertions(+), 5 deletions(-)
+
+diff --git a/pkg/components/sandbox/process/process.go b/pkg/components/sandbox/process/process.go
+index df414df6f..068029d50 100644
+--- a/pkg/components/sandbox/process/process.go
++++ b/pkg/components/sandbox/process/process.go
+@@ -565,8 +565,8 @@ func (i *instance) session(id string) (*session, error) {
+ // SessionSend writes input to the session and returns the output produced
+ // since the call started, once `until` appears in stdout or stderr, the
+ // process exits, or timeout_ms elapses (timed_out=true, no error). With an
+-// empty `until` it simply waits timeout_ms. Output produced between sends is
+-// not returned by the following send.
++// empty `until` it simply waits timeout_ms. The 4 MiB per-stream cap applies per send; output
++// produced between sends is discarded when the next send starts.
+ func (p *Process) SessionSend(ctx context.Context, req *proto.SandboxSessionSendRequest) (*proto.SandboxExecResponse, error) {
+ 	inst, err := p.get(req.GetInstanceId())
+ 	if err != nil {
+@@ -588,8 +588,11 @@ func (p *Process) SessionSend(ctx context.Context, req *proto.SandboxSessionSend
+ 	timer := time.NewTimer(timeout)
+ 	defer timer.Stop()
+ 
++	// Discard anything produced while no send was in progress and start a
++	// fresh capped window, so the 4 MiB cap and the truncated flag are per send.
+ 	s.lock.Lock()
+-	startOut, startErr := len(s.out), len(s.errb)
++	s.out, s.errb, s.truncated = nil, nil, false
++	startOut, startErr := 0, 0
+ 	s.lock.Unlock()
+ 
+ 	if in := req.GetInput(); len(in) > 0 {
+diff --git a/pkg/components/sandbox/process/process_test.go b/pkg/components/sandbox/process/process_test.go
+index f68f8a2ba..3f09102bf 100644
+--- a/pkg/components/sandbox/process/process_test.go
++++ b/pkg/components/sandbox/process/process_test.go
+@@ -19,6 +19,7 @@ package process
+ 
+ import (
+ 	"context"
++	"os"
+ 	"testing"
+ 	"time"
+ 
+@@ -188,10 +189,108 @@ func TestReleaseFreesSlot(t *testing.T) {
+ func TestReconcile(t *testing.T) {
+ 	d := newDriver(t, map[string]string{"warmPoolSize": "0"})
+ 	a := acquire(t, d)
+-	acquire(t, d)
+-	acquire(t, d)
++	released := []string{acquire(t, d).GetInstanceId(), acquire(t, d).GetInstanceId()}
+ 	r, err := d.Reconcile(t.Context(), &proto.SandboxReconcileRequest{LiveInstanceIds: []string{a.GetInstanceId()}})
+ 	require.NoError(t, err)
+ 	assert.Equal(t, uint32(2), r.GetReleased())
+ 	run(t, d, a.GetInstanceId(), &proto.SandboxExecSpec{Command: "true"})
++	d.lock.Lock()
++	assert.Len(t, d.live, 1)
++	d.lock.Unlock()
++	for _, id := range released {
++		_, err := d.Exec(t.Context(), &proto.SandboxExecRequest{InstanceId: id, Spec: &proto.SandboxExecSpec{Command: "true"}})
++		assert.Equal(t, codes.NotFound, status.Code(err))
++	}
++}
++
++func TestReadyFalseBeforePoolFull(t *testing.T) {
++	d := New(logger.NewLogger("test")).(*Process)
++	// Hold the initial fill back so the pool is observably not full.
++	d.cfg.WarmPoolSize = 2
++	d.ctx, d.cancel = context.WithCancel(context.Background())
++	t.Cleanup(func() { _ = d.Close() })
++	r, err := d.Ready(t.Context(), &proto.SandboxReadyRequest{})
++	require.NoError(t, err)
++	assert.False(t, r.GetReady())
++	assert.NotEmpty(t, r.GetReason())
++
++	d.topUp(0)
++	assert.Eventually(t, func() bool {
++		r, _ := d.Ready(t.Context(), &proto.SandboxReadyRequest{})
++		return r.GetReady()
++	}, 5*time.Second, 5*time.Millisecond)
++}
++
++func TestCloseStopsRefillAndDestroysLive(t *testing.T) {
++	d := newDriverDelay(t, map[string]string{"warmPoolSize": "1"}, 200*time.Millisecond)
++	a := acquire(t, d) // pool hit; refill is pending behind the delay
++	d.lock.Lock()
++	inst := d.live[a.GetInstanceId()]
++	d.lock.Unlock()
++	require.NotNil(t, inst)
++	_, err := os.Stat(inst.dir)
++	require.NoError(t, err)
++
++	require.NoError(t, d.Close())
++	_, err = os.Stat(inst.dir)
++	assert.True(t, os.IsNotExist(err), "live instance dir should be removed")
++
++	time.Sleep(400 * time.Millisecond) // longer than the refill delay
++	d.lock.Lock()
++	assert.Empty(t, d.pool)
++	assert.Zero(t, d.inflight)
++	d.lock.Unlock()
++	_, err = d.Acquire(t.Context(), &proto.SandboxAcquireRequest{})
++	assert.Equal(t, codes.Unavailable, status.Code(err))
++}
++
++func TestReleaseKillsInFlightExec(t *testing.T) {
++	d := newDriver(t, nil)
++	a := acquire(t, d)
++	type res struct {
++		r   *proto.SandboxExecResponse
++		err error
++	}
++	ch := make(chan res, 1)
++	go func() {
++		r, err := d.Exec(context.Background(), &proto.SandboxExecRequest{
++			InstanceId: a.GetInstanceId(), Spec: &proto.SandboxExecSpec{Command: "sleep", Args: []string{"30"}},
++		})
++		ch <- res{r, err}
++	}()
++	time.Sleep(100 * time.Millisecond) // let the child start
++	_, err := d.Release(t.Context(), &proto.SandboxReleaseRequest{InstanceId: a.GetInstanceId()})
++	require.NoError(t, err)
++	select {
++	case x := <-ch:
++		require.NoError(t, x.err)
++		assert.NotZero(t, x.r.GetExitCode())
++	case <-time.After(3 * time.Second):
++		t.Fatal("Exec did not return after Release")
++	}
++}
++
++func TestSessionOutputCapPerSend(t *testing.T) {
++	d := newDriver(t, nil)
++	a := acquire(t, d)
++	s, err := d.SessionStart(t.Context(), &proto.SandboxSessionStartRequest{
++		InstanceId: a.GetInstanceId(), Spec: &proto.SandboxExecSpec{Command: "sh"},
++	})
++	require.NoError(t, err)
++	send := func(in, until string) *proto.SandboxExecResponse {
++		r, err := d.SessionSend(t.Context(), &proto.SandboxSessionSendRequest{
++			InstanceId: a.GetInstanceId(), SessionId: s.GetSessionId(), Input: []byte(in), Until: []byte(until), TimeoutMs: 10000,
++		})
++		require.NoError(t, err)
++		return r
++	}
++	r := send("head -c 10485760 /dev/zero; echo big-done >&2\n", "big-done")
++	assert.True(t, r.GetTruncated())
++	assert.Len(t, r.GetStdout(), 4194304)
++	assert.Contains(t, string(r.GetStderr()), "big-done")
++
++	r = send("echo second\n", "second")
++	assert.False(t, r.GetTruncated())
++	assert.False(t, r.GetTimedOut())
++	assert.Equal(t, "second\n", string(r.GetStdout()))
+ }
+-- 
+2.47.0
+

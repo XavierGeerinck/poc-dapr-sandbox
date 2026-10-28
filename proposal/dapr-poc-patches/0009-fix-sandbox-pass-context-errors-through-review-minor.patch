@@ -1,0 +1,289 @@
+From c55bd148d3b21370d792802903bcc2f819bf1c87 Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Wed, 28 Oct 2026 20:43:40 +0100
+Subject: [PATCH 09/12] fix(sandbox): pass context errors through; review
+ minors
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/api/universal/sandbox.go      | 48 ++++++++++++++--------
+ pkg/api/universal/sandbox_test.go | 66 ++++++++++++++++++++++++-------
+ 2 files changed, 84 insertions(+), 30 deletions(-)
+
+diff --git a/pkg/api/universal/sandbox.go b/pkg/api/universal/sandbox.go
+index c919133a1..54c5839cf 100644
+--- a/pkg/api/universal/sandbox.go
++++ b/pkg/api/universal/sandbox.go
+@@ -17,6 +17,7 @@ package universal
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"time"
+ 
+ 	"github.com/google/uuid"
+@@ -91,6 +92,12 @@ func (a *Universal) sandboxCall(ctx context.Context, component, appID, sandboxID
+ 
+ // mapSandboxError maps the gRPC status code of a router error to an API error.
+ func (a *Universal) mapSandboxError(err error) error {
++	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
++		if _, ok := status.FromError(err); !ok {
++			return status.FromContextError(err).Err()
++		}
++		return err
++	}
+ 	st, ok := status.FromError(err)
+ 	if !ok {
+ 		a.logger.Debugf("sandbox call failed: %v", err)
+@@ -112,6 +119,19 @@ func (a *Universal) mapSandboxError(err error) error {
+ 	}
+ }
+ 
++// unmarshalSandboxResponse decodes actor response data into a new T.
++func unmarshalSandboxResponse[T any, PT interface {
++	*T
++	proto.Message
++}](a *Universal, data []byte) (PT, error) {
++	res := PT(new(T))
++	if err := proto.Unmarshal(data, res); err != nil {
++		a.logger.Debugf("sandbox: bad actor response: %v", err)
++		return nil, messages.ErrSandboxExec
++	}
++	return res, nil
++}
++
+ func setTotalUs(t *runtimev1pb.SandboxTimingAlpha1, start time.Time) *runtimev1pb.SandboxTimingAlpha1 {
+ 	if t == nil {
+ 		t = &runtimev1pb.SandboxTimingAlpha1{}
+@@ -133,10 +153,9 @@ func (a *Universal) SandboxCreateAlpha1(ctx context.Context, in *runtimev1pb.San
+ 			}
+ 			return nil, err
+ 		}
+-		res := new(runtimev1pb.SandboxCreateResponseAlpha1)
+-		if err = proto.Unmarshal(data, res); err != nil {
+-			a.logger.Debugf("sandbox create: bad actor response: %v", err)
+-			return nil, messages.ErrSandboxExec
++		res, err := unmarshalSandboxResponse[runtimev1pb.SandboxCreateResponseAlpha1](a, data)
++		if err != nil {
++			return nil, err
+ 		}
+ 		res.SandboxId = id
+ 		res.Timing = setTotalUs(res.GetTiming(), start)
+@@ -155,10 +174,9 @@ func (a *Universal) SandboxExecAlpha1(ctx context.Context, in *runtimev1pb.Sandb
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	res := new(runtimev1pb.SandboxExecResponseAlpha1)
+-	if err = proto.Unmarshal(data, res); err != nil {
+-		a.logger.Debugf("sandbox exec: bad actor response: %v", err)
+-		return nil, messages.ErrSandboxExec
++	res, err := unmarshalSandboxResponse[runtimev1pb.SandboxExecResponseAlpha1](a, data)
++	if err != nil {
++		return nil, err
+ 	}
+ 	res.Timing = setTotalUs(res.GetTiming(), start)
+ 	return res, nil
+@@ -184,10 +202,9 @@ func (a *Universal) SandboxSessionStartAlpha1(ctx context.Context, in *runtimev1
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	res := new(runtimev1pb.SandboxSessionStartResponseAlpha1)
+-	if err = proto.Unmarshal(data, res); err != nil {
+-		a.logger.Debugf("sandbox session start: bad actor response: %v", err)
+-		return nil, messages.ErrSandboxExec
++	res, err := unmarshalSandboxResponse[runtimev1pb.SandboxSessionStartResponseAlpha1](a, data)
++	if err != nil {
++		return nil, err
+ 	}
+ 	return res, nil
+ }
+@@ -202,10 +219,9 @@ func (a *Universal) SandboxSessionSendAlpha1(ctx context.Context, in *runtimev1p
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	res := new(runtimev1pb.SandboxExecResponseAlpha1)
+-	if err = proto.Unmarshal(data, res); err != nil {
+-		a.logger.Debugf("sandbox session send: bad actor response: %v", err)
+-		return nil, messages.ErrSandboxExec
++	res, err := unmarshalSandboxResponse[runtimev1pb.SandboxExecResponseAlpha1](a, data)
++	if err != nil {
++		return nil, err
+ 	}
+ 	res.Timing = setTotalUs(res.GetTiming(), start)
+ 	return res, nil
+diff --git a/pkg/api/universal/sandbox_test.go b/pkg/api/universal/sandbox_test.go
+index ee89d43c4..2c4d64a96 100644
+--- a/pkg/api/universal/sandbox_test.go
++++ b/pkg/api/universal/sandbox_test.go
+@@ -19,6 +19,7 @@ package universal
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"sync"
+ 	"testing"
+ 	"time"
+@@ -43,9 +44,10 @@ import (
+ )
+ 
+ type sandboxCallRec struct {
+-	mu       sync.Mutex
+-	reqs     []*internalsv1pb.InternalInvokeRequest
+-	deadline []bool
++	mu        sync.Mutex
++	reqs      []*internalsv1pb.InternalInvokeRequest
++	deadline  []bool
++	remaining []time.Duration
+ }
+ 
+ func (r *sandboxCallRec) len() int {
+@@ -60,7 +62,9 @@ func newSandboxUniversal(t *testing.T, withLocal bool, fn func(n int, req *inter
+ 	rt := routerfake.New().WithCallFn(func(ctx context.Context, req *internalsv1pb.InternalInvokeRequest) (*internalsv1pb.InternalInvokeResponse, error) {
+ 		rec.mu.Lock()
+ 		rec.reqs = append(rec.reqs, req)
+-		rec.deadline = append(rec.deadline, func() bool { _, ok := ctx.Deadline(); return ok }())
++		dl, hasDl := ctx.Deadline()
++		rec.deadline = append(rec.deadline, hasDl)
++		rec.remaining = append(rec.remaining, time.Until(dl))
+ 		n := len(rec.reqs)
+ 		rec.mu.Unlock()
+ 		msg, err := fn(n, req)
+@@ -91,7 +95,7 @@ func newSandboxUniversal(t *testing.T, withLocal bool, fn func(n int, req *inter
+ 	}, rec
+ }
+ 
+-func TestExecRoutesToActorType(t *testing.T) {
++func TestSandboxExecRoutesToActorType(t *testing.T) {
+ 	u, rec := newSandboxUniversal(t, false, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
+ 		time.Sleep(time.Millisecond)
+ 		return &runtimev1pb.SandboxExecResponseAlpha1{
+@@ -110,13 +114,14 @@ func TestExecRoutesToActorType(t *testing.T) {
+ 	assert.Equal(t, "sb1", req.GetActor().GetActorId())
+ 	assert.Equal(t, "exec", req.GetMessage().GetMethod())
+ 	assert.True(t, rec.deadline[0])
++	assert.InDelta(t, (1000*time.Millisecond + 30*time.Second).Seconds(), rec.remaining[0].Seconds(), 3)
+ 	assert.Positive(t, res.GetTiming().GetTotalUs())
+ 	assert.EqualValues(t, 7, res.GetTiming().GetExecUs())
+ 	assert.Equal(t, "POOL", res.GetTiming().GetAcquirePath())
+ 	assert.Equal(t, "hi", string(res.GetStdout()))
+ }
+ 
+-func TestExecNoTimeoutUsesCallerCtx(t *testing.T) {
++func TestSandboxExecNoTimeoutUsesCallerCtx(t *testing.T) {
+ 	u, rec := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
+ 		return &runtimev1pb.SandboxExecResponseAlpha1{}, nil
+ 	})
+@@ -126,14 +131,14 @@ func TestExecNoTimeoutUsesCallerCtx(t *testing.T) {
+ 	assert.Equal(t, "dapr.internal.default.me.sandbox.py", rec.reqs[0].GetActor().GetActorType())
+ }
+ 
+-func TestExecSelfMissingComponent(t *testing.T) {
++func TestSandboxExecSelfMissingComponent(t *testing.T) {
+ 	u, rec := newSandboxUniversal(t, false, nil)
+ 	_, err := u.SandboxExecAlpha1(t.Context(), &runtimev1pb.SandboxExecRequestAlpha1{Component: "py", SandboxId: "sb1", Command: "x"})
+ 	require.ErrorIs(t, err, messages.ErrSandboxNotFound)
+ 	assert.Equal(t, 0, rec.len())
+ }
+ 
+-func TestCreateRetriesOnFull(t *testing.T) {
++func TestSandboxCreateRetriesOnFull(t *testing.T) {
+ 	u, rec := newSandboxUniversal(t, true, func(n int, req *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
+ 		if n <= 2 {
+ 			return nil, status.Error(codes.ResourceExhausted, "full")
+@@ -155,7 +160,7 @@ func TestCreateRetriesOnFull(t *testing.T) {
+ 	assert.EqualValues(t, 3, res.GetTiming().GetHostUs())
+ }
+ 
+-func TestCreateGivesUp(t *testing.T) {
++func TestSandboxCreateGivesUp(t *testing.T) {
+ 	u, rec := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
+ 		return nil, status.Error(codes.ResourceExhausted, "full")
+ 	})
+@@ -164,7 +169,7 @@ func TestCreateGivesUp(t *testing.T) {
+ 	assert.Equal(t, 5, rec.len())
+ }
+ 
+-func TestErrorMapping(t *testing.T) {
++func TestSandboxErrorMapping(t *testing.T) {
+ 	tests := map[string]struct {
+ 		code codes.Code
+ 		want error
+@@ -188,7 +193,7 @@ func TestErrorMapping(t *testing.T) {
+ 	}
+ }
+ 
+-func TestDeadlineAndCancelPassThrough(t *testing.T) {
++func TestSandboxDeadlineAndCancelPassThrough(t *testing.T) {
+ 	for _, c := range []codes.Code{codes.DeadlineExceeded, codes.Canceled} {
+ 		u, _ := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
+ 			return nil, status.Error(c, "x")
+@@ -198,7 +203,38 @@ func TestDeadlineAndCancelPassThrough(t *testing.T) {
+ 	}
+ }
+ 
+-func TestLostMapsToSandboxLost(t *testing.T) {
++func TestSandboxPlainContextErrorsPassThrough(t *testing.T) {
++	for want, cerr := range map[codes.Code]error{
++		codes.DeadlineExceeded: context.DeadlineExceeded,
++		codes.Canceled:         context.Canceled,
++	} {
++		u, _ := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
++			return nil, fmt.Errorf("wrapped: %w", cerr)
++		})
++		_, err := u.SandboxExecAlpha1(t.Context(), &runtimev1pb.SandboxExecRequestAlpha1{Component: "py", SandboxId: "sb", Command: "x"})
++		require.Error(t, err)
++		assert.Equal(t, want, status.Code(err))
++		assert.NotErrorIs(t, err, messages.ErrSandboxExec)
++	}
++}
++
++func TestSandboxRequestReachesActor(t *testing.T) {
++	u, rec := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
++		return &runtimev1pb.SandboxExecResponseAlpha1{}, nil
++	})
++	in := &runtimev1pb.SandboxExecRequestAlpha1{
++		Component: "py", SandboxId: "sb", Command: "echo", Args: []string{"a", "b"},
++		Env: map[string]string{"K": "V"}, Cwd: "/w", Stdin: []byte("in"), ExpectedActivation: "act",
++	}
++	_, err := u.SandboxExecAlpha1(t.Context(), in)
++	require.NoError(t, err)
++	got := new(runtimev1pb.SandboxExecRequestAlpha1)
++	require.NoError(t, proto.Unmarshal(rec.reqs[0].GetMessage().GetData().GetValue(), got))
++	assert.True(t, proto.Equal(in, got))
++	assert.Equal(t, "application/x-protobuf", rec.reqs[0].GetMessage().GetContentType())
++}
++
++func TestSandboxLostMapsToSandboxLost(t *testing.T) {
+ 	u, _ := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
+ 		return nil, status.Error(codes.FailedPrecondition, "")
+ 	})
+@@ -206,7 +242,7 @@ func TestLostMapsToSandboxLost(t *testing.T) {
+ 	require.ErrorIs(t, err, messages.ErrSandboxLost)
+ }
+ 
+-func TestValidation(t *testing.T) {
++func TestSandboxValidation(t *testing.T) {
+ 	u, rec := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
+ 		return nil, nil
+ 	})
+@@ -229,6 +265,8 @@ func TestValidation(t *testing.T) {
+ 	require.ErrorIs(t, err, messages.ErrSandboxInvalidRequest)
+ 	_, err = u.SandboxSessionSendAlpha1(ctx, &runtimev1pb.SandboxSessionSendRequestAlpha1{Component: "py", SandboxId: "sb"})
+ 	require.ErrorIs(t, err, messages.ErrSandboxInvalidRequest)
++	_, err = u.SandboxSessionSendAlpha1(ctx, &runtimev1pb.SandboxSessionSendRequestAlpha1{SandboxId: "sb", SessionId: "s"})
++	require.ErrorIs(t, err, messages.ErrSandboxInvalidRequest)
+ 	_, err = u.SandboxSessionCloseAlpha1(ctx, &runtimev1pb.SandboxSessionCloseRequestAlpha1{Component: "py", SandboxId: "sb"})
+ 	require.ErrorIs(t, err, messages.ErrSandboxInvalidRequest)
+ 	_, err = u.SandboxSessionCloseAlpha1(ctx, &runtimev1pb.SandboxSessionCloseRequestAlpha1{Component: "py", SessionId: "s"})
+@@ -236,7 +274,7 @@ func TestValidation(t *testing.T) {
+ 	assert.Equal(t, 0, rec.len())
+ }
+ 
+-func TestDeleteAndSessionMethods(t *testing.T) {
++func TestSandboxDeleteAndSessionMethods(t *testing.T) {
+ 	u, rec := newSandboxUniversal(t, true, func(_ int, req *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
+ 		if req.GetMessage().GetMethod() == "session.start" {
+ 			return &runtimev1pb.SandboxSessionStartResponseAlpha1{SessionId: "s1"}, nil
+-- 
+2.47.0
+

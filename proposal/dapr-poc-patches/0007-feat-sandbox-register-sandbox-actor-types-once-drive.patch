@@ -1,0 +1,645 @@
+From fd72a2afe276a7c75a3ce0898deba73326c20b5b Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Wed, 28 Oct 2026 20:34:23 +0100
+Subject: [PATCH 07/12] feat(sandbox): register sandbox actor types once
+ drivers are ready
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/actors/targets/sandbox/factory.go      |  12 +
+ pkg/actors/targets/sandbox/sandbox.go      |   3 +
+ pkg/actors/targets/sandbox/sandbox_test.go |  25 ++
+ pkg/runtime/sandboxhost/host.go            | 240 ++++++++++++++++++-
+ pkg/runtime/sandboxhost/host_test.go       | 261 +++++++++++++++++++++
+ 5 files changed, 534 insertions(+), 7 deletions(-)
+ create mode 100644 pkg/runtime/sandboxhost/host_test.go
+
+diff --git a/pkg/actors/targets/sandbox/factory.go b/pkg/actors/targets/sandbox/factory.go
+index d58a496a8..44898ea24 100644
+--- a/pkg/actors/targets/sandbox/factory.go
++++ b/pkg/actors/targets/sandbox/factory.go
+@@ -18,6 +18,7 @@ import (
+ 	"errors"
+ 	"slices"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/google/uuid"
+@@ -78,6 +79,10 @@ type Factory struct {
+ 	// target is in table exactly while its removed field is false.
+ 	lock  sync.RWMutex
+ 	table map[string]*target
++
++	// acquiring counts the targets inside a driver Acquire call, including the
++	// moment between the driver returning and the instance ID being recorded.
++	acquiring atomic.Int32
+ }
+ 
+ var _ targets.Factory = (*Factory)(nil)
+@@ -174,6 +179,13 @@ func (f *Factory) LiveInstanceIDs() []string {
+ 	return ids
+ }
+ 
++// AcquiresInFlight returns the number of targets currently acquiring a VM from
++// the driver. LiveInstanceIDs does not include such an instance yet, so a
++// driver Reconcile should wait while this is above zero.
++func (f *Factory) AcquiresInFlight() int {
++	return int(f.acquiring.Load())
++}
++
+ // HaltAll removes every target and releases their VMs in the background. It
+ // does not wait for the driver.
+ func (f *Factory) HaltAll(context.Context) error {
+diff --git a/pkg/actors/targets/sandbox/sandbox.go b/pkg/actors/targets/sandbox/sandbox.go
+index 41fb6da0f..6c1d27c08 100644
+--- a/pkg/actors/targets/sandbox/sandbox.go
++++ b/pkg/actors/targets/sandbox/sandbox.go
+@@ -385,6 +385,9 @@ func (t *target) acquire(ctx context.Context, method string, timing *runtimev1pb
+ 	}
+ 
+ 	f := t.factory
++	f.acquiring.Add(1)
++	defer f.acquiring.Add(-1)
++
+ 	start := f.clock.Now()
+ 	res, err := f.driver.Acquire(ctx, &compv1pb.SandboxAcquireRequest{
+ 		SandboxId:    t.actorID,
+diff --git a/pkg/actors/targets/sandbox/sandbox_test.go b/pkg/actors/targets/sandbox/sandbox_test.go
+index 53514c79c..58b0f5fb7 100644
+--- a/pkg/actors/targets/sandbox/sandbox_test.go
++++ b/pkg/actors/targets/sandbox/sandbox_test.go
+@@ -841,3 +841,28 @@ func TestNewRequiresDriver(t *testing.T) {
+ 	require.Error(t, err)
+ 	assert.Nil(t, f)
+ }
++
++func TestAcquiresInFlight(t *testing.T) {
++	for name, acquireErr := range map[string]error{
++		"success": nil,
++		"failure": status.Error(codes.Unavailable, "boom"),
++	} {
++		t.Run(name, func(t *testing.T) {
++			d := &fakeDriver{
++				acquireStarted: make(chan struct{}, 1),
++				acquireBlock:   make(chan struct{}),
++				acquireErr:     acquireErr,
++			}
++			f := newFactory(t, d)
++			assert.Equal(t, 0, f.AcquiresInFlight())
++
++			running := goInvoke(t.Context(), f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++			await(t, d.acquireStarted)
++			assert.Equal(t, 1, f.AcquiresInFlight())
++
++			close(d.acquireBlock)
++			await(t, running)
++			assert.Equal(t, 0, f.AcquiresInFlight())
++		})
++	}
++}
+diff --git a/pkg/runtime/sandboxhost/host.go b/pkg/runtime/sandboxhost/host.go
+index 96938a317..955ed81d4 100644
+--- a/pkg/runtime/sandboxhost/host.go
++++ b/pkg/runtime/sandboxhost/host.go
+@@ -18,12 +18,34 @@ package sandboxhost
+ 
+ import (
+ 	"context"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/dapr/dapr/pkg/actors"
++	"github.com/dapr/dapr/pkg/actors/table"
++	sandboxtarget "github.com/dapr/dapr/pkg/actors/targets/sandbox"
+ 	"github.com/dapr/dapr/pkg/components/sandbox"
++	compv1pb "github.com/dapr/dapr/pkg/proto/components/v1"
++	"github.com/dapr/kit/logger"
+ )
+ 
++const (
++	defaultReadyPollInterval = 100 * time.Millisecond
++	defaultReconcileInterval = 30 * time.Second
++
++	// notReadyLogInterval is the minimum time between logs of the driver's
++	// not-ready reason.
++	notReadyLogInterval = 5 * time.Second
++	// readyCallTimeout bounds each driver Ready call.
++	readyCallTimeout = 5 * time.Second
++	// reconcileTimeout bounds each driver Reconcile call.
++	reconcileTimeout = 10 * time.Second
++	// stopTimeout bounds how long Remove waits for a component's goroutine.
++	stopTimeout = 10 * time.Second
++)
++
++var log = logger.NewLogger("dapr.runtime.sandboxhost")
++
+ // Options are the options for a Host.
+ type Options struct {
+ 	Actors            actors.Interface
+@@ -35,24 +57,228 @@ type Options struct {
+ // Host manages sandbox drivers and registers their internal actor types.
+ type Host struct {
+ 	opts Options
++
++	// opLock serializes Add and Remove.
++	opLock sync.Mutex
++
++	lock    sync.Mutex
++	entries map[string]*entry
++}
++
++// entry is one hosted sandbox component.
++type entry struct {
++	component string
++	actorType string
++	driver    sandbox.Sandbox
++	cancel    context.CancelFunc
++	done      chan struct{}
++
++	// lock guards tbl and registered, which the component goroutine sets.
++	lock       sync.Mutex
++	tbl        table.Interface
++	registered bool
+ }
+ 
+ // New returns a new Host.
+ func New(opts Options) *Host {
+-	return &Host{opts: opts}
++	if opts.ReadyPollInterval <= 0 {
++		opts.ReadyPollInterval = defaultReadyPollInterval
++	}
++	if opts.ReconcileInterval <= 0 {
++		opts.ReconcileInterval = defaultReconcileInterval
++	}
++	return &Host{opts: opts, entries: make(map[string]*entry)}
+ }
+ 
+-// Add registers a sandbox component with the host.
+-func (h *Host) Add(_ context.Context, _ string, _ sandbox.Sandbox, _ sandbox.Config) {
+-	// TODO(Task 6): register the internal actor type and start warm pool management.
++// Add starts hosting a sandbox component. It returns immediately: waiting for
++// the driver and the actor runtime, registering the actor type and the
++// periodic reconcile all happen in a goroutine owned by the host, which lives
++// until Remove. An existing component with the same name is stopped first.
++func (h *Host) Add(_ context.Context, component string, d sandbox.Sandbox, cfg sandbox.Config) {
++	h.opLock.Lock()
++	defer h.opLock.Unlock()
++
++	h.stop(component)
++
++	// The host owns this context: the context passed to Add belongs to the
++	// processor's init and ends long before the component does.
++	ctx, cancel := context.WithCancel(context.Background())
++	e := &entry{
++		component: component,
++		actorType: ActorType(h.opts.Namespace, h.opts.AppID, component),
++		driver:    d,
++		cancel:    cancel,
++		done:      make(chan struct{}),
++	}
++
++	h.lock.Lock()
++	h.entries[component] = e
++	h.lock.Unlock()
++
++	go func() {
++		defer close(e.done)
++		h.run(ctx, e, cfg)
++	}()
+ }
+ 
+-// Remove unregisters a sandbox component from the host.
+-func (h *Host) Remove(_ context.Context, _ string) error {
+-	// TODO(Task 6): unregister the actor type and stop management.
++// Remove stops hosting a sandbox component: it stops the component's
++// goroutine, unregisters the actor type if it was registered (which releases
++// every VM) and asks the driver to reconcile to an empty set. Removing an
++// unknown component is a no-op.
++func (h *Host) Remove(_ context.Context, component string) error {
++	h.opLock.Lock()
++	defer h.opLock.Unlock()
++
++	h.stop(component)
+ 	return nil
+ }
+ 
++// stop must be called with opLock held.
++func (h *Host) stop(component string) {
++	h.lock.Lock()
++	e, ok := h.entries[component]
++	delete(h.entries, component)
++	h.lock.Unlock()
++	if !ok {
++		return
++	}
++
++	e.cancel()
++
++	var exited bool
++	timer := time.NewTimer(stopTimeout)
++	select {
++	case <-e.done:
++		exited = true
++	case <-timer.C:
++		log.Warnf("Sandbox component '%s' did not stop within %s", component, stopTimeout)
++	}
++	timer.Stop()
++
++	e.lock.Lock()
++	tbl, registered := e.tbl, e.registered
++	e.lock.Unlock()
++
++	// Only a goroutine that has exited can no longer register the type.
++	if exited && registered {
++		if err := tbl.UnRegisterActorTypes(e.actorType); err != nil {
++			log.Errorf("Failed to unregister sandbox actor type '%s': %v", e.actorType, err)
++		}
++	}
++
++	// The driver may hold warm VMs whether or not the type was registered.
++	ctx, cancel := context.WithTimeout(context.Background(), reconcileTimeout)
++	defer cancel()
++	if _, err := e.driver.Reconcile(ctx, &compv1pb.SandboxReconcileRequest{LiveInstanceIds: []string{}}); err != nil {
++		log.Errorf("Failed to reconcile sandbox component '%s' on removal: %v", component, err)
++	}
++}
++
++func (h *Host) run(ctx context.Context, e *entry, cfg sandbox.Config) {
++	if !h.waitReady(ctx, e) {
++		return
++	}
++
++	// Table blocks until the actor runtime is ready, which needs placement
++	// and an actor state store and may never happen.
++	tbl, err := h.opts.Actors.Table(ctx)
++	if err != nil || tbl == nil {
++		if ctx.Err() == nil {
++			log.Errorf("Failed to get the actor table for sandbox component '%s': %v", e.component, err)
++		}
++		return
++	}
++
++	factory, err := sandboxtarget.New(sandboxtarget.Options{
++		ActorType:   e.actorType,
++		Component:   e.component,
++		Driver:      e.driver,
++		IdleTimeout: cfg.IdleTimeout,
++	})
++	if err != nil {
++		log.Errorf("Failed to create the actor factory for sandbox component '%s': %v", e.component, err)
++		return
++	}
++
++	if ctx.Err() != nil {
++		return
++	}
++
++	e.lock.Lock()
++	e.tbl = tbl
++	e.registered = true
++	e.lock.Unlock()
++	tbl.RegisterActorTypes(table.RegisterActorTypeOptions{
++		Factories: []table.ActorTypeFactory{{Type: e.actorType, Factory: factory}},
++	})
++	log.Infof("Registered sandbox actor type '%s'", e.actorType)
++
++	h.reconcileLoop(ctx, e, factory)
++}
++
++// waitReady polls the driver until it is ready. It returns false if ctx ended
++// first.
++func (h *Host) waitReady(ctx context.Context, e *entry) bool {
++	var lastLog time.Time
++	for {
++		callCtx, cancel := context.WithTimeout(ctx, readyCallTimeout)
++		res, err := e.driver.Ready(callCtx, &compv1pb.SandboxReadyRequest{})
++		cancel()
++
++		switch {
++		case ctx.Err() != nil:
++			return false
++		case err == nil && res.GetReady():
++			return true
++		case time.Since(lastLog) >= notReadyLogInterval:
++			lastLog = time.Now()
++			if err != nil {
++				log.Infof("Sandbox component '%s' is not ready: %v", e.component, err)
++			} else {
++				log.Infof("Sandbox component '%s' is not ready: %s", e.component, res.GetReason())
++			}
++		}
++
++		select {
++		case <-ctx.Done():
++			return false
++		case <-time.After(h.opts.ReadyPollInterval):
++		}
++	}
++}
++
++func (h *Host) reconcileLoop(ctx context.Context, e *entry, factory *sandboxtarget.Factory) {
++	ticker := time.NewTicker(h.opts.ReconcileInterval)
++	defer ticker.Stop()
++
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++		}
++
++		// An instance being acquired is not in LiveInstanceIDs yet, so
++		// reconciling now could release a VM that was just handed out.
++		if n := factory.AcquiresInFlight(); n > 0 {
++			log.Debugf("Skipping reconcile of sandbox component '%s': %d acquire(s) in flight", e.component, n)
++			continue
++		}
++		ids := factory.LiveInstanceIDs()
++		if n := factory.AcquiresInFlight(); n > 0 {
++			log.Debugf("Skipping reconcile of sandbox component '%s': %d acquire(s) in flight", e.component, n)
++			continue
++		}
++
++		callCtx, cancel := context.WithTimeout(ctx, reconcileTimeout)
++		_, err := e.driver.Reconcile(callCtx, &compv1pb.SandboxReconcileRequest{LiveInstanceIds: ids})
++		cancel()
++		if err != nil && ctx.Err() == nil {
++			log.Errorf("Failed to reconcile sandbox component '%s': %v", e.component, err)
++		}
++	}
++}
++
+ // ActorType returns the internal actor type name for a sandbox component.
+ func ActorType(namespace, appID, component string) string {
+ 	return "dapr.internal." + namespace + "." + appID + ".sandbox." + component
+diff --git a/pkg/runtime/sandboxhost/host_test.go b/pkg/runtime/sandboxhost/host_test.go
+new file mode 100644
+index 000000000..8a403b806
+--- /dev/null
++++ b/pkg/runtime/sandboxhost/host_test.go
+@@ -0,0 +1,261 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandboxhost
++
++import (
++	"context"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/dapr/components-contrib/metadata"
++	actorsfake "github.com/dapr/dapr/pkg/actors/fake"
++	"github.com/dapr/dapr/pkg/actors/table"
++	tablefake "github.com/dapr/dapr/pkg/actors/table/fake"
++	"github.com/dapr/dapr/pkg/components/sandbox"
++	compv1pb "github.com/dapr/dapr/pkg/proto/components/v1"
++)
++
++const wantType = "dapr.internal.default.app1.sandbox.py"
++
++type fakeDriver struct {
++	notReadyPolls int32
++
++	readyCalls atomic.Int32
++
++	lock       sync.Mutex
++	reconciles [][]string
++	// events records "ready", "register", "unregister" and "reconcile" in order.
++	events []string
++}
++
++var _ sandbox.Sandbox = (*fakeDriver)(nil)
++
++func (d *fakeDriver) record(e string) {
++	d.lock.Lock()
++	d.events = append(d.events, e)
++	d.lock.Unlock()
++}
++
++func (d *fakeDriver) Init(context.Context, metadata.Base) error { return nil }
++func (d *fakeDriver) Close() error                              { return nil }
++func (d *fakeDriver) Ready(context.Context, *compv1pb.SandboxReadyRequest) (*compv1pb.SandboxReadyResponse, error) {
++	n := d.readyCalls.Add(1)
++	d.record("ready")
++	if n <= d.notReadyPolls {
++		return &compv1pb.SandboxReadyResponse{Reason: "warming up"}, nil
++	}
++	return &compv1pb.SandboxReadyResponse{Ready: true}, nil
++}
++
++func (d *fakeDriver) Acquire(context.Context, *compv1pb.SandboxAcquireRequest) (*compv1pb.SandboxAcquireResponse, error) {
++	return &compv1pb.SandboxAcquireResponse{InstanceId: "i1"}, nil
++}
++
++func (d *fakeDriver) Exec(context.Context, *compv1pb.SandboxExecRequest) (*compv1pb.SandboxExecResponse, error) {
++	return &compv1pb.SandboxExecResponse{}, nil
++}
++
++func (d *fakeDriver) SessionStart(context.Context, *compv1pb.SandboxSessionStartRequest) (*compv1pb.SandboxSessionStartResponse, error) {
++	return &compv1pb.SandboxSessionStartResponse{}, nil
++}
++
++func (d *fakeDriver) SessionSend(context.Context, *compv1pb.SandboxSessionSendRequest) (*compv1pb.SandboxExecResponse, error) {
++	return &compv1pb.SandboxExecResponse{}, nil
++}
++
++func (d *fakeDriver) SessionClose(context.Context, *compv1pb.SandboxSessionCloseRequest) (*compv1pb.SandboxSessionCloseResponse, error) {
++	return &compv1pb.SandboxSessionCloseResponse{}, nil
++}
++
++func (d *fakeDriver) Release(context.Context, *compv1pb.SandboxReleaseRequest) (*compv1pb.SandboxReleaseResponse, error) {
++	return &compv1pb.SandboxReleaseResponse{}, nil
++}
++
++func (d *fakeDriver) Reconcile(_ context.Context, req *compv1pb.SandboxReconcileRequest) (*compv1pb.SandboxReconcileResponse, error) {
++	d.lock.Lock()
++	d.reconciles = append(d.reconciles, append([]string{}, req.GetLiveInstanceIds()...))
++	d.events = append(d.events, "reconcile")
++	d.lock.Unlock()
++	return &compv1pb.SandboxReconcileResponse{}, nil
++}
++
++func (d *fakeDriver) snapshot() ([][]string, []string) {
++	d.lock.Lock()
++	defer d.lock.Unlock()
++	return append([][]string(nil), d.reconciles...), append([]string(nil), d.events...)
++}
++
++type fakeTable struct {
++	*tablefake.Fake
++	registered   atomic.Int32
++	unregistered chan []string
++	regTypes     chan string
++	readyAtReg   atomic.Int32
++}
++
++func newFixture(d *fakeDriver) (*Host, *fakeTable) {
++	ft := &fakeTable{
++		unregistered: make(chan []string, 10),
++		regTypes:     make(chan string, 10),
++	}
++	ft.Fake = tablefake.New().
++		WithRegisterActorTypes(func(opts table.RegisterActorTypeOptions) {
++			ft.readyAtReg.Store(d.readyCalls.Load())
++			d.record("register")
++			ft.registered.Add(1)
++			for _, f := range opts.Factories {
++				ft.regTypes <- f.Type
++			}
++		}).
++		WithUnRegisterActorTypes(func(types ...string) error {
++			d.record("unregister")
++			ft.unregistered <- types
++			return nil
++		})
++
++	a := actorsfake.New().WithTable(func(context.Context) (table.Interface, error) {
++		return ft, nil
++	})
++	return New(Options{
++		Actors:            a,
++		AppID:             "app1",
++		Namespace:         "default",
++		ReadyPollInterval: time.Millisecond,
++		ReconcileInterval: 10 * time.Millisecond,
++	}), ft
++}
++
++func TestRegistersOnlyAfterReady(t *testing.T) {
++	d := &fakeDriver{notReadyPolls: 3}
++	h, ft := newFixture(d)
++
++	h.Add(t.Context(), "py", d, sandbox.Config{})
++	t.Cleanup(func() { assert.NoError(t, h.Remove(context.Background(), "py")) })
++
++	select {
++	case typ := <-ft.regTypes:
++		assert.Equal(t, wantType, typ)
++	case <-time.After(5 * time.Second):
++		require.Fail(t, "actor type was never registered")
++	}
++
++	assert.Equal(t, int32(4), ft.readyAtReg.Load(), "registered before the 4th Ready poll")
++	assert.Equal(t, int32(1), ft.registered.Load())
++	select {
++	case typ := <-ft.regTypes:
++		assert.Fail(t, "registered twice", typ)
++	case <-time.After(50 * time.Millisecond):
++	}
++}
++
++func TestReconcileLoop(t *testing.T) {
++	d := &fakeDriver{}
++	h, _ := newFixture(d)
++
++	h.Add(t.Context(), "py", d, sandbox.Config{})
++	t.Cleanup(func() { assert.NoError(t, h.Remove(context.Background(), "py")) })
++
++	assert.EventuallyWithT(t, func(c *assert.CollectT) {
++		recs, _ := d.snapshot()
++		assert.GreaterOrEqual(c, len(recs), 2)
++	}, 5*time.Second, 5*time.Millisecond)
++
++	recs, _ := d.snapshot()
++	for _, r := range recs {
++		assert.Empty(t, r, "no active targets, so no live IDs")
++	}
++}
++
++func TestRemoveReleasesAll(t *testing.T) {
++	d := &fakeDriver{}
++	h, ft := newFixture(d)
++
++	h.Add(t.Context(), "py", d, sandbox.Config{})
++	select {
++	case <-ft.regTypes:
++	case <-time.After(5 * time.Second):
++		require.Fail(t, "actor type was never registered")
++	}
++
++	require.NoError(t, h.Remove(context.Background(), "py"))
++
++	select {
++	case types := <-ft.unregistered:
++		assert.Equal(t, []string{wantType}, types)
++	default:
++		require.Fail(t, "UnRegisterActorTypes not called")
++	}
++
++	recs, events := d.snapshot()
++	require.NotEmpty(t, recs)
++	assert.Empty(t, recs[len(recs)-1])
++	assert.Equal(t, "reconcile", events[len(events)-1])
++
++	// The loop is stopped: no more reconciles after Remove.
++	n := len(recs)
++	time.Sleep(50 * time.Millisecond)
++	recs, _ = d.snapshot()
++	assert.Len(t, recs, n)
++
++	// Removing again is a no-op.
++	assert.NoError(t, h.Remove(context.Background(), "py"))
++}
++
++func TestRemoveBeforeReadyDoesNotUnregister(t *testing.T) {
++	d := &fakeDriver{notReadyPolls: 1 << 30}
++	h, ft := newFixture(d)
++
++	h.Add(t.Context(), "py", d, sandbox.Config{})
++	require.NoError(t, h.Remove(context.Background(), "py"))
++
++	assert.Equal(t, int32(0), ft.registered.Load())
++	assert.Empty(t, ft.unregistered)
++	recs, _ := d.snapshot()
++	require.Len(t, recs, 1)
++	assert.Empty(t, recs[0])
++}
++
++func TestAddDoesNotBlockOnTable(t *testing.T) {
++	d := &fakeDriver{}
++	a := actorsfake.New().WithTable(func(ctx context.Context) (table.Interface, error) {
++		<-ctx.Done()
++		return nil, ctx.Err()
++	})
++	h := New(Options{Actors: a, AppID: "app1", Namespace: "default", ReadyPollInterval: time.Millisecond})
++
++	done := make(chan struct{})
++	go func() {
++		h.Add(t.Context(), "py", d, sandbox.Config{})
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(5 * time.Second):
++		require.Fail(t, "Add blocked")
++	}
++
++	// Remove cancels the goroutine stuck in Table.
++	require.NoError(t, h.Remove(context.Background(), "py"))
++}
++
++func TestActorType(t *testing.T) {
++	assert.Equal(t, wantType, ActorType("default", "app1", "py"))
++}
+-- 
+2.47.0
+

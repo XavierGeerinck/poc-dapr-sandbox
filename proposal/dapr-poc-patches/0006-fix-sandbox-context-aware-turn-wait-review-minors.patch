@@ -1,0 +1,608 @@
+From 66f60d503120c3578cc2503d7c2da477d68e4f6d Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Wed, 28 Oct 2026 20:28:52 +0100
+Subject: [PATCH 06/12] fix(sandbox): context-aware turn wait; review minors
+
+Calls now wait for their turn on a 1-slot channel semaphore that also
+selects on the caller's context and on a per-target closed channel, so a
+caller that gives up or a removed target no longer blocks behind a long
+exec, and a dead context never reaches the driver. Also: halt under the
+factory lock, Closed errors carry the actor method, prebuilt lost error,
+New rejects a nil driver, and tests no longer require off the test
+goroutine.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/actors/targets/sandbox/factory.go      |  40 ++--
+ pkg/actors/targets/sandbox/sandbox.go      |  75 ++++---
+ pkg/actors/targets/sandbox/sandbox_test.go | 234 +++++++++++++++++++--
+ 3 files changed, 286 insertions(+), 63 deletions(-)
+
+diff --git a/pkg/actors/targets/sandbox/factory.go b/pkg/actors/targets/sandbox/factory.go
+index 56f7f5e80..d58a496a8 100644
+--- a/pkg/actors/targets/sandbox/factory.go
++++ b/pkg/actors/targets/sandbox/factory.go
+@@ -15,6 +15,7 @@ package sandbox
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"slices"
+ 	"sync"
+ 	"time"
+@@ -62,9 +63,9 @@ type Options struct {
+ // Factory creates and tracks the sandbox actor targets of one sandbox
+ // component. It implements targets.Factory.
+ //
+-// Locking: a target's turn lock may be held while taking Factory.lock, never
+-// the other way round, and Factory.lock is never held while calling the
+-// driver.
++// Lock order: a target's turn, then Factory.lock, then the idler queue's
++// lock; never the other way round. Factory.lock is never held while calling
++// the driver.
+ type Factory struct {
+ 	actorType   string
+ 	component   string
+@@ -82,7 +83,10 @@ type Factory struct {
+ var _ targets.Factory = (*Factory)(nil)
+ 
+ // New returns a Factory for one sandbox component.
+-func New(opts Options) *Factory {
++func New(opts Options) (*Factory, error) {
++	if opts.Driver == nil {
++		return nil, errors.New("sandbox actor factory: driver is required")
++	}
+ 	if opts.Clock == nil {
+ 		opts.Clock = clock.RealClock{}
+ 	}
+@@ -104,7 +108,7 @@ func New(opts Options) *Factory {
+ 		Clock:     f.clock,
+ 	})
+ 
+-	return f
++	return f, nil
+ }
+ 
+ // GetOrCreate returns the target for the sandbox ID, creating it with a new
+@@ -129,6 +133,8 @@ func (f *Factory) GetOrCreate(actorID string) targets.Interface {
+ 		factory:    f,
+ 		actorID:    actorID,
+ 		activation: uuid.NewString(),
++		turn:       make(chan struct{}, 1),
++		closed:     make(chan struct{}),
+ 	}
+ 	t.idleAt.Store(new(f.clock.Now().Add(f.idleTimeout)))
+ 	f.table[actorID] = t
+@@ -188,18 +194,22 @@ func (f *Factory) HaltNonHosted(_ context.Context, fn func(*api.LookupActorReque
+ }
+ 
+ func (f *Factory) haltWhere(halt func(actorID string) bool) {
+-	f.lock.RLock()
+-	all := make([]*target, 0, len(f.table))
++	var release []string
++
++	f.lock.Lock()
+ 	for _, t := range f.table {
+-		all = append(all, t)
++		if !halt(t.actorID) {
++			continue
++		}
++		log.Debugf("Halting sandbox actor '%s'", t.Key())
++		if instanceID, ok := f.removeLocked(t); ok && instanceID != "" {
++			release = append(release, instanceID)
++		}
+ 	}
+-	f.lock.RUnlock()
++	f.lock.Unlock()
+ 
+-	for _, t := range all {
+-		if halt(t.actorID) {
+-			log.Debugf("Halting sandbox actor '%s'", t.Key())
+-			f.remove(t)
+-		}
++	for _, instanceID := range release {
++		f.releaseAsync(instanceID)
+ 	}
+ }
+ 
+@@ -223,6 +233,8 @@ func (f *Factory) removeLocked(t *target) (string, bool) {
+ 		return "", false
+ 	}
+ 	t.removed = true
++	// Wake the calls waiting for their turn: they return Closed.
++	close(t.closed)
+ 	delete(f.table, t.actorID)
+ 	// While t was in the table no other target had its key, so the queued
+ 	// item for the key, if any, is t's.
+diff --git a/pkg/actors/targets/sandbox/sandbox.go b/pkg/actors/targets/sandbox/sandbox.go
+index e89e75fc8..41fb6da0f 100644
+--- a/pkg/actors/targets/sandbox/sandbox.go
++++ b/pkg/actors/targets/sandbox/sandbox.go
+@@ -19,7 +19,6 @@ package sandbox
+ import (
+ 	"context"
+ 	"errors"
+-	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -72,17 +71,22 @@ const (
+ 	ErrorDomain = "dapr.io"
+ )
+ 
+-// ErrSandboxLost returns the "sandbox lost" error: FailedPrecondition with an
+-// ErrorInfo detail whose reason is ReasonSandboxLost.
+-func ErrSandboxLost() error {
++// errSandboxLost is built once so that it always carries its ErrorInfo.
++var errSandboxLost = func() error {
+ 	st, err := status.New(codes.FailedPrecondition, "sandbox lost").WithDetails(&errdetails.ErrorInfo{
+ 		Reason: ReasonSandboxLost,
+ 		Domain: ErrorDomain,
+ 	})
+ 	if err != nil {
+-		return status.Error(codes.FailedPrecondition, "sandbox lost")
++		panic("sandbox: building the sandbox lost error: " + err.Error())
+ 	}
+ 	return st.Err()
++}()
++
++// ErrSandboxLost returns the "sandbox lost" error: FailedPrecondition with an
++// ErrorInfo detail whose reason is ReasonSandboxLost.
++func ErrSandboxLost() error {
++	return errSandboxLost
+ }
+ 
+ // IsSandboxLost reports whether err is the "sandbox lost" error.
+@@ -114,13 +118,15 @@ type target struct {
+ 	// holding it for writing gives a stable value.
+ 	inflight atomic.Int32
+ 
+-	// lock makes calls turn-based: every InvokeMethod holds it for the whole
+-	// call.
+-	lock sync.Mutex
++	// turn makes calls turn-based: a call holds its single slot for the whole
++	// call. Waiting for it honours the caller's context and closed.
++	turn chan struct{}
++	// closed is closed when the target is removed, waking waiting calls.
++	closed chan struct{}
+ 
+ 	// instanceID is the driver instance, or "" before it was acquired. It is
+-	// written while holding both lock and factory.lock; reading it requires
+-	// either.
++	// written while holding both the turn and factory.lock; reading it
++	// requires either.
+ 	instanceID string
+ 	// removed is set once the target left the table. Guarded by
+ 	// factory.lock.
+@@ -138,14 +144,26 @@ func (t *target) InvokeMethod(ctx context.Context, req *internalv1pb.InternalInv
+ 	}
+ 	defer t.exit()
+ 
+-	t.lock.Lock()
+-	defer t.lock.Unlock()
++	// A caller that gives up, or a target removed while the call waits,
++	// leaves the target as it is. Closed makes the router retry on a new
++	// target.
++	select {
++	case t.turn <- struct{}{}:
++	case <-t.closed:
++		return nil, targetserrors.NewClosed(method)
++	case <-ctx.Done():
++		return nil, status.FromContextError(ctx.Err()).Err()
++	}
++	defer func() { <-t.turn }()
+ 
+-	// The target may have been removed while this call waited for its turn.
+-	// The router then retries on a new target.
++	// select picks at random among ready cases, so check both again now that
++	// the turn is held, before any driver call.
+ 	if t.isRemoved() {
+ 		return nil, targetserrors.NewClosed(method)
+ 	}
++	if err := ctx.Err(); err != nil {
++		return nil, status.FromContextError(err).Err()
++	}
+ 
+ 	data := req.GetMessage().GetData().GetValue()
+ 
+@@ -183,7 +201,7 @@ func (t *target) activate(ctx context.Context, data []byte, start time.Time) (pr
+ 	}
+ 
+ 	timing := new(runtimev1pb.SandboxTimingAlpha1)
+-	if _, err := t.acquire(ctx, timing); err != nil {
++	if _, err := t.acquire(ctx, MethodActivate, timing); err != nil {
+ 		return nil, err
+ 	}
+ 
+@@ -200,12 +218,13 @@ func (t *target) exec(ctx context.Context, data []byte, start time.Time) (proto.
+ 	if err := unmarshal(MethodExec, data, &req); err != nil {
+ 		return nil, err
+ 	}
+-	if err := t.checkActivation(req.GetExpectedActivation()); err != nil {
++	// May remove the target.
++	if err := t.verifyActivation(req.GetExpectedActivation()); err != nil {
+ 		return nil, err
+ 	}
+ 
+ 	timing := new(runtimev1pb.SandboxTimingAlpha1)
+-	instanceID, err := t.acquire(ctx, timing)
++	instanceID, err := t.acquire(ctx, MethodExec, timing)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -245,11 +264,12 @@ func (t *target) sessionStart(ctx context.Context, data []byte) (proto.Message,
+ 	if err := unmarshal(MethodSessionStart, data, &req); err != nil {
+ 		return nil, err
+ 	}
+-	if err := t.checkActivation(req.GetExpectedActivation()); err != nil {
++	// May remove the target.
++	if err := t.verifyActivation(req.GetExpectedActivation()); err != nil {
+ 		return nil, err
+ 	}
+ 
+-	instanceID, err := t.acquire(ctx, new(runtimev1pb.SandboxTimingAlpha1))
++	instanceID, err := t.acquire(ctx, MethodSessionStart, new(runtimev1pb.SandboxTimingAlpha1))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -278,7 +298,8 @@ func (t *target) sessionSend(ctx context.Context, data []byte, start time.Time)
+ 	if err := unmarshal(MethodSessionSend, data, &req); err != nil {
+ 		return nil, err
+ 	}
+-	if err := t.checkActivation(req.GetExpectedActivation()); err != nil {
++	// May remove the target.
++	if err := t.verifyActivation(req.GetExpectedActivation()); err != nil {
+ 		return nil, err
+ 	}
+ 	// A sandbox without a VM has no sessions: don't acquire one just to fail.
+@@ -338,9 +359,10 @@ func (t *target) execResponse(res *compv1pb.SandboxExecResponse, timing *runtime
+ 	}
+ }
+ 
+-// checkActivation returns the "sandbox lost" error if the caller expects a
+-// different activation than this one. Must be called with t.lock held.
+-func (t *target) checkActivation(expected string) error {
++// verifyActivation returns the "sandbox lost" error if the caller expects a
++// different activation than this one, and then removes the target if it
++// holds no VM. Must be called with the turn held.
++func (t *target) verifyActivation(expected string) error {
+ 	if expected == "" || expected == t.activation {
+ 		return nil
+ 	}
+@@ -355,8 +377,9 @@ func (t *target) checkActivation(expected string) error {
+ // acquire returns the target's driver instance, acquiring it on first use
+ // and recording the activation time and path in timing. On a driver error
+ // the target is removed: it holds no VM, and a later call starts over with a
+-// new activation. Must be called with t.lock held.
+-func (t *target) acquire(ctx context.Context, timing *runtimev1pb.SandboxTimingAlpha1) (string, error) {
++// new activation. Must be called with the turn held; method names the actor
++// method for the Closed error.
++func (t *target) acquire(ctx context.Context, method string, timing *runtimev1pb.SandboxTimingAlpha1) (string, error) {
+ 	if t.instanceID != "" {
+ 		return t.instanceID, nil
+ 	}
+@@ -382,7 +405,7 @@ func (t *target) acquire(ctx context.Context, timing *runtimev1pb.SandboxTimingA
+ 		// the router retry on a new target. No command ran yet.
+ 		f.lock.Unlock()
+ 		f.releaseAsync(res.GetInstanceId())
+-		return "", targetserrors.NewClosed("acquire")
++		return "", targetserrors.NewClosed(method)
+ 	}
+ 	t.instanceID = res.GetInstanceId()
+ 	f.lock.Unlock()
+diff --git a/pkg/actors/targets/sandbox/sandbox_test.go b/pkg/actors/targets/sandbox/sandbox_test.go
+index 55fadf111..53514c79c 100644
+--- a/pkg/actors/targets/sandbox/sandbox_test.go
++++ b/pkg/actors/targets/sandbox/sandbox_test.go
+@@ -56,6 +56,12 @@ type fakeDriver struct {
+ 	execDelay    time.Duration
+ 	acquireErr   error
+ 	execErr      error
++	// sessionStartErr, when set, is returned by SessionStart.
++	sessionStartErr error
++	// acquireStarted and acquireBlock, when set, make Acquire signal that it
++	// started and wait until acquireBlock is closed.
++	acquireStarted chan struct{}
++	acquireBlock   chan struct{}
+ 	// releaseBlock, when set, makes Release wait until it is closed (or the
+ 	// context is done).
+ 	releaseBlock chan struct{}
+@@ -85,6 +91,12 @@ func (d *fakeDriver) Ready(context.Context, *compv1pb.SandboxReadyRequest) (*com
+ 
+ func (d *fakeDriver) Acquire(ctx context.Context, req *compv1pb.SandboxAcquireRequest) (*compv1pb.SandboxAcquireResponse, error) {
+ 	d.acquireCount.Add(1)
++	if d.acquireStarted != nil {
++		d.acquireStarted <- struct{}{}
++	}
++	if d.acquireBlock != nil {
++		<-d.acquireBlock
++	}
+ 	if d.acquireDelay > 0 {
+ 		time.Sleep(d.acquireDelay)
+ 	}
+@@ -125,6 +137,9 @@ func (d *fakeDriver) SessionStart(ctx context.Context, req *compv1pb.SandboxSess
+ 	d.lock.Lock()
+ 	d.starts = append(d.starts, req)
+ 	d.lock.Unlock()
++	if d.sessionStartErr != nil {
++		return nil, d.sessionStartErr
++	}
+ 	return &compv1pb.SandboxSessionStartResponse{SessionId: "sess-1"}, nil
+ }
+ 
+@@ -181,37 +196,78 @@ func newFactory(t *testing.T, d *fakeDriver, opts ...func(*Options)) *Factory {
+ 	for _, fn := range opts {
+ 		fn(&o)
+ 	}
+-	f := New(o)
++	f, err := New(o)
++	require.NoError(t, err)
+ 	t.Cleanup(func() {
+ 		require.NoError(t, f.HaltAll(context.Background()))
+ 	})
+ 	return f
+ }
+ 
+-func invoke(t *testing.T, f *Factory, id, method string, in proto.Message) (*internalv1pb.InternalInvokeResponse, error) {
+-	t.Helper()
++// call is the outcome of one InvokeMethod.
++type call struct {
++	res *internalv1pb.InternalInvokeResponse
++	err error
++}
++
++// invokeCtx invokes a method on the sandbox's target. It is safe on any
++// goroutine: it reports failures in its result instead of failing the test.
++func invokeCtx(ctx context.Context, f *Factory, id, method string, in proto.Message) call {
+ 	var data []byte
+ 	if in != nil {
+ 		var err error
+-		data, err = proto.Marshal(in)
+-		require.NoError(t, err)
++		if data, err = proto.Marshal(in); err != nil {
++			return call{err: err}
++		}
+ 	}
+ 	req := internalv1pb.NewInternalInvokeRequest(method).
+ 		WithActor(testActorType, id).
+ 		WithData(data).
+ 		WithContentType(internalv1pb.ProtobufContentType)
+-	return f.GetOrCreate(id).InvokeMethod(t.Context(), req)
++	res, err := f.GetOrCreate(id).InvokeMethod(ctx, req)
++	return call{res: res, err: err}
+ }
+ 
+-func execOK(t *testing.T, f *Factory, id string, in *runtimev1pb.SandboxExecRequestAlpha1) *runtimev1pb.SandboxExecResponseAlpha1 {
++// goInvoke runs invokeCtx on a new goroutine.
++func goInvoke(ctx context.Context, f *Factory, id, method string, in proto.Message) <-chan call {
++	ch := make(chan call, 1)
++	go func() { ch <- invokeCtx(ctx, f, id, method, in) }()
++	return ch
++}
++
++// await returns the next value from ch, failing the test after 5 s.
++func await[T any](t *testing.T, ch <-chan T) T {
+ 	t.Helper()
+-	res, err := invoke(t, f, id, MethodExec, in)
+-	require.NoError(t, err)
++	select {
++	case v := <-ch:
++		return v
++	case <-time.After(5 * time.Second):
++		require.FailNow(t, "timed out waiting")
++		var zero T
++		return zero
++	}
++}
++
++func invoke(t *testing.T, f *Factory, id, method string, in proto.Message) (*internalv1pb.InternalInvokeResponse, error) {
++	t.Helper()
++	c := invokeCtx(t.Context(), f, id, method, in)
++	return c.res, c.err
++}
++
++// execResult decodes a successful exec call. Call it on the test goroutine.
++func execResult(t *testing.T, c call) *runtimev1pb.SandboxExecResponseAlpha1 {
++	t.Helper()
++	require.NoError(t, c.err)
+ 	var out runtimev1pb.SandboxExecResponseAlpha1
+-	require.NoError(t, proto.Unmarshal(res.GetMessage().GetData().GetValue(), &out))
++	require.NoError(t, proto.Unmarshal(c.res.GetMessage().GetData().GetValue(), &out))
+ 	return &out
+ }
+ 
++func execOK(t *testing.T, f *Factory, id string, in *runtimev1pb.SandboxExecRequestAlpha1) *runtimev1pb.SandboxExecResponseAlpha1 {
++	t.Helper()
++	return execResult(t, invokeCtx(t.Context(), f, id, MethodExec, in))
++}
++
+ func requireLost(t *testing.T, err error) {
+ 	t.Helper()
+ 	require.Error(t, err)
+@@ -249,14 +305,14 @@ func TestFirstCallAcquiresOnce(t *testing.T) {
+ 	d := &fakeDriver{acquireDelay: 50 * time.Millisecond}
+ 	f := newFactory(t, d)
+ 
+-	var wg sync.WaitGroup
+-	results := make([]*runtimev1pb.SandboxExecResponseAlpha1, 2)
+-	for i := range results {
+-		wg.Go(func() {
+-			results[i] = execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
+-		})
++	calls := []<-chan call{
++		goInvoke(t.Context(), f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"}),
++		goInvoke(t.Context(), f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"}),
++	}
++	results := make([]*runtimev1pb.SandboxExecResponseAlpha1, len(calls))
++	for i, ch := range calls {
++		results[i] = execResult(t, await(t, ch))
+ 	}
+-	wg.Wait()
+ 
+ 	assert.Equal(t, int32(1), d.acquireCount.Load())
+ 	assert.Equal(t, int32(2), d.execCount.Load())
+@@ -425,11 +481,8 @@ func TestIdleWhileCallRunning(t *testing.T) {
+ 	d := &fakeDriver{execStarted: make(chan struct{}, 1), execBlock: make(chan struct{})}
+ 	f := newFactory(t, d, func(o *Options) { o.Clock = clock })
+ 
+-	done := make(chan *runtimev1pb.SandboxExecResponseAlpha1)
+-	go func() {
+-		done <- execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "sleep"})
+-	}()
+-	<-d.execStarted
++	done := goInvoke(t.Context(), f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "sleep"})
++	await(t, d.execStarted)
+ 
+ 	// The idle deadline passes while the call runs: the sandbox is kept.
+ 	assert.Eventually(t, clock.HasWaiters, 5*time.Second, 10*time.Millisecond)
+@@ -438,7 +491,7 @@ func TestIdleWhileCallRunning(t *testing.T) {
+ 	assert.True(t, f.Exists("sb1"))
+ 
+ 	close(d.execBlock)
+-	res := <-done
++	res := execResult(t, await(t, done))
+ 	assert.NotEmpty(t, res.GetActivation())
+ 
+ 	// The idle period restarts when the call ends.
+@@ -653,3 +706,138 @@ func TestInvalidRequests(t *testing.T) {
+ 	assert.Equal(t, "sb1", tgt.ID())
+ 	assert.Equal(t, testActorType+api.DaprSeparator+"sb1", tgt.Key())
+ }
++
++func TestQueuedCallHonoursContext(t *testing.T) {
++	for name, tc := range map[string]struct {
++		newCtx func(context.Context) (context.Context, context.CancelFunc)
++		// giveUp ends the caller's wait: an explicit cancel, or nothing for
++		// the deadline to pass on its own.
++		giveUp func(context.CancelFunc)
++		code   codes.Code
++	}{
++		"cancelled": {
++			newCtx: func(ctx context.Context) (context.Context, context.CancelFunc) { return context.WithCancel(ctx) },
++			giveUp: func(cancel context.CancelFunc) { cancel() },
++			code:   codes.Canceled,
++		},
++		"deadline": {
++			newCtx: func(ctx context.Context) (context.Context, context.CancelFunc) {
++				return context.WithTimeout(ctx, 200*time.Millisecond)
++			},
++			giveUp: func(context.CancelFunc) {},
++			code:   codes.DeadlineExceeded,
++		},
++	} {
++		t.Run(name, func(t *testing.T) {
++			d := &fakeDriver{execStarted: make(chan struct{}, 1), execBlock: make(chan struct{})}
++			f := newFactory(t, d)
++
++			running := goInvoke(t.Context(), f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "sleep"})
++			await(t, d.execStarted)
++			tgt := f.GetOrCreate("sb1").(*target)
++
++			ctx, cancel := tc.newCtx(t.Context())
++			defer cancel()
++			queued := goInvoke(ctx, f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "queued"})
++			assert.Eventually(t, func() bool { return tgt.inflight.Load() == 2 }, 5*time.Second, time.Millisecond)
++			tc.giveUp(cancel)
++
++			// The queued call returns while the running exec is still blocked.
++			c := await(t, queued)
++			require.Error(t, c.err)
++			assert.Equal(t, tc.code, status.Code(c.err))
++			assert.Equal(t, int32(1), tgt.inflight.Load())
++			assert.True(t, f.Exists("sb1"))
++
++			close(d.execBlock)
++			res := execResult(t, await(t, running))
++			assert.Equal(t, []byte("out:sleep"), res.GetStdout())
++
++			// The queued call never reached the driver.
++			assert.Equal(t, int32(1), d.acquireCount.Load())
++			assert.Equal(t, int32(1), d.execCount.Load())
++			assert.Equal(t, int32(0), tgt.inflight.Load())
++			assert.True(t, f.Exists("sb1"))
++		})
++	}
++}
++
++func TestQueuedCallWakesOnRemoval(t *testing.T) {
++	d := &fakeDriver{execStarted: make(chan struct{}, 1), execBlock: make(chan struct{})}
++	f := newFactory(t, d)
++
++	running := goInvoke(t.Context(), f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "sleep"})
++	await(t, d.execStarted)
++	tgt := f.GetOrCreate("sb1").(*target)
++
++	queued := goInvoke(t.Context(), f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "queued"})
++	assert.Eventually(t, func() bool { return tgt.inflight.Load() == 2 }, 5*time.Second, time.Millisecond)
++	require.NoError(t, tgt.Deactivate(t.Context()))
++
++	// The waiter wakes with Closed (the router retries it on a new target)
++	// while the running exec is still blocked.
++	c := await(t, queued)
++	assert.True(t, targetserrors.IsClosed(c.err), "expected Closed, got %v", c.err)
++
++	close(d.execBlock)
++	await(t, running)
++	assert.Equal(t, int32(1), d.execCount.Load())
++	assert.Equal(t, int32(0), tgt.inflight.Load())
++}
++
++func TestDeadContextDoesNotReachDriver(t *testing.T) {
++	d := &fakeDriver{}
++	f := newFactory(t, d)
++
++	ctx, cancel := context.WithCancel(t.Context())
++	cancel()
++	// The turn is free and the context is done: whichever the select picks,
++	// the call stops before the driver. Repeat to cover both.
++	for range 20 {
++		c := invokeCtx(ctx, f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++		assert.Equal(t, codes.Canceled, status.Code(c.err))
++	}
++	assert.Equal(t, int32(0), d.acquireCount.Load())
++	assert.Equal(t, int32(0), d.execCount.Load())
++	assert.True(t, f.Exists("sb1"))
++	assert.Equal(t, int32(0), f.GetOrCreate("sb1").(*target).inflight.Load())
++}
++
++func TestRemovedDuringAcquireReleasesInstance(t *testing.T) {
++	d := &fakeDriver{acquireStarted: make(chan struct{}, 1), acquireBlock: make(chan struct{})}
++	f := newFactory(t, d)
++
++	running := goInvoke(t.Context(), f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++	await(t, d.acquireStarted)
++	require.NoError(t, f.GetOrCreate("sb1").Deactivate(t.Context()))
++	assert.Equal(t, int32(0), d.releaseStarted.Load())
++
++	close(d.acquireBlock)
++	c := await(t, running)
++	assert.True(t, targetserrors.IsClosed(c.err), "expected Closed, got %v", c.err)
++	assert.Contains(t, c.err.Error(), MethodExec)
++
++	// The instance acquired for the removed target is handed back.
++	assert.Eventually(t, func() bool { return d.releaseCount.Load() == 1 }, 5*time.Second, 10*time.Millisecond)
++	assert.Equal(t, []string{"inst-1"}, d.releasedIDs())
++	assert.Equal(t, int32(0), d.execCount.Load())
++	assert.False(t, f.Exists("sb1"))
++	assert.Empty(t, f.LiveInstanceIDs())
++}
++
++func TestSessionStartNotFoundIsLost(t *testing.T) {
++	d := &fakeDriver{sessionStartErr: status.Error(codes.NotFound, "unknown instance")}
++	f := newFactory(t, d)
++
++	_, err := invoke(t, f, "sb1", MethodSessionStart, &runtimev1pb.SandboxSessionStartRequestAlpha1{Command: "sh"})
++	requireLost(t, err)
++	assert.False(t, f.Exists("sb1"))
++	assert.Eventually(t, func() bool { return d.releaseCount.Load() == 1 }, 5*time.Second, 10*time.Millisecond)
++	assert.Equal(t, []string{"inst-1"}, d.releasedIDs())
++}
++
++func TestNewRequiresDriver(t *testing.T) {
++	f, err := New(Options{ActorType: testActorType, Component: "mysandbox"})
++	require.Error(t, err)
++	assert.Nil(t, f)
++}
+-- 
+2.47.0
+

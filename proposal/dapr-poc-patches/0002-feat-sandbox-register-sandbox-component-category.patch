@@ -1,0 +1,767 @@
+From d2a1a05993101750c050492c1e0e73a699ecd21d Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Wed, 28 Oct 2026 19:49:28 +0100
+Subject: [PATCH 02/12] feat(sandbox): register sandbox component category
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmd/daprd/app/app.go                          |   5 +-
+ pkg/components/category.go                    |   1 +
+ pkg/diagnostics/consts/consts.go              |   1 +
+ pkg/messages/errorcodes/errorcodes.go         |   8 +
+ pkg/messages/predefined.go                    |   7 +
+ pkg/resiliency/resiliency.go                  |   1 +
+ pkg/runtime/compstore/compstore.go            |   3 +
+ pkg/runtime/compstore/sandbox.go              |  41 +++++
+ pkg/runtime/processor/manager.go              |   1 +
+ pkg/runtime/processor/processor.go            |  49 ++++--
+ pkg/runtime/processor/processor_test.go       |   1 +
+ pkg/runtime/processor/sandbox/sandbox.go      | 115 ++++++++++++++
+ pkg/runtime/processor/sandbox/sandbox_test.go | 150 ++++++++++++++++++
+ pkg/runtime/registry/options.go               |   9 ++
+ pkg/runtime/registry/registry.go              |   7 +
+ pkg/runtime/sandboxhost/host.go               |  59 +++++++
+ 16 files changed, 444 insertions(+), 14 deletions(-)
+ create mode 100644 pkg/runtime/compstore/sandbox.go
+ create mode 100644 pkg/runtime/processor/sandbox/sandbox.go
+ create mode 100644 pkg/runtime/processor/sandbox/sandbox_test.go
+ create mode 100644 pkg/runtime/sandboxhost/host.go
+
+diff --git a/cmd/daprd/app/app.go b/cmd/daprd/app/app.go
+index 45a2f6282..f2733f13e 100644
+--- a/cmd/daprd/app/app.go
++++ b/cmd/daprd/app/app.go
+@@ -36,6 +36,7 @@ import (
+ 	httpMiddlewareLoader "github.com/dapr/dapr/pkg/components/middleware/http"
+ 	nrLoader "github.com/dapr/dapr/pkg/components/nameresolution"
+ 	pubsubLoader "github.com/dapr/dapr/pkg/components/pubsub"
++	sandboxLoader "github.com/dapr/dapr/pkg/components/sandbox"
+ 	searchLoader "github.com/dapr/dapr/pkg/components/search"
+ 	secretstoresLoader "github.com/dapr/dapr/pkg/components/secretstores"
+ 	stateLoader "github.com/dapr/dapr/pkg/components/state"
+@@ -106,6 +107,7 @@ func Run() {
+ 	bindingsLoader.DefaultRegistry.Logger = logContrib
+ 	conversationLoader.DefaultRegistry.Logger = logContrib
+ 	binarystoreLoader.DefaultRegistry.Logger = logContrib
++	sandboxLoader.DefaultRegistry.Logger = logContrib
+ 	httpMiddlewareLoader.DefaultRegistry.Logger = log // Note this uses log on purpose
+ 
+ 	ctx := signals.Context()
+@@ -167,7 +169,8 @@ func runWithContext(ctx context.Context, opts *options.Options, internalGRPCList
+ 		WithCryptoProviders(cryptoLoader.DefaultRegistry).
+ 		WithHTTPMiddlewares(httpMiddlewareLoader.DefaultRegistry).
+ 		WithConversations(conversationLoader.DefaultRegistry).
+-		WithBinaryStores(binarystoreLoader.DefaultRegistry)
++		WithBinaryStores(binarystoreLoader.DefaultRegistry).
++		WithSandboxes(sandboxLoader.DefaultRegistry)
+ 
+ 	healthz := healthz.New()
+ 	secProvider, err := security.New(ctx, security.Options{
+diff --git a/pkg/components/category.go b/pkg/components/category.go
+index be2b01fad..57d9642fe 100644
+--- a/pkg/components/category.go
++++ b/pkg/components/category.go
+@@ -32,4 +32,5 @@ const (
+ 	CategorySearch          Category = "search"
+ 	CategoryVector          Category = "vector"
+ 	CategoryBinaryStore     Category = "binarystore"
++	CategorySandbox         Category = "sandbox"
+ )
+diff --git a/pkg/diagnostics/consts/consts.go b/pkg/diagnostics/consts/consts.go
+index e6947d840..b6d1ef959 100644
+--- a/pkg/diagnostics/consts/consts.go
++++ b/pkg/diagnostics/consts/consts.go
+@@ -55,6 +55,7 @@ const (
+ 	BindingBuildingBlockType     = "bindings"
+ 	PubsubBuildingBlockType      = "pubsub"
+ 	BinaryStoreBuildingBlockType = "binarystore"
++	SandboxBuildingBlockType     = "sandbox"
+ 	SearchBuildingBlockType      = "search"
+ 	VectorBuildingBlockType      = "vector"
+ 
+diff --git a/pkg/messages/errorcodes/errorcodes.go b/pkg/messages/errorcodes/errorcodes.go
+index f0276dd76..2a29edacc 100644
+--- a/pkg/messages/errorcodes/errorcodes.go
++++ b/pkg/messages/errorcodes/errorcodes.go
+@@ -28,6 +28,7 @@ const (
+ 	CategorySearch            Category = "search"
+ 	CategoryVector            Category = "vector"
+ 	CategoryBinaryStore       Category = "binarystore"
++	CategorySandbox           Category = "sandbox"
+ 	CategoryServiceInvocation Category = "service-invocation"
+ 	CategoryBinding           Category = "binding"
+ 	CategoryLock              Category = "lock"
+@@ -170,6 +171,13 @@ var (
+ 	BinaryStoreFileTooLarge = ErrorCode{"ERR_BINARY_STORE_FILE_TOO_LARGE", "", CategoryBinaryStore}      // Binary file exceeds maximum size
+ 	BinaryStoreFull         = ErrorCode{"ERR_BINARY_STORE_FULL", "", CategoryBinaryStore}                // Binary store is full
+ 
++	// ### Sandbox API
++	SandboxNotFound       = ErrorCode{"ERR_SANDBOX_NOT_FOUND", "", CategorySandbox}       // Sandbox component not found
++	SandboxHostFull       = ErrorCode{"ERR_SANDBOX_HOST_FULL", "", CategorySandbox}       // Sandbox host is at capacity
++	SandboxLost           = ErrorCode{"ERR_SANDBOX_LOST", "", CategorySandbox}            // Sandbox was lost
++	SandboxInvalidRequest = ErrorCode{"ERR_SANDBOX_INVALID_REQUEST", "", CategorySandbox} // Invalid sandbox request
++	SandboxExec           = ErrorCode{"ERR_SANDBOX_EXEC", "", CategorySandbox}            // Error executing in sandbox
++
+ 	// ### Service Invocation / Direct Messaging API
+ 	ServiceInvocationDirectInvoke = ErrorCode{"ERR_DIRECT_INVOKE", "", CategoryServiceInvocation} // Error invoking service
+ 
+diff --git a/pkg/messages/predefined.go b/pkg/messages/predefined.go
+index 6116f4f95..7c17ac073 100644
+--- a/pkg/messages/predefined.go
++++ b/pkg/messages/predefined.go
+@@ -160,4 +160,11 @@ var (
+ 	ErrBinaryStoreFileExists   = APIError{"binary file %q already exists in component %s", errorcodes.BinaryStoreFileExists, http.StatusConflict, grpcCodes.AlreadyExists}
+ 	ErrBinaryStoreTooLarge     = APIError{"binary file %q exceeds the maximum size allowed by component %s", errorcodes.BinaryStoreFileTooLarge, http.StatusRequestEntityTooLarge, grpcCodes.ResourceExhausted}
+ 	ErrBinaryStoreFull         = APIError{"component %s cannot store binary file %q: store is full", errorcodes.BinaryStoreFull, http.StatusInsufficientStorage, grpcCodes.ResourceExhausted}
++
++	// Sandbox
++	ErrSandboxNotFound       = APIError{"failed finding sandbox component %s", errorcodes.SandboxNotFound, http.StatusBadRequest, grpcCodes.InvalidArgument}
++	ErrSandboxHostFull       = APIError{"sandbox host is at capacity", errorcodes.SandboxHostFull, http.StatusTooManyRequests, grpcCodes.ResourceExhausted}
++	ErrSandboxLost           = APIError{"sandbox was lost", errorcodes.SandboxLost, http.StatusGone, grpcCodes.FailedPrecondition}
++	ErrSandboxInvalidRequest = APIError{"invalid sandbox request", errorcodes.SandboxInvalidRequest, http.StatusBadRequest, grpcCodes.InvalidArgument}
++	ErrSandboxExec           = APIError{"sandbox execution failed", errorcodes.SandboxExec, http.StatusInternalServerError, grpcCodes.Internal}
+ )
+diff --git a/pkg/resiliency/resiliency.go b/pkg/resiliency/resiliency.go
+index 76352e874..f9af89bef 100644
+--- a/pkg/resiliency/resiliency.go
++++ b/pkg/resiliency/resiliency.go
+@@ -67,6 +67,7 @@ const (
+ 	Search                        ComponentType         = "Search"
+ 	Vector                        ComponentType         = "Vector"
+ 	Binarystore                   ComponentType         = "Binarystore"
++	Sandbox                       ComponentType         = "Sandbox"
+ 	Secretstore                   ComponentType         = "Secretstore"
+ 	Statestore                    ComponentType         = "Statestore"
+ 	Inbound                       ComponentDirection    = "Inbound"
+diff --git a/pkg/runtime/compstore/compstore.go b/pkg/runtime/compstore/compstore.go
+index 56c8c50dd..88a106156 100644
+--- a/pkg/runtime/compstore/compstore.go
++++ b/pkg/runtime/compstore/compstore.go
+@@ -35,6 +35,7 @@ import (
+ 	mcpserverV1alpha1 "github.com/dapr/dapr/pkg/apis/mcpserver/v1alpha1"
+ 	resiliencyapi "github.com/dapr/dapr/pkg/apis/resiliency/v1alpha1"
+ 	wfaclapi "github.com/dapr/dapr/pkg/apis/workflowaccesspolicy/v1alpha1"
++	"github.com/dapr/dapr/pkg/components/sandbox"
+ 	"github.com/dapr/dapr/pkg/config"
+ 	rtpubsub "github.com/dapr/dapr/pkg/runtime/pubsub"
+ )
+@@ -78,6 +79,7 @@ type ComponentStore struct {
+ 	vectors       map[string]vector.Vector
+ 
+ 	binaryStores map[string]binarystore.BinaryStore
++	sandboxes    map[string]sandbox.Sandbox
+ 
+ 	compPendingLock sync.Mutex
+ 	compPending     *compsv1alpha1.Component
+@@ -108,5 +110,6 @@ func New() *ComponentStore {
+ 		searches:      make(map[string]search.Search),
+ 		vectors:       make(map[string]vector.Vector),
+ 		binaryStores:  make(map[string]binarystore.BinaryStore),
++		sandboxes:     make(map[string]sandbox.Sandbox),
+ 	}
+ }
+diff --git a/pkg/runtime/compstore/sandbox.go b/pkg/runtime/compstore/sandbox.go
+new file mode 100644
+index 000000000..09907776e
+--- /dev/null
++++ b/pkg/runtime/compstore/sandbox.go
+@@ -0,0 +1,41 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package compstore
++
++import "github.com/dapr/dapr/pkg/components/sandbox"
++
++func (c *ComponentStore) AddSandbox(name string, s sandbox.Sandbox) {
++	c.lock.Lock()
++	defer c.lock.Unlock()
++
++	c.sandboxes[name] = s
++}
++
++func (c *ComponentStore) GetSandbox(name string) (sandbox.Sandbox, bool) {
++	c.lock.RLock()
++	defer c.lock.RUnlock()
++
++	s, ok := c.sandboxes[name]
++
++	return s, ok
++}
++
++func (c *ComponentStore) DeleteSandbox(name string) {
++	c.lock.Lock()
++	defer c.lock.Unlock()
++
++	delete(c.sandboxes, name)
++}
+diff --git a/pkg/runtime/processor/manager.go b/pkg/runtime/processor/manager.go
+index 75cd8abfd..41116c2c7 100644
+--- a/pkg/runtime/processor/manager.go
++++ b/pkg/runtime/processor/manager.go
+@@ -107,6 +107,7 @@ func (p *Processor) category(comp componentsapi.Component) components.Category {
+ 		components.CategorySearch,
+ 		components.CategoryVector,
+ 		components.CategoryBinaryStore,
++		components.CategorySandbox,
+ 	} {
+ 		if strings.HasPrefix(comp.Spec.Type, string(cat)+".") {
+ 			return cat
+diff --git a/pkg/runtime/processor/processor.go b/pkg/runtime/processor/processor.go
+index a5b1d45d8..070cadbd9 100644
+--- a/pkg/runtime/processor/processor.go
++++ b/pkg/runtime/processor/processor.go
+@@ -64,6 +64,7 @@ import (
+ 	loopstatestore "github.com/dapr/dapr/pkg/runtime/processor/loops/statestore"
+ 	"github.com/dapr/dapr/pkg/runtime/processor/middleware"
+ 	"github.com/dapr/dapr/pkg/runtime/processor/pubsub"
++	sandboxproc "github.com/dapr/dapr/pkg/runtime/processor/sandbox"
+ 	"github.com/dapr/dapr/pkg/runtime/processor/search"
+ 	"github.com/dapr/dapr/pkg/runtime/processor/secret"
+ 	"github.com/dapr/dapr/pkg/runtime/processor/state"
+@@ -71,6 +72,7 @@ import (
+ 	"github.com/dapr/dapr/pkg/runtime/processor/vector"
+ 	rtpubsub "github.com/dapr/dapr/pkg/runtime/pubsub"
+ 	"github.com/dapr/dapr/pkg/runtime/registry"
++	"github.com/dapr/dapr/pkg/runtime/sandboxhost"
+ 	"github.com/dapr/dapr/pkg/runtime/wfengine/wfregistrar"
+ 	"github.com/dapr/dapr/pkg/security"
+ )
+@@ -148,19 +150,20 @@ type Processor struct {
+ 	inProcessWorkflows     wfregistrar.Registrar
+ 
+ 	// Root loop and per-category loops.
+-	rootLoop  *root.Root
+-	stateCat  *loopstatestore.Category
+-	secCat    *loopsecret.Category
+-	bindCat   *loopbindings.Category
+-	psCat     *looppubsub.Category
+-	confCat   *category.Category
+-	cryptoCat *category.Category
+-	lockCat   *category.Category
+-	midCat    *category.Category
+-	convCat   *category.Category
+-	searchCat *category.Category
+-	vectorCat *category.Category
+-	binCat    *category.Category
++	rootLoop   *root.Root
++	stateCat   *loopstatestore.Category
++	secCat     *loopsecret.Category
++	bindCat    *loopbindings.Category
++	psCat      *looppubsub.Category
++	confCat    *category.Category
++	cryptoCat  *category.Category
++	lockCat    *category.Category
++	midCat     *category.Category
++	convCat    *category.Category
++	searchCat  *category.Category
++	vectorCat  *category.Category
++	binCat     *category.Category
++	sandboxCat *category.Category
+ 
+ 	// inlineManagers is used by Init/Close when Process is not running and by
+ 	// Close after shutdown. The loop path never reads this map.
+@@ -273,6 +276,16 @@ func New(opts Options) *Processor {
+ 		Registry: opts.Registry.BinaryStores(),
+ 		Store:    opts.ComponentStore,
+ 	})
++	sandboxProc := sandboxproc.New(sandboxproc.Options{
++		Meta:     opts.Meta,
++		Registry: opts.Registry.Sandboxes(),
++		Store:    opts.ComponentStore,
++		Host: sandboxhost.New(sandboxhost.Options{
++			Actors:    opts.Actors,
++			AppID:     opts.ID,
++			Namespace: opts.Namespace,
++		}),
++	})
+ 
+ 	reporter := DefaultReporter
+ 	if opts.Reporter != nil {
+@@ -303,6 +316,7 @@ func New(opts Options) *Processor {
+ 			components.CategorySearch:         searchProc,
+ 			components.CategoryVector:         vectorProc,
+ 			components.CategoryBinaryStore:    binStoreProc,
++			components.CategorySandbox:        sandboxProc,
+ 		},
+ 	}
+ 
+@@ -389,6 +403,13 @@ func New(opts Options) *Processor {
+ 		Reporter:  reporter,
+ 		Security:  opts.Security,
+ 	})
++	p.sandboxCat = category.New(category.Options{
++		Name:      string(components.CategorySandbox),
++		Manager:   sandboxProc,
++		CompStore: opts.ComponentStore,
++		Reporter:  reporter,
++		Security:  opts.Security,
++	})
+ 
+ 	// Root loop ----------------------------------------------------------
+ 	cats := map[components.Category]loop.Interface[loops.EventCategory]{
+@@ -404,6 +425,7 @@ func New(opts Options) *Processor {
+ 		components.CategorySearch:         p.searchCat.Loop(),
+ 		components.CategoryVector:         p.vectorCat.Loop(),
+ 		components.CategoryBinaryStore:    p.binCat.Loop(),
++		components.CategorySandbox:        p.sandboxCat.Loop(),
+ 	}
+ 	p.rootLoop = root.New(root.Options{
+ 		CompStore:      opts.ComponentStore,
+@@ -466,6 +488,7 @@ func (p *Processor) Process(ctx context.Context) error {
+ 		p.searchCat.Run,
+ 		p.vectorCat.Run,
+ 		p.binCat.Run,
++		p.sandboxCat.Run,
+ 		p.subscriber.Run,
+ 		func(ctx context.Context) error {
+ 			<-ctx.Done()
+diff --git a/pkg/runtime/processor/processor_test.go b/pkg/runtime/processor/processor_test.go
+index 6002b707f..3979f7166 100644
+--- a/pkg/runtime/processor/processor_test.go
++++ b/pkg/runtime/processor/processor_test.go
+@@ -242,6 +242,7 @@ func TestExtractComponentCategory(t *testing.T) {
+ 		{"vectors.meilisearch", ""},
+ 		{"binarystore.fake", "binarystore"},
+ 		{"binarystore", ""},
++		{"sandbox.microvm", "sandbox"},
+ 		{"this.is.invalid.category", ""},
+ 	}
+ 
+diff --git a/pkg/runtime/processor/sandbox/sandbox.go b/pkg/runtime/processor/sandbox/sandbox.go
+new file mode 100644
+index 000000000..4fd9c0b6b
+--- /dev/null
++++ b/pkg/runtime/processor/sandbox/sandbox.go
+@@ -0,0 +1,115 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"context"
++	"fmt"
++
++	compapi "github.com/dapr/dapr/pkg/apis/components/v1alpha1"
++	compsandbox "github.com/dapr/dapr/pkg/components/sandbox"
++	diag "github.com/dapr/dapr/pkg/diagnostics"
++	"github.com/dapr/dapr/pkg/runtime/compstore"
++	rterrors "github.com/dapr/dapr/pkg/runtime/errors"
++	"github.com/dapr/dapr/pkg/runtime/meta"
++)
++
++// SandboxHost is the subset of the sandbox host used by the processor.
++type SandboxHost interface {
++	Add(ctx context.Context, component string, d compsandbox.Sandbox, cfg compsandbox.Config)
++	Remove(ctx context.Context, component string) error
++}
++
++type Options struct {
++	Registry *compsandbox.Registry
++	Store    *compstore.ComponentStore
++	Meta     *meta.Meta
++	Host     SandboxHost
++}
++
++type sandboxMgr struct {
++	registry *compsandbox.Registry
++	store    *compstore.ComponentStore
++	meta     *meta.Meta
++	host     SandboxHost
++}
++
++func New(opts Options) *sandboxMgr {
++	return &sandboxMgr{
++		registry: opts.Registry,
++		store:    opts.Store,
++		meta:     opts.Meta,
++		host:     opts.Host,
++	}
++}
++
++func (s *sandboxMgr) Init(ctx context.Context, comp compapi.Component) error {
++	fName := comp.LogName()
++
++	driver, err := s.registry.Create(comp.Spec.Type, comp.Spec.Version, fName)
++	if err != nil {
++		diag.DefaultMonitoring.ComponentInitFailed(comp.Spec.Type, "creation", comp.Name)
++		return rterrors.NewInit(rterrors.CreateComponentFailure, fName, err)
++	}
++
++	if driver == nil {
++		diag.DefaultMonitoring.ComponentInitFailed(comp.Spec.Type, "creation", comp.Name)
++		return rterrors.NewInit(rterrors.CreateComponentFailure, fName,
++			fmt.Errorf("sandbox %s/%s returned a nil driver", comp.Spec.Type, comp.Spec.Version))
++	}
++
++	base, err := s.meta.ToBaseMetadata(comp)
++	if err != nil {
++		diag.DefaultMonitoring.ComponentInitFailed(comp.Spec.Type, "init", comp.Name)
++		return rterrors.NewInit(rterrors.InitComponentFailure, fName, err)
++	}
++
++	// Parse before driver Init: a failure here must not touch the driver, since
++	// pluggable drivers' Close dereferences a connection that Init dials.
++	cfg, err := compsandbox.ParseConfig(base.Properties)
++	if err != nil {
++		diag.DefaultMonitoring.ComponentInitFailed(comp.Spec.Type, "init", comp.Name)
++		return rterrors.NewInit(rterrors.InitComponentFailure, fName, err)
++	}
++
++	// On Init failure the driver is deliberately not closed (see above).
++	if err = driver.Init(ctx, base); err != nil {
++		diag.DefaultMonitoring.ComponentInitFailed(comp.Spec.Type, "init", comp.Name)
++		return rterrors.NewInit(rterrors.InitComponentFailure, fName, err)
++	}
++
++	s.store.AddSandbox(comp.Name, driver)
++	s.host.Add(ctx, comp.Name, driver, cfg)
++
++	diag.DefaultMonitoring.ComponentInitialized(comp.Spec.Type)
++
++	return nil
++}
++
++func (s *sandboxMgr) Close(comp compapi.Component) error {
++	driver, ok := s.store.GetSandbox(comp.Name)
++	if !ok {
++		return nil
++	}
++
++	defer s.store.DeleteSandbox(comp.Name)
++
++	if err := s.host.Remove(context.Background(), comp.Name); err != nil {
++		_ = driver.Close()
++		return err
++	}
++	return driver.Close()
++}
+diff --git a/pkg/runtime/processor/sandbox/sandbox_test.go b/pkg/runtime/processor/sandbox/sandbox_test.go
+new file mode 100644
+index 000000000..5605b4f5e
+--- /dev/null
++++ b/pkg/runtime/processor/sandbox/sandbox_test.go
+@@ -0,0 +1,150 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"context"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	"github.com/dapr/components-contrib/metadata"
++	commonapi "github.com/dapr/dapr/pkg/apis/common"
++	compapi "github.com/dapr/dapr/pkg/apis/components/v1alpha1"
++	compsandbox "github.com/dapr/dapr/pkg/components/sandbox"
++	"github.com/dapr/dapr/pkg/runtime/compstore"
++	"github.com/dapr/dapr/pkg/runtime/meta"
++	"github.com/dapr/kit/logger"
++)
++
++type fakeDriver struct {
++	compsandbox.Sandbox
++	initErr     error
++	initCalled  bool
++	closeCalled bool
++	md          metadata.Base
++}
++
++func (f *fakeDriver) Init(_ context.Context, md metadata.Base) error {
++	f.initCalled = true
++	f.md = md
++	return f.initErr
++}
++
++func (f *fakeDriver) Close() error {
++	f.closeCalled = true
++	return nil
++}
++
++type fakeHost struct {
++	added    []string
++	cfgs     []compsandbox.Config
++	removed  []string
++	removeEr error
++}
++
++func (h *fakeHost) Add(_ context.Context, component string, _ compsandbox.Sandbox, cfg compsandbox.Config) {
++	h.added = append(h.added, component)
++	h.cfgs = append(h.cfgs, cfg)
++}
++
++func (h *fakeHost) Remove(_ context.Context, component string) error {
++	h.removed = append(h.removed, component)
++	return h.removeEr
++}
++
++func newComp(props map[string]string) compapi.Component {
++	c := compapi.Component{
++		ObjectMeta: metav1.ObjectMeta{Name: "box"},
++		Spec:       compapi.ComponentSpec{Type: "sandbox.fake", Version: "v1"},
++	}
++	for k, v := range props {
++		c.Spec.Metadata = append(c.Spec.Metadata, commonapi.NameValuePair{
++			Name:  k,
++			Value: commonapi.DynamicValue{JSON: apiextv1.JSON{Raw: []byte(v)}},
++		})
++	}
++	return c
++}
++
++func setup(fake *fakeDriver) (*sandboxMgr, *compstore.ComponentStore, *fakeHost) {
++	reg := compsandbox.NewRegistry()
++	reg.RegisterComponent(func(logger.Logger) compsandbox.Sandbox { return fake }, "fake")
++	store := compstore.New()
++	host := &fakeHost{}
++	return New(Options{Registry: reg, Store: store, Meta: meta.New(meta.Options{}), Host: host}), store, host
++}
++
++func TestSandboxProcessor_InitClose(t *testing.T) {
++	t.Parallel()
++
++	t.Run("init adds to store and host, close removes", func(t *testing.T) {
++		t.Parallel()
++		fake := &fakeDriver{}
++		p, store, host := setup(fake)
++
++		require.NoError(t, p.Init(t.Context(), newComp(map[string]string{"image": "x"})))
++		assert.True(t, fake.initCalled)
++		got, ok := store.GetSandbox("box")
++		require.True(t, ok)
++		assert.Same(t, fake, got)
++		require.Len(t, host.added, 1)
++		assert.Equal(t, "box", host.added[0])
++		assert.Equal(t, "x", host.cfgs[0].Image)
++		assert.Equal(t, uint32(1), host.cfgs[0].CPUs)
++
++		require.NoError(t, p.Close(newComp(nil)))
++		assert.Equal(t, []string{"box"}, host.removed)
++		_, ok = store.GetSandbox("box")
++		assert.False(t, ok)
++		assert.True(t, fake.closeCalled)
++	})
++
++	t.Run("missing image errors, nothing added", func(t *testing.T) {
++		t.Parallel()
++		fake := &fakeDriver{}
++		p, store, host := setup(fake)
++
++		require.Error(t, p.Init(t.Context(), newComp(nil)))
++		assert.False(t, fake.initCalled)
++		assert.False(t, fake.closeCalled)
++		_, ok := store.GetSandbox("box")
++		assert.False(t, ok)
++		assert.Empty(t, host.added)
++	})
++
++	t.Run("driver init error, nothing added or closed", func(t *testing.T) {
++		t.Parallel()
++		fake := &fakeDriver{initErr: assert.AnError}
++		p, store, host := setup(fake)
++
++		require.Error(t, p.Init(t.Context(), newComp(map[string]string{"image": "x"})))
++		assert.False(t, fake.closeCalled)
++		_, ok := store.GetSandbox("box")
++		assert.False(t, ok)
++		assert.Empty(t, host.added)
++	})
++
++	t.Run("close of unknown component is a no-op", func(t *testing.T) {
++		t.Parallel()
++		p, _, host := setup(&fakeDriver{})
++		require.NoError(t, p.Close(newComp(nil)))
++		assert.Empty(t, host.removed)
++	})
++}
+diff --git a/pkg/runtime/registry/options.go b/pkg/runtime/registry/options.go
+index d7a8495b8..558a90552 100644
+--- a/pkg/runtime/registry/options.go
++++ b/pkg/runtime/registry/options.go
+@@ -23,6 +23,7 @@ import (
+ 	"github.com/dapr/dapr/pkg/components/middleware/http"
+ 	"github.com/dapr/dapr/pkg/components/nameresolution"
+ 	"github.com/dapr/dapr/pkg/components/pubsub"
++	"github.com/dapr/dapr/pkg/components/sandbox"
+ 	compsearch "github.com/dapr/dapr/pkg/components/search"
+ 	"github.com/dapr/dapr/pkg/components/secretstores"
+ 	"github.com/dapr/dapr/pkg/components/state"
+@@ -44,6 +45,7 @@ type Options struct {
+ 	search             *compsearch.Registry
+ 	vector             *compvector.Registry
+ 	binaryStore        *binarystore.Registry
++	sandbox            *sandbox.Registry
+ 	componentsCallback ComponentsCallback
+ 	reporter           Reporter
+ }
+@@ -63,6 +65,7 @@ func NewOptions() *Options {
+ 		search:         compsearch.DefaultRegistry,
+ 		vector:         compvector.DefaultRegistry,
+ 		binaryStore:    binarystore.DefaultRegistry,
++		sandbox:        sandbox.DefaultRegistry,
+ 	}
+ }
+ 
+@@ -144,6 +147,12 @@ func (o *Options) WithBinaryStores(registry *binarystore.Registry) *Options {
+ 	return o
+ }
+ 
++// WithSandboxes adds sandbox components to the runtime.
++func (o *Options) WithSandboxes(registry *sandbox.Registry) *Options {
++	o.sandbox = registry
++	return o
++}
++
+ // WithComponentsCallback sets the components callback for applications that embed Dapr.
+ func (o *Options) WithComponentsCallback(componentsCallback ComponentsCallback) *Options {
+ 	o.componentsCallback = componentsCallback
+diff --git a/pkg/runtime/registry/registry.go b/pkg/runtime/registry/registry.go
+index 82e8b30e7..1dec2cd61 100644
+--- a/pkg/runtime/registry/registry.go
++++ b/pkg/runtime/registry/registry.go
+@@ -26,6 +26,7 @@ import (
+ 	"github.com/dapr/dapr/pkg/components/middleware/http"
+ 	"github.com/dapr/dapr/pkg/components/nameresolution"
+ 	"github.com/dapr/dapr/pkg/components/pubsub"
++	"github.com/dapr/dapr/pkg/components/sandbox"
+ 	compsearch "github.com/dapr/dapr/pkg/components/search"
+ 	"github.com/dapr/dapr/pkg/components/secretstores"
+ 	"github.com/dapr/dapr/pkg/components/state"
+@@ -59,6 +60,7 @@ type Registry struct {
+ 	searches       *compsearch.Registry
+ 	vectors        *compvector.Registry
+ 	binaryStores   *binarystore.Registry
++	sandboxes      *sandbox.Registry
+ 	componentCb    ComponentsCallback
+ 	reporter       Reporter
+ }
+@@ -78,6 +80,7 @@ func New(opts *Options) *Registry {
+ 		searches:       opts.search,
+ 		vectors:        opts.vector,
+ 		binaryStores:   opts.binaryStore,
++		sandboxes:      opts.sandbox,
+ 		componentCb:    opts.componentsCallback,
+ 		reporter:       opts.reporter,
+ 	}
+@@ -135,6 +138,10 @@ func (r *Registry) BinaryStores() *binarystore.Registry {
+ 	return r.binaryStores
+ }
+ 
++func (r *Registry) Sandboxes() *sandbox.Registry {
++	return r.sandboxes
++}
++
+ func (r *Registry) ComponentsCallback() ComponentsCallback {
+ 	return r.componentCb
+ }
+diff --git a/pkg/runtime/sandboxhost/host.go b/pkg/runtime/sandboxhost/host.go
+new file mode 100644
+index 000000000..96938a317
+--- /dev/null
++++ b/pkg/runtime/sandboxhost/host.go
+@@ -0,0 +1,59 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package sandboxhost hosts sandbox drivers and exposes them as internal actors.
++package sandboxhost
++
++import (
++	"context"
++	"time"
++
++	"github.com/dapr/dapr/pkg/actors"
++	"github.com/dapr/dapr/pkg/components/sandbox"
++)
++
++// Options are the options for a Host.
++type Options struct {
++	Actors            actors.Interface
++	AppID, Namespace  string
++	ReadyPollInterval time.Duration
++	ReconcileInterval time.Duration
++}
++
++// Host manages sandbox drivers and registers their internal actor types.
++type Host struct {
++	opts Options
++}
++
++// New returns a new Host.
++func New(opts Options) *Host {
++	return &Host{opts: opts}
++}
++
++// Add registers a sandbox component with the host.
++func (h *Host) Add(_ context.Context, _ string, _ sandbox.Sandbox, _ sandbox.Config) {
++	// TODO(Task 6): register the internal actor type and start warm pool management.
++}
++
++// Remove unregisters a sandbox component from the host.
++func (h *Host) Remove(_ context.Context, _ string) error {
++	// TODO(Task 6): unregister the actor type and stop management.
++	return nil
++}
++
++// ActorType returns the internal actor type name for a sandbox component.
++func ActorType(namespace, appID, component string) string {
++	return "dapr.internal." + namespace + "." + appID + ".sandbox." + component
++}
+-- 
+2.47.0
+

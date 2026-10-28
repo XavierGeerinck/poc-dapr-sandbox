@@ -1,0 +1,489 @@
+From 78cd2c0c61373c95402a79af5bf98678b6dff24e Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Wed, 28 Oct 2026 20:48:03 +0100
+Subject: [PATCH 10/12] feat(sandbox): alpha HTTP API
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/api/http/endpoints/endpointgroup.go |   1 +
+ pkg/api/http/http.go                    |   1 +
+ pkg/api/http/sandbox.go                 | 146 +++++++++++++
+ pkg/api/http/sandbox_test.go            | 274 ++++++++++++++++++++++++
+ pkg/api/http/server.go                  |   3 +-
+ 5 files changed, 424 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/api/http/sandbox.go
+ create mode 100644 pkg/api/http/sandbox_test.go
+
+diff --git a/pkg/api/http/endpoints/endpointgroup.go b/pkg/api/http/endpoints/endpointgroup.go
+index cabee704a..be71eab20 100644
+--- a/pkg/api/http/endpoints/endpointgroup.go
++++ b/pkg/api/http/endpoints/endpointgroup.go
+@@ -61,6 +61,7 @@ const (
+ 	EndpointGroupSearch            EndpointGroupName = "search"
+ 	EndpointGroupVector            EndpointGroupName = "vector"
+ 	EndpointGroupBinaryStore       EndpointGroupName = "binarystore"
++	EndpointGroupSandbox           EndpointGroupName = "sandbox"
+ )
+ 
+ // EndpointGroupVersion is the version of an endpoint group.
+diff --git a/pkg/api/http/http.go b/pkg/api/http/http.go
+index 64c1d699a..515ca8103 100644
+--- a/pkg/api/http/http.go
++++ b/pkg/api/http/http.go
+@@ -167,6 +167,7 @@ func NewAPI(opts APIOpts) API {
+ 	api.endpoints = append(api.endpoints, api.constructSearchEndpoints()...)
+ 	api.endpoints = append(api.endpoints, api.constructVectorEndpoints()...)
+ 	api.endpoints = append(api.endpoints, api.constructBinaryStoreEndpoints()...)
++	api.endpoints = append(api.endpoints, api.constructSandboxEndpoints()...)
+ 
+ 	api.publicEndpoints = append(api.publicEndpoints, metadataEndpoints...)
+ 	api.publicEndpoints = append(api.publicEndpoints, healthEndpoints...)
+diff --git a/pkg/api/http/sandbox.go b/pkg/api/http/sandbox.go
+new file mode 100644
+index 000000000..78fc81de9
+--- /dev/null
++++ b/pkg/api/http/sandbox.go
+@@ -0,0 +1,146 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package http
++
++import (
++	"context"
++	"net/http"
++
++	"github.com/go-chi/chi/v5"
++	"google.golang.org/protobuf/types/known/emptypb"
++
++	"github.com/dapr/dapr/pkg/api/http/endpoints"
++	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
++)
++
++const (
++	// Path parameters carrying sandbox and session IDs. They are unescaped
++	// with url.PathUnescape (see unespaceRequestParametersInContext) so that
++	// "+" is preserved.
++	sandboxIDParam        = "sandboxId"
++	sandboxSessionIDParam = "sessionId"
++
++	sandboxComponentParam = "component"
++	daprAppIDHeader       = "dapr-app-id"
++)
++
++var endpointGroupSandboxV1Alpha1 = &endpoints.EndpointGroup{
++	Name:                 endpoints.EndpointGroupSandbox,
++	Version:              endpoints.EndpointGroupVersion1alpha1,
++	AppendSpanAttributes: nil,
++}
++
++// sandboxFns are the universal methods backing the sandbox endpoints.
++type sandboxFns struct {
++	create       func(context.Context, *runtimev1pb.SandboxCreateRequestAlpha1) (*runtimev1pb.SandboxCreateResponseAlpha1, error)
++	exec         func(context.Context, *runtimev1pb.SandboxExecRequestAlpha1) (*runtimev1pb.SandboxExecResponseAlpha1, error)
++	del          func(context.Context, *runtimev1pb.SandboxDeleteRequestAlpha1) (*emptypb.Empty, error)
++	sessionStart func(context.Context, *runtimev1pb.SandboxSessionStartRequestAlpha1) (*runtimev1pb.SandboxSessionStartResponseAlpha1, error)
++	sessionSend  func(context.Context, *runtimev1pb.SandboxSessionSendRequestAlpha1) (*runtimev1pb.SandboxExecResponseAlpha1, error)
++	sessionClose func(context.Context, *runtimev1pb.SandboxSessionCloseRequestAlpha1) (*emptypb.Empty, error)
++}
++
++func (a *api) constructSandboxEndpoints() []endpoints.Endpoint {
++	return constructSandboxEndpoints(sandboxFns{
++		create:       a.universal.SandboxCreateAlpha1,
++		exec:         a.universal.SandboxExecAlpha1,
++		del:          a.universal.SandboxDeleteAlpha1,
++		sessionStart: a.universal.SandboxSessionStartAlpha1,
++		sessionSend:  a.universal.SandboxSessionSendAlpha1,
++		sessionClose: a.universal.SandboxSessionCloseAlpha1,
++	})
++}
++
++// sandboxAppID returns the target app ID: the dapr-app-id header when set
++// (overriding the body), otherwise the body's value.
++func sandboxAppID(r *http.Request, bodyAppID string) string {
++	if h := r.Header.Get(daprAppIDHeader); h != "" {
++		return h
++	}
++	return bodyAppID
++}
++
++func constructSandboxEndpoints(fns sandboxFns) []endpoints.Endpoint {
++	ep := func(method, route, name string, h http.HandlerFunc) endpoints.Endpoint {
++		return endpoints.Endpoint{
++			Methods:  []string{method},
++			Route:    route,
++			Version:  apiVersionV1alpha1,
++			Group:    endpointGroupSandboxV1Alpha1,
++			Handler:  h,
++			Settings: endpoints.EndpointSettings{Name: name},
++		}
++	}
++
++	create := UniversalHTTPHandler(fns.create, UniversalHTTPHandlerOpts[*runtimev1pb.SandboxCreateRequestAlpha1, *runtimev1pb.SandboxCreateResponseAlpha1]{
++		InModifier: func(r *http.Request, in *runtimev1pb.SandboxCreateRequestAlpha1) (*runtimev1pb.SandboxCreateRequestAlpha1, error) {
++			in.Component = chi.URLParam(r, sandboxComponentParam)
++			in.AppId = sandboxAppID(r, in.GetAppId())
++			return in, nil
++		},
++	})
++	exec := UniversalHTTPHandler(fns.exec, UniversalHTTPHandlerOpts[*runtimev1pb.SandboxExecRequestAlpha1, *runtimev1pb.SandboxExecResponseAlpha1]{
++		InModifier: func(r *http.Request, in *runtimev1pb.SandboxExecRequestAlpha1) (*runtimev1pb.SandboxExecRequestAlpha1, error) {
++			in.Component = chi.URLParam(r, sandboxComponentParam)
++			in.SandboxId = chi.URLParam(r, sandboxIDParam)
++			in.AppId = sandboxAppID(r, in.GetAppId())
++			return in, nil
++		},
++	})
++	del := UniversalHTTPHandler(fns.del, UniversalHTTPHandlerOpts[*runtimev1pb.SandboxDeleteRequestAlpha1, *emptypb.Empty]{
++		InModifier: func(r *http.Request, in *runtimev1pb.SandboxDeleteRequestAlpha1) (*runtimev1pb.SandboxDeleteRequestAlpha1, error) {
++			in.Component = chi.URLParam(r, sandboxComponentParam)
++			in.SandboxId = chi.URLParam(r, sandboxIDParam)
++			in.AppId = sandboxAppID(r, in.GetAppId())
++			return in, nil
++		},
++	})
++	sessionStart := UniversalHTTPHandler(fns.sessionStart, UniversalHTTPHandlerOpts[*runtimev1pb.SandboxSessionStartRequestAlpha1, *runtimev1pb.SandboxSessionStartResponseAlpha1]{
++		InModifier: func(r *http.Request, in *runtimev1pb.SandboxSessionStartRequestAlpha1) (*runtimev1pb.SandboxSessionStartRequestAlpha1, error) {
++			in.Component = chi.URLParam(r, sandboxComponentParam)
++			in.SandboxId = chi.URLParam(r, sandboxIDParam)
++			in.AppId = sandboxAppID(r, in.GetAppId())
++			return in, nil
++		},
++	})
++	sessionSend := UniversalHTTPHandler(fns.sessionSend, UniversalHTTPHandlerOpts[*runtimev1pb.SandboxSessionSendRequestAlpha1, *runtimev1pb.SandboxExecResponseAlpha1]{
++		InModifier: func(r *http.Request, in *runtimev1pb.SandboxSessionSendRequestAlpha1) (*runtimev1pb.SandboxSessionSendRequestAlpha1, error) {
++			in.Component = chi.URLParam(r, sandboxComponentParam)
++			in.SandboxId = chi.URLParam(r, sandboxIDParam)
++			in.SessionId = chi.URLParam(r, sandboxSessionIDParam)
++			in.AppId = sandboxAppID(r, in.GetAppId())
++			return in, nil
++		},
++	})
++	sessionClose := UniversalHTTPHandler(fns.sessionClose, UniversalHTTPHandlerOpts[*runtimev1pb.SandboxSessionCloseRequestAlpha1, *emptypb.Empty]{
++		InModifier: func(r *http.Request, in *runtimev1pb.SandboxSessionCloseRequestAlpha1) (*runtimev1pb.SandboxSessionCloseRequestAlpha1, error) {
++			in.Component = chi.URLParam(r, sandboxComponentParam)
++			in.SandboxId = chi.URLParam(r, sandboxIDParam)
++			in.SessionId = chi.URLParam(r, sandboxSessionIDParam)
++			in.AppId = sandboxAppID(r, in.GetAppId())
++			return in, nil
++		},
++	})
++
++	return []endpoints.Endpoint{
++		ep(http.MethodPost, "sandboxes/{component}", "CreateSandbox", create),
++		ep(http.MethodPost, "sandboxes/{component}/{sandboxId}/exec", "ExecSandbox", exec),
++		ep(http.MethodDelete, "sandboxes/{component}/{sandboxId}", "DeleteSandbox", del),
++		ep(http.MethodPost, "sandboxes/{component}/{sandboxId}/sessions", "StartSandboxSession", sessionStart),
++		ep(http.MethodPost, "sandboxes/{component}/{sandboxId}/sessions/{sessionId}", "SendSandboxSession", sessionSend),
++		ep(http.MethodDelete, "sandboxes/{component}/{sandboxId}/sessions/{sessionId}", "CloseSandboxSession", sessionClose),
++	}
++}
+diff --git a/pkg/api/http/sandbox_test.go b/pkg/api/http/sandbox_test.go
+new file mode 100644
+index 000000000..b0224ffd3
+--- /dev/null
++++ b/pkg/api/http/sandbox_test.go
+@@ -0,0 +1,274 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package http
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/protobuf/types/known/emptypb"
++
++	"github.com/dapr/dapr/pkg/api/http/endpoints"
++	"github.com/dapr/dapr/pkg/messages"
++	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
++)
++
++type sandboxRec struct {
++	mu          sync.Mutex
++	exec        *runtimev1pb.SandboxExecRequestAlpha1
++	create      *runtimev1pb.SandboxCreateRequestAlpha1
++	del         *runtimev1pb.SandboxDeleteRequestAlpha1
++	start       *runtimev1pb.SandboxSessionStartRequestAlpha1
++	send        *runtimev1pb.SandboxSessionSendRequestAlpha1
++	closeReq    *runtimev1pb.SandboxSessionCloseRequestAlpha1
++	err         error
++	directCalls int
++}
++
++func (rec *sandboxRec) fns() sandboxFns {
++	return sandboxFns{
++		create: func(_ context.Context, in *runtimev1pb.SandboxCreateRequestAlpha1) (*runtimev1pb.SandboxCreateResponseAlpha1, error) {
++			rec.mu.Lock()
++			defer rec.mu.Unlock()
++			rec.create = in
++			if rec.err != nil {
++				return nil, rec.err
++			}
++			return &runtimev1pb.SandboxCreateResponseAlpha1{SandboxId: "sb-1", Activation: "cold", Timing: &runtimev1pb.SandboxTimingAlpha1{TotalUs: 5}}, nil
++		},
++		exec: func(_ context.Context, in *runtimev1pb.SandboxExecRequestAlpha1) (*runtimev1pb.SandboxExecResponseAlpha1, error) {
++			rec.mu.Lock()
++			defer rec.mu.Unlock()
++			rec.exec = in
++			if rec.err != nil {
++				return nil, rec.err
++			}
++			return &runtimev1pb.SandboxExecResponseAlpha1{
++				SandboxId: in.GetSandboxId(), Activation: "warm", Stdout: []byte("hi\n"),
++				Timing: &runtimev1pb.SandboxTimingAlpha1{TotalUs: 10},
++			}, nil
++		},
++		del: func(_ context.Context, in *runtimev1pb.SandboxDeleteRequestAlpha1) (*emptypb.Empty, error) {
++			rec.mu.Lock()
++			defer rec.mu.Unlock()
++			rec.del = in
++			return &emptypb.Empty{}, nil
++		},
++		sessionStart: func(_ context.Context, in *runtimev1pb.SandboxSessionStartRequestAlpha1) (*runtimev1pb.SandboxSessionStartResponseAlpha1, error) {
++			rec.mu.Lock()
++			defer rec.mu.Unlock()
++			rec.start = in
++			return &runtimev1pb.SandboxSessionStartResponseAlpha1{SessionId: "s-1"}, nil
++		},
++		sessionSend: func(_ context.Context, in *runtimev1pb.SandboxSessionSendRequestAlpha1) (*runtimev1pb.SandboxExecResponseAlpha1, error) {
++			rec.mu.Lock()
++			defer rec.mu.Unlock()
++			rec.send = in
++			return &runtimev1pb.SandboxExecResponseAlpha1{Stdout: []byte("out")}, nil
++		},
++		sessionClose: func(_ context.Context, in *runtimev1pb.SandboxSessionCloseRequestAlpha1) (*emptypb.Empty, error) {
++			rec.mu.Lock()
++			defer rec.mu.Unlock()
++			rec.closeReq = in
++			return &emptypb.Empty{}, nil
++		},
++	}
++}
++
++// newSandboxTestServer routes through the real server's setupRoutes (so the
++// path-parameter unescaping middleware applies) with CleanPathMiddleware, and
++// a fallback handler standing in for direct invocation.
++func newSandboxTestServer(t *testing.T, rec *sandboxRec) *httptest.Server {
++	t.Helper()
++	srv := newServer()
++	r := srv.getRouter()
++	eps := append(constructSandboxEndpoints(rec.fns()), endpoints.Endpoint{
++		Route:   "{path:*}",
++		Version: "v1.0",
++		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			rec.mu.Lock()
++			rec.directCalls++
++			rec.mu.Unlock()
++			w.WriteHeader(http.StatusTeapot)
++		}),
++		Settings: endpoints.EndpointSettings{IsFallback: true},
++	})
++	srv.setupRoutes(r, eps)
++	s := httptest.NewServer(r)
++	t.Cleanup(s.Close)
++	return s
++}
++
++func sandboxDo(t *testing.T, s *httptest.Server, method, path, body string, hdr map[string]string) (int, string) {
++	t.Helper()
++	var rd io.Reader
++	if body != "" {
++		rd = strings.NewReader(body)
++	}
++	req, err := http.NewRequest(method, s.URL+path, rd)
++	require.NoError(t, err)
++	for k, v := range hdr {
++		req.Header.Set(k, v)
++	}
++	resp, err := s.Client().Do(req)
++	require.NoError(t, err)
++	defer resp.Body.Close()
++	b, err := io.ReadAll(resp.Body)
++	require.NoError(t, err)
++	return resp.StatusCode, string(b)
++}
++
++func TestSandboxHTTP_ExecJSON(t *testing.T) {
++	rec := &sandboxRec{}
++	s := newSandboxTestServer(t, rec)
++
++	code, body := sandboxDo(t, s, http.MethodPost, "/v1.0-alpha1/sandboxes/pool/sb-1/exec",
++		`{"command":"echo","args":["hi"],"component":"evil","sandboxId":"evil"}`, nil)
++	require.Equal(t, http.StatusOK, code, body)
++	assert.Contains(t, body, `"activation":"warm"`)
++	assert.Contains(t, body, `"timing"`)
++	assert.Contains(t, body, `"stdout":"aGkK"`)
++
++	rec.mu.Lock()
++	defer rec.mu.Unlock()
++	assert.Equal(t, "echo", rec.exec.GetCommand())
++	assert.Equal(t, []string{"hi"}, rec.exec.GetArgs())
++	// Path params win over body.
++	assert.Equal(t, "pool", rec.exec.GetComponent())
++	assert.Equal(t, "sb-1", rec.exec.GetSandboxId())
++}
++
++func TestSandboxHTTP_EmptyBodies(t *testing.T) {
++	rec := &sandboxRec{}
++	s := newSandboxTestServer(t, rec)
++
++	code, body := sandboxDo(t, s, http.MethodPost, "/v1.0-alpha1/sandboxes/pool", "", nil)
++	require.Equal(t, http.StatusOK, code, body)
++	assert.Contains(t, body, `"sandboxId":"sb-1"`)
++
++	code, body = sandboxDo(t, s, http.MethodDelete, "/v1.0-alpha1/sandboxes/pool/sb-1", "", nil)
++	require.Equal(t, http.StatusOK, code, body)
++	code, body = sandboxDo(t, s, http.MethodDelete, "/v1.0-alpha1/sandboxes/pool/sb-1/sessions/s-1", "", nil)
++	require.Equal(t, http.StatusOK, code, body)
++
++	rec.mu.Lock()
++	defer rec.mu.Unlock()
++	assert.Equal(t, "pool", rec.create.GetComponent())
++	assert.Equal(t, "sb-1", rec.del.GetSandboxId())
++	assert.Equal(t, "pool", rec.del.GetComponent())
++	assert.Equal(t, "s-1", rec.closeReq.GetSessionId())
++}
++
++func TestSandboxHTTP_Sessions(t *testing.T) {
++	rec := &sandboxRec{}
++	s := newSandboxTestServer(t, rec)
++
++	code, body := sandboxDo(t, s, http.MethodPost, "/v1.0-alpha1/sandboxes/pool/sb-1/sessions", `{"command":"cat"}`, nil)
++	require.Equal(t, http.StatusOK, code, body)
++	assert.Contains(t, body, `"sessionId":"s-1"`)
++
++	// "hello" in base64.
++	code, body = sandboxDo(t, s, http.MethodPost, "/v1.0-alpha1/sandboxes/pool/sb-1/sessions/s-1",
++		`{"input":"aGVsbG8=","sessionId":"evil"}`, nil)
++	require.Equal(t, http.StatusOK, code, body)
++
++	rec.mu.Lock()
++	defer rec.mu.Unlock()
++	assert.Equal(t, "cat", rec.start.GetCommand())
++	assert.Equal(t, "sb-1", rec.start.GetSandboxId())
++	assert.Equal(t, []byte("hello"), rec.send.GetInput())
++	assert.Equal(t, "s-1", rec.send.GetSessionId())
++}
++
++func TestSandboxHTTP_AppIDHeader(t *testing.T) {
++	rec := &sandboxRec{}
++	s := newSandboxTestServer(t, rec)
++
++	code, body := sandboxDo(t, s, http.MethodPost, "/v1.0-alpha1/sandboxes/pool/sb-1/exec",
++		`{"command":"echo","appId":"fromBody"}`, map[string]string{"dapr-app-id": "pool"})
++	require.Equal(t, http.StatusOK, code, body)
++
++	rec.mu.Lock()
++	assert.Equal(t, "pool", rec.exec.GetAppId())
++	assert.Equal(t, 0, rec.directCalls, "request must not reach direct invoke")
++	rec.exec = nil
++	rec.mu.Unlock()
++
++	// Without the header, the body's appId is kept.
++	code, body = sandboxDo(t, s, http.MethodPost, "/v1.0-alpha1/sandboxes/pool/sb-1/exec",
++		`{"command":"echo","appId":"fromBody"}`, nil)
++	require.Equal(t, http.StatusOK, code, body)
++	rec.mu.Lock()
++	defer rec.mu.Unlock()
++	assert.Equal(t, "fromBody", rec.exec.GetAppId())
++}
++
++func TestSandboxHTTP_UnsafeID(t *testing.T) {
++	long := strings.Repeat("x", 300)
++	tests := map[string]struct {
++		escaped string
++		want    string
++	}{
++		"colon slash utf8": {"a:b%2Fc%E2%9C%93", "a:b/c✓"},
++		"plus":             {"a+b", "a+b"},
++		"long":             {long, long},
++	}
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			rec := &sandboxRec{}
++			s := newSandboxTestServer(t, rec)
++
++			code, body := sandboxDo(t, s, http.MethodPost, "/v1.0-alpha1/sandboxes/pool/"+tc.escaped+"/exec", `{"command":"echo"}`, nil)
++			require.Equal(t, http.StatusOK, code, body)
++			code, body = sandboxDo(t, s, http.MethodPost, "/v1.0-alpha1/sandboxes/pool/"+tc.escaped+"/sessions/"+tc.escaped, `{}`, nil)
++			require.Equal(t, http.StatusOK, code, body)
++
++			rec.mu.Lock()
++			defer rec.mu.Unlock()
++			assert.Equal(t, tc.want, rec.exec.GetSandboxId())
++			assert.Equal(t, tc.want, rec.send.GetSandboxId())
++			assert.Equal(t, tc.want, rec.send.GetSessionId())
++			assert.Equal(t, 0, rec.directCalls)
++		})
++	}
++}
++
++func TestSandboxHTTP_ErrorStatuses(t *testing.T) {
++	tests := map[string]struct {
++		err  error
++		want int
++	}{
++		"full":    {messages.ErrSandboxHostFull, http.StatusTooManyRequests},
++		"lost":    {messages.ErrSandboxLost, http.StatusGone},
++		"invalid": {messages.ErrSandboxInvalidRequest, http.StatusBadRequest},
++		"exec":    {messages.ErrSandboxExec, http.StatusInternalServerError},
++	}
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			rec := &sandboxRec{err: tc.err}
++			s := newSandboxTestServer(t, rec)
++			code, body := sandboxDo(t, s, http.MethodPost, "/v1.0-alpha1/sandboxes/pool/sb-1/exec", `{"command":"echo"}`, nil)
++			assert.Equal(t, tc.want, code, body)
++		})
++	}
++}
+diff --git a/pkg/api/http/server.go b/pkg/api/http/server.go
+index 984c3d04f..1372e687d 100644
+--- a/pkg/api/http/server.go
++++ b/pkg/api/http/server.go
+@@ -441,7 +441,8 @@ func (s *server) unescapeRequestParametersHandler(next http.Handler) http.Handle
+ func (s *server) unespaceRequestParametersInContext(chiCtx *chi.Context) (err error) {
+ 	for i, key := range chiCtx.URLParams.Keys {
+ 		unescape := url.QueryUnescape
+-		if key == binaryStoreFileNameParam {
++		// These parameters carry arbitrary IDs, so "+" must stay a plus sign.
++		if key == binaryStoreFileNameParam || key == sandboxIDParam || key == sandboxSessionIDParam {
+ 			unescape = url.PathUnescape
+ 		}
+ 
+-- 
+2.47.0
+

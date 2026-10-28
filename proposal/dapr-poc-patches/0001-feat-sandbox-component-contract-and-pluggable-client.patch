@@ -1,0 +1,3124 @@
+From 683d442668cbad86908ae7689ed367a0026b513e Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Wed, 28 Oct 2026 19:45:39 +0100
+Subject: [PATCH 01/12] feat(sandbox): component contract and pluggable client
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dapr/proto/components/v1/sandbox.proto        |   59 +
+ pkg/components/sandbox/config.go              |   90 +
+ pkg/components/sandbox/config_test.go         |   84 +
+ pkg/components/sandbox/pluggable.go           |   89 +
+ pkg/components/sandbox/pluggable_test.go      |   94 +
+ pkg/components/sandbox/registry.go            |   89 +
+ pkg/components/sandbox/sandbox.go             |   36 +
+ .../v1/componentsconnect/sandbox.connect.go   |  406 +++++
+ pkg/proto/components/v1/sandbox.pb.go         | 1590 +++++++++++++++++
+ pkg/proto/components/v1/sandbox_grpc.pb.go    |  495 +++++
+ 10 files changed, 3032 insertions(+)
+ create mode 100644 dapr/proto/components/v1/sandbox.proto
+ create mode 100644 pkg/components/sandbox/config.go
+ create mode 100644 pkg/components/sandbox/config_test.go
+ create mode 100644 pkg/components/sandbox/pluggable.go
+ create mode 100644 pkg/components/sandbox/pluggable_test.go
+ create mode 100644 pkg/components/sandbox/registry.go
+ create mode 100644 pkg/components/sandbox/sandbox.go
+ create mode 100644 pkg/proto/components/v1/componentsconnect/sandbox.connect.go
+ create mode 100644 pkg/proto/components/v1/sandbox.pb.go
+ create mode 100644 pkg/proto/components/v1/sandbox_grpc.pb.go
+
+diff --git a/dapr/proto/components/v1/sandbox.proto b/dapr/proto/components/v1/sandbox.proto
+new file mode 100644
+index 000000000..ba4659d0e
+--- /dev/null
++++ b/dapr/proto/components/v1/sandbox.proto
+@@ -0,0 +1,59 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++
++syntax = "proto3";
++
++package dapr.proto.components.v1;
++
++import "dapr/proto/components/v1/common.proto";
++
++option go_package = "github.com/dapr/dapr/pkg/proto/components/v1;components";
++
++// Interface for sandbox drivers.
++service Sandbox {
++  rpc Init(SandboxInitRequest) returns (SandboxInitResponse) {}
++  rpc Features(FeaturesRequest) returns (FeaturesResponse) {}
++  rpc Ping(PingRequest) returns (PingResponse) {}
++  rpc Ready(SandboxReadyRequest) returns (SandboxReadyResponse) {}
++  // RESOURCE_EXHAUSTED when full.
++  rpc Acquire(SandboxAcquireRequest) returns (SandboxAcquireResponse) {}
++  // NOT_FOUND if instance unknown.
++  rpc Exec(SandboxExecRequest) returns (SandboxExecResponse) {}
++  rpc SessionStart(SandboxSessionStartRequest) returns (SandboxSessionStartResponse) {}
++  rpc SessionSend(SandboxSessionSendRequest) returns (SandboxExecResponse) {}
++  rpc SessionClose(SandboxSessionCloseRequest) returns (SandboxSessionCloseResponse) {}
++  // Returns immediately.
++  rpc Release(SandboxReleaseRequest) returns (SandboxReleaseResponse) {}
++  rpc Reconcile(SandboxReconcileRequest) returns (SandboxReconcileResponse) {}
++}
++
++message SandboxInitRequest { MetadataRequest metadata = 1; }
++message SandboxInitResponse {}
++message SandboxReadyRequest {}
++message SandboxReadyResponse { bool ready = 1; string reason = 2; }
++enum SandboxAcquirePath { SANDBOX_ACQUIRE_PATH_UNSPECIFIED = 0; POOL = 1; RESTORE = 2; BOOT = 3; }
++message SandboxAcquireRequest { string sandbox_id = 1; string activation_id = 2; }
++message SandboxAcquireResponse { string instance_id = 1; SandboxAcquirePath path = 2; uint64 elapsed_us = 3; }
++message SandboxExecSpec { string command = 1; repeated string args = 2; map<string,string> env = 3; string cwd = 4; bytes stdin = 5; uint32 timeout_ms = 6; }
++message SandboxExecRequest { string instance_id = 1; SandboxExecSpec spec = 2; }
++message SandboxExecResponse { bytes stdout = 1; bytes stderr = 2; int32 exit_code = 3; bool truncated = 4; bool timed_out = 5; uint64 elapsed_us = 6; }
++message SandboxSessionStartRequest { string instance_id = 1; SandboxExecSpec spec = 2; }
++message SandboxSessionStartResponse { string session_id = 1; }
++message SandboxSessionSendRequest { string instance_id = 1; string session_id = 2; bytes input = 3; bytes until = 4; uint32 timeout_ms = 5; }
++message SandboxSessionCloseRequest { string instance_id = 1; string session_id = 2; }
++message SandboxSessionCloseResponse {}
++message SandboxReleaseRequest { string instance_id = 1; }
++message SandboxReleaseResponse {}
++message SandboxReconcileRequest { repeated string live_instance_ids = 1; }
++message SandboxReconcileResponse { uint32 released = 1; }
+diff --git a/pkg/components/sandbox/config.go b/pkg/components/sandbox/config.go
+new file mode 100644
+index 000000000..71125cb6a
+--- /dev/null
++++ b/pkg/components/sandbox/config.go
+@@ -0,0 +1,90 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"errors"
++	"fmt"
++	"strconv"
++	"time"
++)
++
++// Config is the parsed component metadata of a sandbox component.
++type Config struct {
++	Image               string
++	CPUs                uint32
++	MemoryMiB           uint32
++	Setup               string
++	WarmPoolSize        uint32
++	MaxSandboxesPerHost uint32
++	RefillConcurrency   uint32
++	IdleTimeout         time.Duration
++	Template            string
++}
++
++// ParseConfig parses component metadata properties, applying defaults.
++func ParseConfig(props map[string]string) (Config, error) {
++	c := Config{
++		Image:               props["image"],
++		CPUs:                1,
++		MemoryMiB:           512,
++		Setup:               props["setup"],
++		WarmPoolSize:        4,
++		MaxSandboxesPerHost: 32,
++		RefillConcurrency:   2,
++		IdleTimeout:         5 * time.Minute,
++		Template:            "snapshot",
++	}
++	if c.Image == "" {
++		return Config{}, errors.New("sandbox: metadata 'image' is required")
++	}
++
++	for _, f := range []struct {
++		name string
++		dst  *uint32
++	}{
++		{"cpus", &c.CPUs},
++		{"memoryMiB", &c.MemoryMiB},
++		{"warmPoolSize", &c.WarmPoolSize},
++		{"maxSandboxesPerHost", &c.MaxSandboxesPerHost},
++		{"refillConcurrency", &c.RefillConcurrency},
++	} {
++		v, ok := props[f.name]
++		if !ok || v == "" {
++			continue
++		}
++		n, err := strconv.ParseUint(v, 10, 32)
++		if err != nil {
++			return Config{}, fmt.Errorf("sandbox: invalid metadata '%s' %q: %w", f.name, v, err)
++		}
++		*f.dst = uint32(n)
++	}
++
++	if v := props["idleTimeout"]; v != "" {
++		d, err := time.ParseDuration(v)
++		if err != nil {
++			return Config{}, fmt.Errorf("sandbox: invalid metadata 'idleTimeout' %q: %w", v, err)
++		}
++		c.IdleTimeout = d
++	}
++
++	if v := props["template"]; v != "" {
++		if v != "snapshot" && v != "none" {
++			return Config{}, fmt.Errorf("sandbox: invalid metadata 'template' %q: must be 'snapshot' or 'none'", v)
++		}
++		c.Template = v
++	}
++
++	return c, nil
++}
+diff --git a/pkg/components/sandbox/config_test.go b/pkg/components/sandbox/config_test.go
+new file mode 100644
+index 000000000..1e5acbf2a
+--- /dev/null
++++ b/pkg/components/sandbox/config_test.go
+@@ -0,0 +1,84 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestParseConfig(t *testing.T) {
++	t.Run("defaults", func(t *testing.T) {
++		c, err := ParseConfig(map[string]string{"image": "x"})
++		require.NoError(t, err)
++		assert.Equal(t, Config{
++			Image:               "x",
++			CPUs:                1,
++			MemoryMiB:           512,
++			WarmPoolSize:        4,
++			MaxSandboxesPerHost: 32,
++			RefillConcurrency:   2,
++			IdleTimeout:         5 * time.Minute,
++			Template:            "snapshot",
++		}, c)
++	})
++
++	t.Run("missing image", func(t *testing.T) {
++		_, err := ParseConfig(map[string]string{})
++		require.Error(t, err)
++	})
++
++	t.Run("idleTimeout", func(t *testing.T) {
++		c, err := ParseConfig(map[string]string{"image": "x", "idleTimeout": "90s"})
++		require.NoError(t, err)
++		assert.Equal(t, 90*time.Second, c.IdleTimeout)
++
++		_, err = ParseConfig(map[string]string{"image": "x", "idleTimeout": "soon"})
++		require.Error(t, err)
++	})
++
++	t.Run("template", func(t *testing.T) {
++		c, err := ParseConfig(map[string]string{"image": "x", "template": "none"})
++		require.NoError(t, err)
++		assert.Equal(t, "none", c.Template)
++
++		_, err = ParseConfig(map[string]string{"image": "x", "template": "bogus"})
++		require.Error(t, err)
++	})
++
++	t.Run("numeric fields", func(t *testing.T) {
++		c, err := ParseConfig(map[string]string{
++			"image": "x", "cpus": "2", "memoryMiB": "1024", "setup": "echo hi",
++			"warmPoolSize": "0", "maxSandboxesPerHost": "8", "refillConcurrency": "3",
++		})
++		require.NoError(t, err)
++		assert.Equal(t, uint32(2), c.CPUs)
++		assert.Equal(t, uint32(1024), c.MemoryMiB)
++		assert.Equal(t, "echo hi", c.Setup)
++		assert.Equal(t, uint32(0), c.WarmPoolSize)
++		assert.Equal(t, uint32(8), c.MaxSandboxesPerHost)
++		assert.Equal(t, uint32(3), c.RefillConcurrency)
++
++		for _, k := range []string{"cpus", "memoryMiB", "warmPoolSize", "maxSandboxesPerHost", "refillConcurrency"} {
++			for _, v := range []string{"-1", "abc"} {
++				_, err := ParseConfig(map[string]string{"image": "x", k: v})
++				require.Error(t, err, "%s=%s", k, v)
++				assert.Contains(t, err.Error(), k)
++			}
++		}
++	})
++}
+diff --git a/pkg/components/sandbox/pluggable.go b/pkg/components/sandbox/pluggable.go
+new file mode 100644
+index 000000000..482a5b9f0
+--- /dev/null
++++ b/pkg/components/sandbox/pluggable.go
+@@ -0,0 +1,89 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"context"
++
++	"github.com/dapr/components-contrib/metadata"
++	"github.com/dapr/dapr/pkg/components/pluggable"
++	proto "github.com/dapr/dapr/pkg/proto/components/v1"
++	"github.com/dapr/kit/logger"
++)
++
++// grpcSandbox is a Sandbox implementation over a gRPC pluggable component.
++type grpcSandbox struct {
++	*pluggable.GRPCConnector[proto.SandboxClient]
++}
++
++// Init dials the component and passes the metadata to it.
++func (g *grpcSandbox) Init(ctx context.Context, md metadata.Base) error {
++	if err := g.Dial(md.Name); err != nil {
++		return err
++	}
++	_, err := g.Client.Init(g.Context, &proto.SandboxInitRequest{
++		Metadata: &proto.MetadataRequest{Properties: md.Properties},
++	})
++	return err
++}
++
++func (g *grpcSandbox) Ready(ctx context.Context, req *proto.SandboxReadyRequest) (*proto.SandboxReadyResponse, error) {
++	return g.Client.Ready(ctx, req)
++}
++
++func (g *grpcSandbox) Acquire(ctx context.Context, req *proto.SandboxAcquireRequest) (*proto.SandboxAcquireResponse, error) {
++	return g.Client.Acquire(ctx, req)
++}
++
++func (g *grpcSandbox) Exec(ctx context.Context, req *proto.SandboxExecRequest) (*proto.SandboxExecResponse, error) {
++	return g.Client.Exec(ctx, req)
++}
++
++func (g *grpcSandbox) SessionStart(ctx context.Context, req *proto.SandboxSessionStartRequest) (*proto.SandboxSessionStartResponse, error) {
++	return g.Client.SessionStart(ctx, req)
++}
++
++func (g *grpcSandbox) SessionSend(ctx context.Context, req *proto.SandboxSessionSendRequest) (*proto.SandboxExecResponse, error) {
++	return g.Client.SessionSend(ctx, req)
++}
++
++func (g *grpcSandbox) SessionClose(ctx context.Context, req *proto.SandboxSessionCloseRequest) (*proto.SandboxSessionCloseResponse, error) {
++	return g.Client.SessionClose(ctx, req)
++}
++
++func (g *grpcSandbox) Release(ctx context.Context, req *proto.SandboxReleaseRequest) (*proto.SandboxReleaseResponse, error) {
++	return g.Client.Release(ctx, req)
++}
++
++func (g *grpcSandbox) Reconcile(ctx context.Context, req *proto.SandboxReconcileRequest) (*proto.SandboxReconcileResponse, error) {
++	return g.Client.Reconcile(ctx, req)
++}
++
++// NewGRPCSandbox creates a new gRPC sandbox using the given socket.
++func NewGRPCSandbox(l logger.Logger, socket string) Sandbox {
++	return &grpcSandbox{GRPCConnector: pluggable.NewGRPCConnector(socket, proto.NewSandboxClient)}
++}
++
++func newGRPCSandbox(dialer pluggable.GRPCConnectionDialer) func(l logger.Logger) Sandbox {
++	return func(l logger.Logger) Sandbox {
++		return &grpcSandbox{GRPCConnector: pluggable.NewGRPCConnectorWithDialer(dialer, proto.NewSandboxClient)}
++	}
++}
++
++func init() {
++	//nolint:nosnakecase
++	pluggable.AddServiceDiscoveryCallback(proto.Sandbox_ServiceDesc.ServiceName, func(name string, dialer pluggable.GRPCConnectionDialer) {
++		DefaultRegistry.RegisterComponent(newGRPCSandbox(dialer), name)
++	})
++}
+diff --git a/pkg/components/sandbox/pluggable_test.go b/pkg/components/sandbox/pluggable_test.go
+new file mode 100644
+index 000000000..1cdfcb6cc
+--- /dev/null
++++ b/pkg/components/sandbox/pluggable_test.go
+@@ -0,0 +1,94 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"context"
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/metadata"
++	"google.golang.org/grpc/status"
++
++	cmetadata "github.com/dapr/components-contrib/metadata"
++	proto "github.com/dapr/dapr/pkg/proto/components/v1"
++	"github.com/dapr/kit/logger"
++)
++
++type fakeServer struct {
++	proto.UnimplementedSandboxServer
++	initProps   map[string]string
++	instanceHdr []string
++	acquireErr  error
++}
++
++func (f *fakeServer) Init(ctx context.Context, req *proto.SandboxInitRequest) (*proto.SandboxInitResponse, error) {
++	f.initProps = req.GetMetadata().GetProperties()
++	md, _ := metadata.FromIncomingContext(ctx)
++	f.instanceHdr = md.Get("x-component-instance")
++	return &proto.SandboxInitResponse{}, nil
++}
++
++func (f *fakeServer) Acquire(context.Context, *proto.SandboxAcquireRequest) (*proto.SandboxAcquireResponse, error) {
++	if f.acquireErr != nil {
++		return nil, f.acquireErr
++	}
++	return &proto.SandboxAcquireResponse{InstanceId: "inst-1", Path: proto.SandboxAcquirePath_POOL}, nil
++}
++
++func startFake(t *testing.T, f *fakeServer) string {
++	t.Helper()
++	// Unix socket paths are limited to ~104 bytes on macOS.
++	dir, err := os.MkdirTemp("/tmp", "sbx")
++	require.NoError(t, err)
++	t.Cleanup(func() { os.RemoveAll(dir) })
++	sock := filepath.Join(dir, "s.sock")
++	lis, err := net.Listen("unix", sock)
++	require.NoError(t, err)
++	srv := grpc.NewServer()
++	proto.RegisterSandboxServer(srv, f)
++	go srv.Serve(lis)
++	t.Cleanup(srv.Stop)
++	return sock
++}
++
++func TestGRPCSandbox_RoundTrip(t *testing.T) {
++	f := &fakeServer{}
++	sock := startFake(t, f)
++
++	sb := NewGRPCSandbox(logger.NewLogger("test"), sock)
++	t.Cleanup(func() { sb.Close() })
++
++	require.NoError(t, sb.Init(t.Context(), cmetadata.Base{
++		Name:       "mysb",
++		Properties: map[string]string{"image": "x"},
++	}))
++	assert.Equal(t, map[string]string{"image": "x"}, f.initProps)
++	assert.Equal(t, []string{"mysb"}, f.instanceHdr)
++
++	resp, err := sb.Acquire(t.Context(), &proto.SandboxAcquireRequest{SandboxId: "a"})
++	require.NoError(t, err)
++	assert.Equal(t, "inst-1", resp.GetInstanceId())
++
++	f.acquireErr = status.Error(codes.ResourceExhausted, "full")
++	_, err = sb.Acquire(t.Context(), &proto.SandboxAcquireRequest{SandboxId: "b"})
++	require.Error(t, err)
++	assert.Equal(t, codes.ResourceExhausted, status.Code(err))
++}
+diff --git a/pkg/components/sandbox/registry.go b/pkg/components/sandbox/registry.go
+new file mode 100644
+index 000000000..2cc771b5f
+--- /dev/null
++++ b/pkg/components/sandbox/registry.go
+@@ -0,0 +1,89 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"fmt"
++	"strings"
++
++	"github.com/dapr/dapr/pkg/components"
++	"github.com/dapr/kit/logger"
++)
++
++// Registry is an interface for a component that returns registered sandbox implementations.
++type Registry struct {
++	Logger    logger.Logger
++	sandboxes map[string]func(logger.Logger) Sandbox
++}
++
++// DefaultRegistry is the singleton with the registry.
++var DefaultRegistry *Registry = NewRegistry()
++
++// NewRegistry is used to create sandbox registry.
++func NewRegistry() *Registry {
++	return &Registry{
++		Logger:    logger.NewLogger("dapr.sandbox.registry"),
++		sandboxes: make(map[string]func(logger.Logger) Sandbox),
++	}
++}
++
++// RegisterComponent adds a new sandbox to the registry.
++func (s *Registry) RegisterComponent(componentFactory func(logger.Logger) Sandbox, names ...string) {
++	for _, name := range names {
++		s.sandboxes[createFullName(name)] = componentFactory
++	}
++}
++
++func (s *Registry) Create(name, version, logName string) (Sandbox, error) {
++	if method, ok := s.getSandbox(name, version, logName); ok {
++		return method(), nil
++	}
++	return nil, fmt.Errorf("couldn't find sandbox %s/%s", name, version)
++}
++
++func (s *Registry) getSandbox(name, version, logName string) (func() Sandbox, bool) {
++	name = strings.ToLower(name)
++	version = strings.ToLower(version)
++	storeFn, ok := s.sandboxes[name+"/"+version]
++
++	if ok {
++		return s.wrapFn(storeFn, logName), true
++	}
++	if components.IsInitialVersion(version) {
++		storeFn, ok = s.sandboxes[name]
++		if ok {
++			return s.wrapFn(storeFn, logName), true
++		}
++	}
++
++	return nil, false
++}
++
++func (s *Registry) wrapFn(componentFactory func(logger.Logger) Sandbox, logName string) func() Sandbox {
++	return func() Sandbox {
++		l := s.Logger
++		if logName != "" && l != nil {
++			l = l.WithFields(map[string]any{
++				"component": logName,
++			})
++		}
++		return componentFactory(l)
++	}
++}
++
++func createFullName(name string) string {
++	return strings.ToLower("sandbox." + name)
++}
+diff --git a/pkg/components/sandbox/sandbox.go b/pkg/components/sandbox/sandbox.go
+new file mode 100644
+index 000000000..10d5da378
+--- /dev/null
++++ b/pkg/components/sandbox/sandbox.go
+@@ -0,0 +1,36 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"context"
++
++	"github.com/dapr/components-contrib/metadata"
++	proto "github.com/dapr/dapr/pkg/proto/components/v1"
++)
++
++// Sandbox is the driver interface daprd uses to manage isolated sandboxes.
++type Sandbox interface {
++	Init(ctx context.Context, md metadata.Base) error
++	Close() error
++
++	Ready(ctx context.Context, req *proto.SandboxReadyRequest) (*proto.SandboxReadyResponse, error)
++	Acquire(ctx context.Context, req *proto.SandboxAcquireRequest) (*proto.SandboxAcquireResponse, error)
++	Exec(ctx context.Context, req *proto.SandboxExecRequest) (*proto.SandboxExecResponse, error)
++	SessionStart(ctx context.Context, req *proto.SandboxSessionStartRequest) (*proto.SandboxSessionStartResponse, error)
++	SessionSend(ctx context.Context, req *proto.SandboxSessionSendRequest) (*proto.SandboxExecResponse, error)
++	SessionClose(ctx context.Context, req *proto.SandboxSessionCloseRequest) (*proto.SandboxSessionCloseResponse, error)
++	Release(ctx context.Context, req *proto.SandboxReleaseRequest) (*proto.SandboxReleaseResponse, error)
++	Reconcile(ctx context.Context, req *proto.SandboxReconcileRequest) (*proto.SandboxReconcileResponse, error)
++}
+diff --git a/pkg/proto/components/v1/componentsconnect/sandbox.connect.go b/pkg/proto/components/v1/componentsconnect/sandbox.connect.go
+new file mode 100644
+index 000000000..6d4b42b35
+--- /dev/null
++++ b/pkg/proto/components/v1/componentsconnect/sandbox.connect.go
+@@ -0,0 +1,406 @@
++//
++//Copyright 2026 The Dapr Authors
++//Licensed under the Apache License, Version 2.0 (the "License");
++//you may not use this file except in compliance with the License.
++//You may obtain a copy of the License at
++//http://www.apache.org/licenses/LICENSE-2.0
++//Unless required by applicable law or agreed to in writing, software
++//distributed under the License is distributed on an "AS IS" BASIS,
++//WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//See the License for the specific language governing permissions and
++//limitations under the License.
++
++// Code generated by protoc-gen-connect-go. DO NOT EDIT.
++//
++// Source: dapr/proto/components/v1/sandbox.proto
++
++package componentsconnect
++
++import (
++	connect "connectrpc.com/connect"
++	context "context"
++	errors "errors"
++	v1 "github.com/dapr/dapr/pkg/proto/components/v1"
++	http "net/http"
++	strings "strings"
++)
++
++// This is a compile-time assertion to ensure that this generated file and the connect package are
++// compatible. If you get a compiler error that this constant is not defined, this code was
++// generated with a version of connect newer than the one compiled into your binary. You can fix the
++// problem by either regenerating this code with an older version of connect or updating the connect
++// version compiled into your binary.
++const _ = connect.IsAtLeastVersion1_13_0
++
++const (
++	// SandboxName is the fully-qualified name of the Sandbox service.
++	SandboxName = "dapr.proto.components.v1.Sandbox"
++)
++
++// These constants are the fully-qualified names of the RPCs defined in this package. They're
++// exposed at runtime as Spec.Procedure and as the final two segments of the HTTP route.
++//
++// Note that these are different from the fully-qualified method names used by
++// google.golang.org/protobuf/reflect/protoreflect. To convert from these constants to
++// reflection-formatted method names, remove the leading slash and convert the remaining slash to a
++// period.
++const (
++	// SandboxInitProcedure is the fully-qualified name of the Sandbox's Init RPC.
++	SandboxInitProcedure = "/dapr.proto.components.v1.Sandbox/Init"
++	// SandboxFeaturesProcedure is the fully-qualified name of the Sandbox's Features RPC.
++	SandboxFeaturesProcedure = "/dapr.proto.components.v1.Sandbox/Features"
++	// SandboxPingProcedure is the fully-qualified name of the Sandbox's Ping RPC.
++	SandboxPingProcedure = "/dapr.proto.components.v1.Sandbox/Ping"
++	// SandboxReadyProcedure is the fully-qualified name of the Sandbox's Ready RPC.
++	SandboxReadyProcedure = "/dapr.proto.components.v1.Sandbox/Ready"
++	// SandboxAcquireProcedure is the fully-qualified name of the Sandbox's Acquire RPC.
++	SandboxAcquireProcedure = "/dapr.proto.components.v1.Sandbox/Acquire"
++	// SandboxExecProcedure is the fully-qualified name of the Sandbox's Exec RPC.
++	SandboxExecProcedure = "/dapr.proto.components.v1.Sandbox/Exec"
++	// SandboxSessionStartProcedure is the fully-qualified name of the Sandbox's SessionStart RPC.
++	SandboxSessionStartProcedure = "/dapr.proto.components.v1.Sandbox/SessionStart"
++	// SandboxSessionSendProcedure is the fully-qualified name of the Sandbox's SessionSend RPC.
++	SandboxSessionSendProcedure = "/dapr.proto.components.v1.Sandbox/SessionSend"
++	// SandboxSessionCloseProcedure is the fully-qualified name of the Sandbox's SessionClose RPC.
++	SandboxSessionCloseProcedure = "/dapr.proto.components.v1.Sandbox/SessionClose"
++	// SandboxReleaseProcedure is the fully-qualified name of the Sandbox's Release RPC.
++	SandboxReleaseProcedure = "/dapr.proto.components.v1.Sandbox/Release"
++	// SandboxReconcileProcedure is the fully-qualified name of the Sandbox's Reconcile RPC.
++	SandboxReconcileProcedure = "/dapr.proto.components.v1.Sandbox/Reconcile"
++)
++
++// SandboxClient is a client for the dapr.proto.components.v1.Sandbox service.
++type SandboxClient interface {
++	Init(context.Context, *connect.Request[v1.SandboxInitRequest]) (*connect.Response[v1.SandboxInitResponse], error)
++	Features(context.Context, *connect.Request[v1.FeaturesRequest]) (*connect.Response[v1.FeaturesResponse], error)
++	Ping(context.Context, *connect.Request[v1.PingRequest]) (*connect.Response[v1.PingResponse], error)
++	Ready(context.Context, *connect.Request[v1.SandboxReadyRequest]) (*connect.Response[v1.SandboxReadyResponse], error)
++	// RESOURCE_EXHAUSTED when full.
++	Acquire(context.Context, *connect.Request[v1.SandboxAcquireRequest]) (*connect.Response[v1.SandboxAcquireResponse], error)
++	// NOT_FOUND if instance unknown.
++	Exec(context.Context, *connect.Request[v1.SandboxExecRequest]) (*connect.Response[v1.SandboxExecResponse], error)
++	SessionStart(context.Context, *connect.Request[v1.SandboxSessionStartRequest]) (*connect.Response[v1.SandboxSessionStartResponse], error)
++	SessionSend(context.Context, *connect.Request[v1.SandboxSessionSendRequest]) (*connect.Response[v1.SandboxExecResponse], error)
++	SessionClose(context.Context, *connect.Request[v1.SandboxSessionCloseRequest]) (*connect.Response[v1.SandboxSessionCloseResponse], error)
++	// Returns immediately.
++	Release(context.Context, *connect.Request[v1.SandboxReleaseRequest]) (*connect.Response[v1.SandboxReleaseResponse], error)
++	Reconcile(context.Context, *connect.Request[v1.SandboxReconcileRequest]) (*connect.Response[v1.SandboxReconcileResponse], error)
++}
++
++// NewSandboxClient constructs a client for the dapr.proto.components.v1.Sandbox service. By
++// default, it uses the Connect protocol with the binary Protobuf Codec, asks for gzipped responses,
++// and sends uncompressed requests. To use the gRPC or gRPC-Web protocols, supply the
++// connect.WithGRPC() or connect.WithGRPCWeb() options.
++//
++// The URL supplied here should be the base URL for the Connect or gRPC server (for example,
++// http://api.acme.com or https://acme.com/grpc).
++func NewSandboxClient(httpClient connect.HTTPClient, baseURL string, opts ...connect.ClientOption) SandboxClient {
++	baseURL = strings.TrimRight(baseURL, "/")
++	sandboxMethods := v1.File_dapr_proto_components_v1_sandbox_proto.Services().ByName("Sandbox").Methods()
++	return &sandboxClient{
++		init: connect.NewClient[v1.SandboxInitRequest, v1.SandboxInitResponse](
++			httpClient,
++			baseURL+SandboxInitProcedure,
++			connect.WithSchema(sandboxMethods.ByName("Init")),
++			connect.WithClientOptions(opts...),
++		),
++		features: connect.NewClient[v1.FeaturesRequest, v1.FeaturesResponse](
++			httpClient,
++			baseURL+SandboxFeaturesProcedure,
++			connect.WithSchema(sandboxMethods.ByName("Features")),
++			connect.WithClientOptions(opts...),
++		),
++		ping: connect.NewClient[v1.PingRequest, v1.PingResponse](
++			httpClient,
++			baseURL+SandboxPingProcedure,
++			connect.WithSchema(sandboxMethods.ByName("Ping")),
++			connect.WithClientOptions(opts...),
++		),
++		ready: connect.NewClient[v1.SandboxReadyRequest, v1.SandboxReadyResponse](
++			httpClient,
++			baseURL+SandboxReadyProcedure,
++			connect.WithSchema(sandboxMethods.ByName("Ready")),
++			connect.WithClientOptions(opts...),
++		),
++		acquire: connect.NewClient[v1.SandboxAcquireRequest, v1.SandboxAcquireResponse](
++			httpClient,
++			baseURL+SandboxAcquireProcedure,
++			connect.WithSchema(sandboxMethods.ByName("Acquire")),
++			connect.WithClientOptions(opts...),
++		),
++		exec: connect.NewClient[v1.SandboxExecRequest, v1.SandboxExecResponse](
++			httpClient,
++			baseURL+SandboxExecProcedure,
++			connect.WithSchema(sandboxMethods.ByName("Exec")),
++			connect.WithClientOptions(opts...),
++		),
++		sessionStart: connect.NewClient[v1.SandboxSessionStartRequest, v1.SandboxSessionStartResponse](
++			httpClient,
++			baseURL+SandboxSessionStartProcedure,
++			connect.WithSchema(sandboxMethods.ByName("SessionStart")),
++			connect.WithClientOptions(opts...),
++		),
++		sessionSend: connect.NewClient[v1.SandboxSessionSendRequest, v1.SandboxExecResponse](
++			httpClient,
++			baseURL+SandboxSessionSendProcedure,
++			connect.WithSchema(sandboxMethods.ByName("SessionSend")),
++			connect.WithClientOptions(opts...),
++		),
++		sessionClose: connect.NewClient[v1.SandboxSessionCloseRequest, v1.SandboxSessionCloseResponse](
++			httpClient,
++			baseURL+SandboxSessionCloseProcedure,
++			connect.WithSchema(sandboxMethods.ByName("SessionClose")),
++			connect.WithClientOptions(opts...),
++		),
++		release: connect.NewClient[v1.SandboxReleaseRequest, v1.SandboxReleaseResponse](
++			httpClient,
++			baseURL+SandboxReleaseProcedure,
++			connect.WithSchema(sandboxMethods.ByName("Release")),
++			connect.WithClientOptions(opts...),
++		),
++		reconcile: connect.NewClient[v1.SandboxReconcileRequest, v1.SandboxReconcileResponse](
++			httpClient,
++			baseURL+SandboxReconcileProcedure,
++			connect.WithSchema(sandboxMethods.ByName("Reconcile")),
++			connect.WithClientOptions(opts...),
++		),
++	}
++}
++
++// sandboxClient implements SandboxClient.
++type sandboxClient struct {
++	init         *connect.Client[v1.SandboxInitRequest, v1.SandboxInitResponse]
++	features     *connect.Client[v1.FeaturesRequest, v1.FeaturesResponse]
++	ping         *connect.Client[v1.PingRequest, v1.PingResponse]
++	ready        *connect.Client[v1.SandboxReadyRequest, v1.SandboxReadyResponse]
++	acquire      *connect.Client[v1.SandboxAcquireRequest, v1.SandboxAcquireResponse]
++	exec         *connect.Client[v1.SandboxExecRequest, v1.SandboxExecResponse]
++	sessionStart *connect.Client[v1.SandboxSessionStartRequest, v1.SandboxSessionStartResponse]
++	sessionSend  *connect.Client[v1.SandboxSessionSendRequest, v1.SandboxExecResponse]
++	sessionClose *connect.Client[v1.SandboxSessionCloseRequest, v1.SandboxSessionCloseResponse]
++	release      *connect.Client[v1.SandboxReleaseRequest, v1.SandboxReleaseResponse]
++	reconcile    *connect.Client[v1.SandboxReconcileRequest, v1.SandboxReconcileResponse]
++}
++
++// Init calls dapr.proto.components.v1.Sandbox.Init.
++func (c *sandboxClient) Init(ctx context.Context, req *connect.Request[v1.SandboxInitRequest]) (*connect.Response[v1.SandboxInitResponse], error) {
++	return c.init.CallUnary(ctx, req)
++}
++
++// Features calls dapr.proto.components.v1.Sandbox.Features.
++func (c *sandboxClient) Features(ctx context.Context, req *connect.Request[v1.FeaturesRequest]) (*connect.Response[v1.FeaturesResponse], error) {
++	return c.features.CallUnary(ctx, req)
++}
++
++// Ping calls dapr.proto.components.v1.Sandbox.Ping.
++func (c *sandboxClient) Ping(ctx context.Context, req *connect.Request[v1.PingRequest]) (*connect.Response[v1.PingResponse], error) {
++	return c.ping.CallUnary(ctx, req)
++}
++
++// Ready calls dapr.proto.components.v1.Sandbox.Ready.
++func (c *sandboxClient) Ready(ctx context.Context, req *connect.Request[v1.SandboxReadyRequest]) (*connect.Response[v1.SandboxReadyResponse], error) {
++	return c.ready.CallUnary(ctx, req)
++}
++
++// Acquire calls dapr.proto.components.v1.Sandbox.Acquire.
++func (c *sandboxClient) Acquire(ctx context.Context, req *connect.Request[v1.SandboxAcquireRequest]) (*connect.Response[v1.SandboxAcquireResponse], error) {
++	return c.acquire.CallUnary(ctx, req)
++}
++
++// Exec calls dapr.proto.components.v1.Sandbox.Exec.
++func (c *sandboxClient) Exec(ctx context.Context, req *connect.Request[v1.SandboxExecRequest]) (*connect.Response[v1.SandboxExecResponse], error) {
++	return c.exec.CallUnary(ctx, req)
++}
++
++// SessionStart calls dapr.proto.components.v1.Sandbox.SessionStart.
++func (c *sandboxClient) SessionStart(ctx context.Context, req *connect.Request[v1.SandboxSessionStartRequest]) (*connect.Response[v1.SandboxSessionStartResponse], error) {
++	return c.sessionStart.CallUnary(ctx, req)
++}
++
++// SessionSend calls dapr.proto.components.v1.Sandbox.SessionSend.
++func (c *sandboxClient) SessionSend(ctx context.Context, req *connect.Request[v1.SandboxSessionSendRequest]) (*connect.Response[v1.SandboxExecResponse], error) {
++	return c.sessionSend.CallUnary(ctx, req)
++}
++
++// SessionClose calls dapr.proto.components.v1.Sandbox.SessionClose.
++func (c *sandboxClient) SessionClose(ctx context.Context, req *connect.Request[v1.SandboxSessionCloseRequest]) (*connect.Response[v1.SandboxSessionCloseResponse], error) {
++	return c.sessionClose.CallUnary(ctx, req)
++}
++
++// Release calls dapr.proto.components.v1.Sandbox.Release.
++func (c *sandboxClient) Release(ctx context.Context, req *connect.Request[v1.SandboxReleaseRequest]) (*connect.Response[v1.SandboxReleaseResponse], error) {
++	return c.release.CallUnary(ctx, req)
++}
++
++// Reconcile calls dapr.proto.components.v1.Sandbox.Reconcile.
++func (c *sandboxClient) Reconcile(ctx context.Context, req *connect.Request[v1.SandboxReconcileRequest]) (*connect.Response[v1.SandboxReconcileResponse], error) {
++	return c.reconcile.CallUnary(ctx, req)
++}
++
++// SandboxHandler is an implementation of the dapr.proto.components.v1.Sandbox service.
++type SandboxHandler interface {
++	Init(context.Context, *connect.Request[v1.SandboxInitRequest]) (*connect.Response[v1.SandboxInitResponse], error)
++	Features(context.Context, *connect.Request[v1.FeaturesRequest]) (*connect.Response[v1.FeaturesResponse], error)
++	Ping(context.Context, *connect.Request[v1.PingRequest]) (*connect.Response[v1.PingResponse], error)
++	Ready(context.Context, *connect.Request[v1.SandboxReadyRequest]) (*connect.Response[v1.SandboxReadyResponse], error)
++	// RESOURCE_EXHAUSTED when full.
++	Acquire(context.Context, *connect.Request[v1.SandboxAcquireRequest]) (*connect.Response[v1.SandboxAcquireResponse], error)
++	// NOT_FOUND if instance unknown.
++	Exec(context.Context, *connect.Request[v1.SandboxExecRequest]) (*connect.Response[v1.SandboxExecResponse], error)
++	SessionStart(context.Context, *connect.Request[v1.SandboxSessionStartRequest]) (*connect.Response[v1.SandboxSessionStartResponse], error)
++	SessionSend(context.Context, *connect.Request[v1.SandboxSessionSendRequest]) (*connect.Response[v1.SandboxExecResponse], error)
++	SessionClose(context.Context, *connect.Request[v1.SandboxSessionCloseRequest]) (*connect.Response[v1.SandboxSessionCloseResponse], error)
++	// Returns immediately.
++	Release(context.Context, *connect.Request[v1.SandboxReleaseRequest]) (*connect.Response[v1.SandboxReleaseResponse], error)
++	Reconcile(context.Context, *connect.Request[v1.SandboxReconcileRequest]) (*connect.Response[v1.SandboxReconcileResponse], error)
++}
++
++// NewSandboxHandler builds an HTTP handler from the service implementation. It returns the path on
++// which to mount the handler and the handler itself.
++//
++// By default, handlers support the Connect, gRPC, and gRPC-Web protocols with the binary Protobuf
++// and JSON codecs. They also support gzip compression.
++func NewSandboxHandler(svc SandboxHandler, opts ...connect.HandlerOption) (string, http.Handler) {
++	sandboxMethods := v1.File_dapr_proto_components_v1_sandbox_proto.Services().ByName("Sandbox").Methods()
++	sandboxInitHandler := connect.NewUnaryHandler(
++		SandboxInitProcedure,
++		svc.Init,
++		connect.WithSchema(sandboxMethods.ByName("Init")),
++		connect.WithHandlerOptions(opts...),
++	)
++	sandboxFeaturesHandler := connect.NewUnaryHandler(
++		SandboxFeaturesProcedure,
++		svc.Features,
++		connect.WithSchema(sandboxMethods.ByName("Features")),
++		connect.WithHandlerOptions(opts...),
++	)
++	sandboxPingHandler := connect.NewUnaryHandler(
++		SandboxPingProcedure,
++		svc.Ping,
++		connect.WithSchema(sandboxMethods.ByName("Ping")),
++		connect.WithHandlerOptions(opts...),
++	)
++	sandboxReadyHandler := connect.NewUnaryHandler(
++		SandboxReadyProcedure,
++		svc.Ready,
++		connect.WithSchema(sandboxMethods.ByName("Ready")),
++		connect.WithHandlerOptions(opts...),
++	)
++	sandboxAcquireHandler := connect.NewUnaryHandler(
++		SandboxAcquireProcedure,
++		svc.Acquire,
++		connect.WithSchema(sandboxMethods.ByName("Acquire")),
++		connect.WithHandlerOptions(opts...),
++	)
++	sandboxExecHandler := connect.NewUnaryHandler(
++		SandboxExecProcedure,
++		svc.Exec,
++		connect.WithSchema(sandboxMethods.ByName("Exec")),
++		connect.WithHandlerOptions(opts...),
++	)
++	sandboxSessionStartHandler := connect.NewUnaryHandler(
++		SandboxSessionStartProcedure,
++		svc.SessionStart,
++		connect.WithSchema(sandboxMethods.ByName("SessionStart")),
++		connect.WithHandlerOptions(opts...),
++	)
++	sandboxSessionSendHandler := connect.NewUnaryHandler(
++		SandboxSessionSendProcedure,
++		svc.SessionSend,
++		connect.WithSchema(sandboxMethods.ByName("SessionSend")),
++		connect.WithHandlerOptions(opts...),
++	)
++	sandboxSessionCloseHandler := connect.NewUnaryHandler(
++		SandboxSessionCloseProcedure,
++		svc.SessionClose,
++		connect.WithSchema(sandboxMethods.ByName("SessionClose")),
++		connect.WithHandlerOptions(opts...),
++	)
++	sandboxReleaseHandler := connect.NewUnaryHandler(
++		SandboxReleaseProcedure,
++		svc.Release,
++		connect.WithSchema(sandboxMethods.ByName("Release")),
++		connect.WithHandlerOptions(opts...),
++	)
++	sandboxReconcileHandler := connect.NewUnaryHandler(
++		SandboxReconcileProcedure,
++		svc.Reconcile,
++		connect.WithSchema(sandboxMethods.ByName("Reconcile")),
++		connect.WithHandlerOptions(opts...),
++	)
++	return "/dapr.proto.components.v1.Sandbox/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch r.URL.Path {
++		case SandboxInitProcedure:
++			sandboxInitHandler.ServeHTTP(w, r)
++		case SandboxFeaturesProcedure:
++			sandboxFeaturesHandler.ServeHTTP(w, r)
++		case SandboxPingProcedure:
++			sandboxPingHandler.ServeHTTP(w, r)
++		case SandboxReadyProcedure:
++			sandboxReadyHandler.ServeHTTP(w, r)
++		case SandboxAcquireProcedure:
++			sandboxAcquireHandler.ServeHTTP(w, r)
++		case SandboxExecProcedure:
++			sandboxExecHandler.ServeHTTP(w, r)
++		case SandboxSessionStartProcedure:
++			sandboxSessionStartHandler.ServeHTTP(w, r)
++		case SandboxSessionSendProcedure:
++			sandboxSessionSendHandler.ServeHTTP(w, r)
++		case SandboxSessionCloseProcedure:
++			sandboxSessionCloseHandler.ServeHTTP(w, r)
++		case SandboxReleaseProcedure:
++			sandboxReleaseHandler.ServeHTTP(w, r)
++		case SandboxReconcileProcedure:
++			sandboxReconcileHandler.ServeHTTP(w, r)
++		default:
++			http.NotFound(w, r)
++		}
++	})
++}
++
++// UnimplementedSandboxHandler returns CodeUnimplemented from all methods.
++type UnimplementedSandboxHandler struct{}
++
++func (UnimplementedSandboxHandler) Init(context.Context, *connect.Request[v1.SandboxInitRequest]) (*connect.Response[v1.SandboxInitResponse], error) {
++	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("dapr.proto.components.v1.Sandbox.Init is not implemented"))
++}
++
++func (UnimplementedSandboxHandler) Features(context.Context, *connect.Request[v1.FeaturesRequest]) (*connect.Response[v1.FeaturesResponse], error) {
++	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("dapr.proto.components.v1.Sandbox.Features is not implemented"))
++}
++
++func (UnimplementedSandboxHandler) Ping(context.Context, *connect.Request[v1.PingRequest]) (*connect.Response[v1.PingResponse], error) {
++	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("dapr.proto.components.v1.Sandbox.Ping is not implemented"))
++}
++
++func (UnimplementedSandboxHandler) Ready(context.Context, *connect.Request[v1.SandboxReadyRequest]) (*connect.Response[v1.SandboxReadyResponse], error) {
++	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("dapr.proto.components.v1.Sandbox.Ready is not implemented"))
++}
++
++func (UnimplementedSandboxHandler) Acquire(context.Context, *connect.Request[v1.SandboxAcquireRequest]) (*connect.Response[v1.SandboxAcquireResponse], error) {
++	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("dapr.proto.components.v1.Sandbox.Acquire is not implemented"))
++}
++
++func (UnimplementedSandboxHandler) Exec(context.Context, *connect.Request[v1.SandboxExecRequest]) (*connect.Response[v1.SandboxExecResponse], error) {
++	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("dapr.proto.components.v1.Sandbox.Exec is not implemented"))
++}
++
++func (UnimplementedSandboxHandler) SessionStart(context.Context, *connect.Request[v1.SandboxSessionStartRequest]) (*connect.Response[v1.SandboxSessionStartResponse], error) {
++	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("dapr.proto.components.v1.Sandbox.SessionStart is not implemented"))
++}
++
++func (UnimplementedSandboxHandler) SessionSend(context.Context, *connect.Request[v1.SandboxSessionSendRequest]) (*connect.Response[v1.SandboxExecResponse], error) {
++	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("dapr.proto.components.v1.Sandbox.SessionSend is not implemented"))
++}
++
++func (UnimplementedSandboxHandler) SessionClose(context.Context, *connect.Request[v1.SandboxSessionCloseRequest]) (*connect.Response[v1.SandboxSessionCloseResponse], error) {
++	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("dapr.proto.components.v1.Sandbox.SessionClose is not implemented"))
++}
++
++func (UnimplementedSandboxHandler) Release(context.Context, *connect.Request[v1.SandboxReleaseRequest]) (*connect.Response[v1.SandboxReleaseResponse], error) {
++	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("dapr.proto.components.v1.Sandbox.Release is not implemented"))
++}
++
++func (UnimplementedSandboxHandler) Reconcile(context.Context, *connect.Request[v1.SandboxReconcileRequest]) (*connect.Response[v1.SandboxReconcileResponse], error) {
++	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("dapr.proto.components.v1.Sandbox.Reconcile is not implemented"))
++}
+diff --git a/pkg/proto/components/v1/sandbox.pb.go b/pkg/proto/components/v1/sandbox.pb.go
+new file mode 100644
+index 000000000..5637babef
+--- /dev/null
++++ b/pkg/proto/components/v1/sandbox.pb.go
+@@ -0,0 +1,1590 @@
++//
++//Copyright 2026 The Dapr Authors
++//Licensed under the Apache License, Version 2.0 (the "License");
++//you may not use this file except in compliance with the License.
++//You may obtain a copy of the License at
++//http://www.apache.org/licenses/LICENSE-2.0
++//Unless required by applicable law or agreed to in writing, software
++//distributed under the License is distributed on an "AS IS" BASIS,
++//WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//See the License for the specific language governing permissions and
++//limitations under the License.
++
++// Code generated by protoc-gen-go. DO NOT EDIT.
++// versions:
++// 	protoc-gen-go v1.32.0
++// 	protoc        v7.34.1
++// source: dapr/proto/components/v1/sandbox.proto
++
++package components
++
++import (
++	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
++	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
++	reflect "reflect"
++	sync "sync"
++)
++
++const (
++	// Verify that this generated code is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
++	// Verify that runtime/protoimpl is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
++)
++
++type SandboxAcquirePath int32
++
++const (
++	SandboxAcquirePath_SANDBOX_ACQUIRE_PATH_UNSPECIFIED SandboxAcquirePath = 0
++	SandboxAcquirePath_POOL                             SandboxAcquirePath = 1
++	SandboxAcquirePath_RESTORE                          SandboxAcquirePath = 2
++	SandboxAcquirePath_BOOT                             SandboxAcquirePath = 3
++)
++
++// Enum value maps for SandboxAcquirePath.
++var (
++	SandboxAcquirePath_name = map[int32]string{
++		0: "SANDBOX_ACQUIRE_PATH_UNSPECIFIED",
++		1: "POOL",
++		2: "RESTORE",
++		3: "BOOT",
++	}
++	SandboxAcquirePath_value = map[string]int32{
++		"SANDBOX_ACQUIRE_PATH_UNSPECIFIED": 0,
++		"POOL":                             1,
++		"RESTORE":                          2,
++		"BOOT":                             3,
++	}
++)
++
++func (x SandboxAcquirePath) Enum() *SandboxAcquirePath {
++	p := new(SandboxAcquirePath)
++	*p = x
++	return p
++}
++
++func (x SandboxAcquirePath) String() string {
++	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
++}
++
++func (SandboxAcquirePath) Descriptor() protoreflect.EnumDescriptor {
++	return file_dapr_proto_components_v1_sandbox_proto_enumTypes[0].Descriptor()
++}
++
++func (SandboxAcquirePath) Type() protoreflect.EnumType {
++	return &file_dapr_proto_components_v1_sandbox_proto_enumTypes[0]
++}
++
++func (x SandboxAcquirePath) Number() protoreflect.EnumNumber {
++	return protoreflect.EnumNumber(x)
++}
++
++// Deprecated: Use SandboxAcquirePath.Descriptor instead.
++func (SandboxAcquirePath) EnumDescriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{0}
++}
++
++type SandboxInitRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Metadata *MetadataRequest `protobuf:"bytes,1,opt,name=metadata,proto3" json:"metadata,omitempty"`
++}
++
++func (x *SandboxInitRequest) Reset() {
++	*x = SandboxInitRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[0]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxInitRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxInitRequest) ProtoMessage() {}
++
++func (x *SandboxInitRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[0]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxInitRequest.ProtoReflect.Descriptor instead.
++func (*SandboxInitRequest) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{0}
++}
++
++func (x *SandboxInitRequest) GetMetadata() *MetadataRequest {
++	if x != nil {
++		return x.Metadata
++	}
++	return nil
++}
++
++type SandboxInitResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++}
++
++func (x *SandboxInitResponse) Reset() {
++	*x = SandboxInitResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[1]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxInitResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxInitResponse) ProtoMessage() {}
++
++func (x *SandboxInitResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[1]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxInitResponse.ProtoReflect.Descriptor instead.
++func (*SandboxInitResponse) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{1}
++}
++
++type SandboxReadyRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++}
++
++func (x *SandboxReadyRequest) Reset() {
++	*x = SandboxReadyRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[2]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxReadyRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxReadyRequest) ProtoMessage() {}
++
++func (x *SandboxReadyRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[2]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxReadyRequest.ProtoReflect.Descriptor instead.
++func (*SandboxReadyRequest) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{2}
++}
++
++type SandboxReadyResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Ready  bool   `protobuf:"varint,1,opt,name=ready,proto3" json:"ready,omitempty"`
++	Reason string `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
++}
++
++func (x *SandboxReadyResponse) Reset() {
++	*x = SandboxReadyResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[3]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxReadyResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxReadyResponse) ProtoMessage() {}
++
++func (x *SandboxReadyResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[3]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxReadyResponse.ProtoReflect.Descriptor instead.
++func (*SandboxReadyResponse) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{3}
++}
++
++func (x *SandboxReadyResponse) GetReady() bool {
++	if x != nil {
++		return x.Ready
++	}
++	return false
++}
++
++func (x *SandboxReadyResponse) GetReason() string {
++	if x != nil {
++		return x.Reason
++	}
++	return ""
++}
++
++type SandboxAcquireRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	SandboxId    string `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
++	ActivationId string `protobuf:"bytes,2,opt,name=activation_id,json=activationId,proto3" json:"activation_id,omitempty"`
++}
++
++func (x *SandboxAcquireRequest) Reset() {
++	*x = SandboxAcquireRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[4]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxAcquireRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxAcquireRequest) ProtoMessage() {}
++
++func (x *SandboxAcquireRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[4]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxAcquireRequest.ProtoReflect.Descriptor instead.
++func (*SandboxAcquireRequest) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{4}
++}
++
++func (x *SandboxAcquireRequest) GetSandboxId() string {
++	if x != nil {
++		return x.SandboxId
++	}
++	return ""
++}
++
++func (x *SandboxAcquireRequest) GetActivationId() string {
++	if x != nil {
++		return x.ActivationId
++	}
++	return ""
++}
++
++type SandboxAcquireResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	InstanceId string             `protobuf:"bytes,1,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
++	Path       SandboxAcquirePath `protobuf:"varint,2,opt,name=path,proto3,enum=dapr.proto.components.v1.SandboxAcquirePath" json:"path,omitempty"`
++	ElapsedUs  uint64             `protobuf:"varint,3,opt,name=elapsed_us,json=elapsedUs,proto3" json:"elapsed_us,omitempty"`
++}
++
++func (x *SandboxAcquireResponse) Reset() {
++	*x = SandboxAcquireResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[5]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxAcquireResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxAcquireResponse) ProtoMessage() {}
++
++func (x *SandboxAcquireResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[5]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxAcquireResponse.ProtoReflect.Descriptor instead.
++func (*SandboxAcquireResponse) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{5}
++}
++
++func (x *SandboxAcquireResponse) GetInstanceId() string {
++	if x != nil {
++		return x.InstanceId
++	}
++	return ""
++}
++
++func (x *SandboxAcquireResponse) GetPath() SandboxAcquirePath {
++	if x != nil {
++		return x.Path
++	}
++	return SandboxAcquirePath_SANDBOX_ACQUIRE_PATH_UNSPECIFIED
++}
++
++func (x *SandboxAcquireResponse) GetElapsedUs() uint64 {
++	if x != nil {
++		return x.ElapsedUs
++	}
++	return 0
++}
++
++type SandboxExecSpec struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Command   string            `protobuf:"bytes,1,opt,name=command,proto3" json:"command,omitempty"`
++	Args      []string          `protobuf:"bytes,2,rep,name=args,proto3" json:"args,omitempty"`
++	Env       map[string]string `protobuf:"bytes,3,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
++	Cwd       string            `protobuf:"bytes,4,opt,name=cwd,proto3" json:"cwd,omitempty"`
++	Stdin     []byte            `protobuf:"bytes,5,opt,name=stdin,proto3" json:"stdin,omitempty"`
++	TimeoutMs uint32            `protobuf:"varint,6,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
++}
++
++func (x *SandboxExecSpec) Reset() {
++	*x = SandboxExecSpec{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[6]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxExecSpec) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxExecSpec) ProtoMessage() {}
++
++func (x *SandboxExecSpec) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[6]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxExecSpec.ProtoReflect.Descriptor instead.
++func (*SandboxExecSpec) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{6}
++}
++
++func (x *SandboxExecSpec) GetCommand() string {
++	if x != nil {
++		return x.Command
++	}
++	return ""
++}
++
++func (x *SandboxExecSpec) GetArgs() []string {
++	if x != nil {
++		return x.Args
++	}
++	return nil
++}
++
++func (x *SandboxExecSpec) GetEnv() map[string]string {
++	if x != nil {
++		return x.Env
++	}
++	return nil
++}
++
++func (x *SandboxExecSpec) GetCwd() string {
++	if x != nil {
++		return x.Cwd
++	}
++	return ""
++}
++
++func (x *SandboxExecSpec) GetStdin() []byte {
++	if x != nil {
++		return x.Stdin
++	}
++	return nil
++}
++
++func (x *SandboxExecSpec) GetTimeoutMs() uint32 {
++	if x != nil {
++		return x.TimeoutMs
++	}
++	return 0
++}
++
++type SandboxExecRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	InstanceId string           `protobuf:"bytes,1,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
++	Spec       *SandboxExecSpec `protobuf:"bytes,2,opt,name=spec,proto3" json:"spec,omitempty"`
++}
++
++func (x *SandboxExecRequest) Reset() {
++	*x = SandboxExecRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[7]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxExecRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxExecRequest) ProtoMessage() {}
++
++func (x *SandboxExecRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[7]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxExecRequest.ProtoReflect.Descriptor instead.
++func (*SandboxExecRequest) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{7}
++}
++
++func (x *SandboxExecRequest) GetInstanceId() string {
++	if x != nil {
++		return x.InstanceId
++	}
++	return ""
++}
++
++func (x *SandboxExecRequest) GetSpec() *SandboxExecSpec {
++	if x != nil {
++		return x.Spec
++	}
++	return nil
++}
++
++type SandboxExecResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Stdout    []byte `protobuf:"bytes,1,opt,name=stdout,proto3" json:"stdout,omitempty"`
++	Stderr    []byte `protobuf:"bytes,2,opt,name=stderr,proto3" json:"stderr,omitempty"`
++	ExitCode  int32  `protobuf:"varint,3,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
++	Truncated bool   `protobuf:"varint,4,opt,name=truncated,proto3" json:"truncated,omitempty"`
++	TimedOut  bool   `protobuf:"varint,5,opt,name=timed_out,json=timedOut,proto3" json:"timed_out,omitempty"`
++	ElapsedUs uint64 `protobuf:"varint,6,opt,name=elapsed_us,json=elapsedUs,proto3" json:"elapsed_us,omitempty"`
++}
++
++func (x *SandboxExecResponse) Reset() {
++	*x = SandboxExecResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[8]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxExecResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxExecResponse) ProtoMessage() {}
++
++func (x *SandboxExecResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[8]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxExecResponse.ProtoReflect.Descriptor instead.
++func (*SandboxExecResponse) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{8}
++}
++
++func (x *SandboxExecResponse) GetStdout() []byte {
++	if x != nil {
++		return x.Stdout
++	}
++	return nil
++}
++
++func (x *SandboxExecResponse) GetStderr() []byte {
++	if x != nil {
++		return x.Stderr
++	}
++	return nil
++}
++
++func (x *SandboxExecResponse) GetExitCode() int32 {
++	if x != nil {
++		return x.ExitCode
++	}
++	return 0
++}
++
++func (x *SandboxExecResponse) GetTruncated() bool {
++	if x != nil {
++		return x.Truncated
++	}
++	return false
++}
++
++func (x *SandboxExecResponse) GetTimedOut() bool {
++	if x != nil {
++		return x.TimedOut
++	}
++	return false
++}
++
++func (x *SandboxExecResponse) GetElapsedUs() uint64 {
++	if x != nil {
++		return x.ElapsedUs
++	}
++	return 0
++}
++
++type SandboxSessionStartRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	InstanceId string           `protobuf:"bytes,1,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
++	Spec       *SandboxExecSpec `protobuf:"bytes,2,opt,name=spec,proto3" json:"spec,omitempty"`
++}
++
++func (x *SandboxSessionStartRequest) Reset() {
++	*x = SandboxSessionStartRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[9]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxSessionStartRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxSessionStartRequest) ProtoMessage() {}
++
++func (x *SandboxSessionStartRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[9]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxSessionStartRequest.ProtoReflect.Descriptor instead.
++func (*SandboxSessionStartRequest) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{9}
++}
++
++func (x *SandboxSessionStartRequest) GetInstanceId() string {
++	if x != nil {
++		return x.InstanceId
++	}
++	return ""
++}
++
++func (x *SandboxSessionStartRequest) GetSpec() *SandboxExecSpec {
++	if x != nil {
++		return x.Spec
++	}
++	return nil
++}
++
++type SandboxSessionStartResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	SessionId string `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
++}
++
++func (x *SandboxSessionStartResponse) Reset() {
++	*x = SandboxSessionStartResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[10]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxSessionStartResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxSessionStartResponse) ProtoMessage() {}
++
++func (x *SandboxSessionStartResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[10]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxSessionStartResponse.ProtoReflect.Descriptor instead.
++func (*SandboxSessionStartResponse) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{10}
++}
++
++func (x *SandboxSessionStartResponse) GetSessionId() string {
++	if x != nil {
++		return x.SessionId
++	}
++	return ""
++}
++
++type SandboxSessionSendRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	InstanceId string `protobuf:"bytes,1,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
++	SessionId  string `protobuf:"bytes,2,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
++	Input      []byte `protobuf:"bytes,3,opt,name=input,proto3" json:"input,omitempty"`
++	Until      []byte `protobuf:"bytes,4,opt,name=until,proto3" json:"until,omitempty"`
++	TimeoutMs  uint32 `protobuf:"varint,5,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
++}
++
++func (x *SandboxSessionSendRequest) Reset() {
++	*x = SandboxSessionSendRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[11]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxSessionSendRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxSessionSendRequest) ProtoMessage() {}
++
++func (x *SandboxSessionSendRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[11]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxSessionSendRequest.ProtoReflect.Descriptor instead.
++func (*SandboxSessionSendRequest) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{11}
++}
++
++func (x *SandboxSessionSendRequest) GetInstanceId() string {
++	if x != nil {
++		return x.InstanceId
++	}
++	return ""
++}
++
++func (x *SandboxSessionSendRequest) GetSessionId() string {
++	if x != nil {
++		return x.SessionId
++	}
++	return ""
++}
++
++func (x *SandboxSessionSendRequest) GetInput() []byte {
++	if x != nil {
++		return x.Input
++	}
++	return nil
++}
++
++func (x *SandboxSessionSendRequest) GetUntil() []byte {
++	if x != nil {
++		return x.Until
++	}
++	return nil
++}
++
++func (x *SandboxSessionSendRequest) GetTimeoutMs() uint32 {
++	if x != nil {
++		return x.TimeoutMs
++	}
++	return 0
++}
++
++type SandboxSessionCloseRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	InstanceId string `protobuf:"bytes,1,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
++	SessionId  string `protobuf:"bytes,2,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
++}
++
++func (x *SandboxSessionCloseRequest) Reset() {
++	*x = SandboxSessionCloseRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[12]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxSessionCloseRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxSessionCloseRequest) ProtoMessage() {}
++
++func (x *SandboxSessionCloseRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[12]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxSessionCloseRequest.ProtoReflect.Descriptor instead.
++func (*SandboxSessionCloseRequest) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{12}
++}
++
++func (x *SandboxSessionCloseRequest) GetInstanceId() string {
++	if x != nil {
++		return x.InstanceId
++	}
++	return ""
++}
++
++func (x *SandboxSessionCloseRequest) GetSessionId() string {
++	if x != nil {
++		return x.SessionId
++	}
++	return ""
++}
++
++type SandboxSessionCloseResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++}
++
++func (x *SandboxSessionCloseResponse) Reset() {
++	*x = SandboxSessionCloseResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[13]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxSessionCloseResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxSessionCloseResponse) ProtoMessage() {}
++
++func (x *SandboxSessionCloseResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[13]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxSessionCloseResponse.ProtoReflect.Descriptor instead.
++func (*SandboxSessionCloseResponse) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{13}
++}
++
++type SandboxReleaseRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	InstanceId string `protobuf:"bytes,1,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
++}
++
++func (x *SandboxReleaseRequest) Reset() {
++	*x = SandboxReleaseRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[14]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxReleaseRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxReleaseRequest) ProtoMessage() {}
++
++func (x *SandboxReleaseRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[14]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxReleaseRequest.ProtoReflect.Descriptor instead.
++func (*SandboxReleaseRequest) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{14}
++}
++
++func (x *SandboxReleaseRequest) GetInstanceId() string {
++	if x != nil {
++		return x.InstanceId
++	}
++	return ""
++}
++
++type SandboxReleaseResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++}
++
++func (x *SandboxReleaseResponse) Reset() {
++	*x = SandboxReleaseResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[15]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxReleaseResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxReleaseResponse) ProtoMessage() {}
++
++func (x *SandboxReleaseResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[15]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxReleaseResponse.ProtoReflect.Descriptor instead.
++func (*SandboxReleaseResponse) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{15}
++}
++
++type SandboxReconcileRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	LiveInstanceIds []string `protobuf:"bytes,1,rep,name=live_instance_ids,json=liveInstanceIds,proto3" json:"live_instance_ids,omitempty"`
++}
++
++func (x *SandboxReconcileRequest) Reset() {
++	*x = SandboxReconcileRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[16]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxReconcileRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxReconcileRequest) ProtoMessage() {}
++
++func (x *SandboxReconcileRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[16]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxReconcileRequest.ProtoReflect.Descriptor instead.
++func (*SandboxReconcileRequest) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{16}
++}
++
++func (x *SandboxReconcileRequest) GetLiveInstanceIds() []string {
++	if x != nil {
++		return x.LiveInstanceIds
++	}
++	return nil
++}
++
++type SandboxReconcileResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Released uint32 `protobuf:"varint,1,opt,name=released,proto3" json:"released,omitempty"`
++}
++
++func (x *SandboxReconcileResponse) Reset() {
++	*x = SandboxReconcileResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[17]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxReconcileResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxReconcileResponse) ProtoMessage() {}
++
++func (x *SandboxReconcileResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_components_v1_sandbox_proto_msgTypes[17]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxReconcileResponse.ProtoReflect.Descriptor instead.
++func (*SandboxReconcileResponse) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP(), []int{17}
++}
++
++func (x *SandboxReconcileResponse) GetReleased() uint32 {
++	if x != nil {
++		return x.Released
++	}
++	return 0
++}
++
++var File_dapr_proto_components_v1_sandbox_proto protoreflect.FileDescriptor
++
++var file_dapr_proto_components_v1_sandbox_proto_rawDesc = []byte{
++	0x0a, 0x26, 0x64, 0x61, 0x70, 0x72, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2f, 0x63, 0x6f, 0x6d,
++	0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2f, 0x76, 0x31, 0x2f, 0x73, 0x61, 0x6e, 0x64, 0x62,
++	0x6f, 0x78, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x12, 0x18, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70,
++	0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e,
++	0x76, 0x31, 0x1a, 0x25, 0x64, 0x61, 0x70, 0x72, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2f, 0x63,
++	0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2f, 0x76, 0x31, 0x2f, 0x63, 0x6f, 0x6d,
++	0x6d, 0x6f, 0x6e, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x22, 0x5b, 0x0a, 0x12, 0x53, 0x61, 0x6e,
++	0x64, 0x62, 0x6f, 0x78, 0x49, 0x6e, 0x69, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12,
++	0x45, 0x0a, 0x08, 0x6d, 0x65, 0x74, 0x61, 0x64, 0x61, 0x74, 0x61, 0x18, 0x01, 0x20, 0x01, 0x28,
++	0x0b, 0x32, 0x29, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63,
++	0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x4d, 0x65, 0x74,
++	0x61, 0x64, 0x61, 0x74, 0x61, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x52, 0x08, 0x6d, 0x65,
++	0x74, 0x61, 0x64, 0x61, 0x74, 0x61, 0x22, 0x15, 0x0a, 0x13, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f,
++	0x78, 0x49, 0x6e, 0x69, 0x74, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x15, 0x0a,
++	0x13, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x52, 0x65, 0x61, 0x64, 0x79, 0x52, 0x65, 0x71,
++	0x75, 0x65, 0x73, 0x74, 0x22, 0x44, 0x0a, 0x14, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x52,
++	0x65, 0x61, 0x64, 0x79, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x14, 0x0a, 0x05,
++	0x72, 0x65, 0x61, 0x64, 0x79, 0x18, 0x01, 0x20, 0x01, 0x28, 0x08, 0x52, 0x05, 0x72, 0x65, 0x61,
++	0x64, 0x79, 0x12, 0x16, 0x0a, 0x06, 0x72, 0x65, 0x61, 0x73, 0x6f, 0x6e, 0x18, 0x02, 0x20, 0x01,
++	0x28, 0x09, 0x52, 0x06, 0x72, 0x65, 0x61, 0x73, 0x6f, 0x6e, 0x22, 0x5b, 0x0a, 0x15, 0x53, 0x61,
++	0x6e, 0x64, 0x62, 0x6f, 0x78, 0x41, 0x63, 0x71, 0x75, 0x69, 0x72, 0x65, 0x52, 0x65, 0x71, 0x75,
++	0x65, 0x73, 0x74, 0x12, 0x1d, 0x0a, 0x0a, 0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x5f, 0x69,
++	0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78,
++	0x49, 0x64, 0x12, 0x23, 0x0a, 0x0d, 0x61, 0x63, 0x74, 0x69, 0x76, 0x61, 0x74, 0x69, 0x6f, 0x6e,
++	0x5f, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0c, 0x61, 0x63, 0x74, 0x69, 0x76,
++	0x61, 0x74, 0x69, 0x6f, 0x6e, 0x49, 0x64, 0x22, 0x9a, 0x01, 0x0a, 0x16, 0x53, 0x61, 0x6e, 0x64,
++	0x62, 0x6f, 0x78, 0x41, 0x63, 0x71, 0x75, 0x69, 0x72, 0x65, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e,
++	0x73, 0x65, 0x12, 0x1f, 0x0a, 0x0b, 0x69, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x63, 0x65, 0x5f, 0x69,
++	0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0a, 0x69, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x63,
++	0x65, 0x49, 0x64, 0x12, 0x40, 0x0a, 0x04, 0x70, 0x61, 0x74, 0x68, 0x18, 0x02, 0x20, 0x01, 0x28,
++	0x0e, 0x32, 0x2c, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63,
++	0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x53, 0x61, 0x6e,
++	0x64, 0x62, 0x6f, 0x78, 0x41, 0x63, 0x71, 0x75, 0x69, 0x72, 0x65, 0x50, 0x61, 0x74, 0x68, 0x52,
++	0x04, 0x70, 0x61, 0x74, 0x68, 0x12, 0x1d, 0x0a, 0x0a, 0x65, 0x6c, 0x61, 0x70, 0x73, 0x65, 0x64,
++	0x5f, 0x75, 0x73, 0x18, 0x03, 0x20, 0x01, 0x28, 0x04, 0x52, 0x09, 0x65, 0x6c, 0x61, 0x70, 0x73,
++	0x65, 0x64, 0x55, 0x73, 0x22, 0x84, 0x02, 0x0a, 0x0f, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78,
++	0x45, 0x78, 0x65, 0x63, 0x53, 0x70, 0x65, 0x63, 0x12, 0x18, 0x0a, 0x07, 0x63, 0x6f, 0x6d, 0x6d,
++	0x61, 0x6e, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x07, 0x63, 0x6f, 0x6d, 0x6d, 0x61,
++	0x6e, 0x64, 0x12, 0x12, 0x0a, 0x04, 0x61, 0x72, 0x67, 0x73, 0x18, 0x02, 0x20, 0x03, 0x28, 0x09,
++	0x52, 0x04, 0x61, 0x72, 0x67, 0x73, 0x12, 0x44, 0x0a, 0x03, 0x65, 0x6e, 0x76, 0x18, 0x03, 0x20,
++	0x03, 0x28, 0x0b, 0x32, 0x32, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f,
++	0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x53,
++	0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x45, 0x78, 0x65, 0x63, 0x53, 0x70, 0x65, 0x63, 0x2e, 0x45,
++	0x6e, 0x76, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x52, 0x03, 0x65, 0x6e, 0x76, 0x12, 0x10, 0x0a, 0x03,
++	0x63, 0x77, 0x64, 0x18, 0x04, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x63, 0x77, 0x64, 0x12, 0x14,
++	0x0a, 0x05, 0x73, 0x74, 0x64, 0x69, 0x6e, 0x18, 0x05, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x05, 0x73,
++	0x74, 0x64, 0x69, 0x6e, 0x12, 0x1d, 0x0a, 0x0a, 0x74, 0x69, 0x6d, 0x65, 0x6f, 0x75, 0x74, 0x5f,
++	0x6d, 0x73, 0x18, 0x06, 0x20, 0x01, 0x28, 0x0d, 0x52, 0x09, 0x74, 0x69, 0x6d, 0x65, 0x6f, 0x75,
++	0x74, 0x4d, 0x73, 0x1a, 0x36, 0x0a, 0x08, 0x45, 0x6e, 0x76, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x12,
++	0x10, 0x0a, 0x03, 0x6b, 0x65, 0x79, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x6b, 0x65,
++	0x79, 0x12, 0x14, 0x0a, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09,
++	0x52, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x3a, 0x02, 0x38, 0x01, 0x22, 0x74, 0x0a, 0x12, 0x53,
++	0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x45, 0x78, 0x65, 0x63, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
++	0x74, 0x12, 0x1f, 0x0a, 0x0b, 0x69, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x63, 0x65, 0x5f, 0x69, 0x64,
++	0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0a, 0x69, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x63, 0x65,
++	0x49, 0x64, 0x12, 0x3d, 0x0a, 0x04, 0x73, 0x70, 0x65, 0x63, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0b,
++	0x32, 0x29, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63, 0x6f,
++	0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x53, 0x61, 0x6e, 0x64,
++	0x62, 0x6f, 0x78, 0x45, 0x78, 0x65, 0x63, 0x53, 0x70, 0x65, 0x63, 0x52, 0x04, 0x73, 0x70, 0x65,
++	0x63, 0x22, 0xbc, 0x01, 0x0a, 0x13, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x45, 0x78, 0x65,
++	0x63, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x16, 0x0a, 0x06, 0x73, 0x74, 0x64,
++	0x6f, 0x75, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x06, 0x73, 0x74, 0x64, 0x6f, 0x75,
++	0x74, 0x12, 0x16, 0x0a, 0x06, 0x73, 0x74, 0x64, 0x65, 0x72, 0x72, 0x18, 0x02, 0x20, 0x01, 0x28,
++	0x0c, 0x52, 0x06, 0x73, 0x74, 0x64, 0x65, 0x72, 0x72, 0x12, 0x1b, 0x0a, 0x09, 0x65, 0x78, 0x69,
++	0x74, 0x5f, 0x63, 0x6f, 0x64, 0x65, 0x18, 0x03, 0x20, 0x01, 0x28, 0x05, 0x52, 0x08, 0x65, 0x78,
++	0x69, 0x74, 0x43, 0x6f, 0x64, 0x65, 0x12, 0x1c, 0x0a, 0x09, 0x74, 0x72, 0x75, 0x6e, 0x63, 0x61,
++	0x74, 0x65, 0x64, 0x18, 0x04, 0x20, 0x01, 0x28, 0x08, 0x52, 0x09, 0x74, 0x72, 0x75, 0x6e, 0x63,
++	0x61, 0x74, 0x65, 0x64, 0x12, 0x1b, 0x0a, 0x09, 0x74, 0x69, 0x6d, 0x65, 0x64, 0x5f, 0x6f, 0x75,
++	0x74, 0x18, 0x05, 0x20, 0x01, 0x28, 0x08, 0x52, 0x08, 0x74, 0x69, 0x6d, 0x65, 0x64, 0x4f, 0x75,
++	0x74, 0x12, 0x1d, 0x0a, 0x0a, 0x65, 0x6c, 0x61, 0x70, 0x73, 0x65, 0x64, 0x5f, 0x75, 0x73, 0x18,
++	0x06, 0x20, 0x01, 0x28, 0x04, 0x52, 0x09, 0x65, 0x6c, 0x61, 0x70, 0x73, 0x65, 0x64, 0x55, 0x73,
++	0x22, 0x7c, 0x0a, 0x1a, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x53, 0x65, 0x73, 0x73, 0x69,
++	0x6f, 0x6e, 0x53, 0x74, 0x61, 0x72, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x1f,
++	0x0a, 0x0b, 0x69, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x63, 0x65, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20,
++	0x01, 0x28, 0x09, 0x52, 0x0a, 0x69, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x63, 0x65, 0x49, 0x64, 0x12,
++	0x3d, 0x0a, 0x04, 0x73, 0x70, 0x65, 0x63, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x29, 0x2e,
++	0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f,
++	0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78,
++	0x45, 0x78, 0x65, 0x63, 0x53, 0x70, 0x65, 0x63, 0x52, 0x04, 0x73, 0x70, 0x65, 0x63, 0x22, 0x3c,
++	0x0a, 0x1b, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x53, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e,
++	0x53, 0x74, 0x61, 0x72, 0x74, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x1d, 0x0a,
++	0x0a, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28,
++	0x09, 0x52, 0x09, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x49, 0x64, 0x22, 0xa6, 0x01, 0x0a,
++	0x19, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x53, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x53,
++	0x65, 0x6e, 0x64, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x1f, 0x0a, 0x0b, 0x69, 0x6e,
++	0x73, 0x74, 0x61, 0x6e, 0x63, 0x65, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52,
++	0x0a, 0x69, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x63, 0x65, 0x49, 0x64, 0x12, 0x1d, 0x0a, 0x0a, 0x73,
++	0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x5f, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52,
++	0x09, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x49, 0x64, 0x12, 0x14, 0x0a, 0x05, 0x69, 0x6e,
++	0x70, 0x75, 0x74, 0x18, 0x03, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x05, 0x69, 0x6e, 0x70, 0x75, 0x74,
++	0x12, 0x14, 0x0a, 0x05, 0x75, 0x6e, 0x74, 0x69, 0x6c, 0x18, 0x04, 0x20, 0x01, 0x28, 0x0c, 0x52,
++	0x05, 0x75, 0x6e, 0x74, 0x69, 0x6c, 0x12, 0x1d, 0x0a, 0x0a, 0x74, 0x69, 0x6d, 0x65, 0x6f, 0x75,
++	0x74, 0x5f, 0x6d, 0x73, 0x18, 0x05, 0x20, 0x01, 0x28, 0x0d, 0x52, 0x09, 0x74, 0x69, 0x6d, 0x65,
++	0x6f, 0x75, 0x74, 0x4d, 0x73, 0x22, 0x5c, 0x0a, 0x1a, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78,
++	0x53, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x43, 0x6c, 0x6f, 0x73, 0x65, 0x52, 0x65, 0x71, 0x75,
++	0x65, 0x73, 0x74, 0x12, 0x1f, 0x0a, 0x0b, 0x69, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x63, 0x65, 0x5f,
++	0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0a, 0x69, 0x6e, 0x73, 0x74, 0x61, 0x6e,
++	0x63, 0x65, 0x49, 0x64, 0x12, 0x1d, 0x0a, 0x0a, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x5f,
++	0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f,
++	0x6e, 0x49, 0x64, 0x22, 0x1d, 0x0a, 0x1b, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x53, 0x65,
++	0x73, 0x73, 0x69, 0x6f, 0x6e, 0x43, 0x6c, 0x6f, 0x73, 0x65, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e,
++	0x73, 0x65, 0x22, 0x38, 0x0a, 0x15, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x52, 0x65, 0x6c,
++	0x65, 0x61, 0x73, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x1f, 0x0a, 0x0b, 0x69,
++	0x6e, 0x73, 0x74, 0x61, 0x6e, 0x63, 0x65, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09,
++	0x52, 0x0a, 0x69, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x63, 0x65, 0x49, 0x64, 0x22, 0x18, 0x0a, 0x16,
++	0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x52, 0x65, 0x6c, 0x65, 0x61, 0x73, 0x65, 0x52, 0x65,
++	0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x45, 0x0a, 0x17, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f,
++	0x78, 0x52, 0x65, 0x63, 0x6f, 0x6e, 0x63, 0x69, 0x6c, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
++	0x74, 0x12, 0x2a, 0x0a, 0x11, 0x6c, 0x69, 0x76, 0x65, 0x5f, 0x69, 0x6e, 0x73, 0x74, 0x61, 0x6e,
++	0x63, 0x65, 0x5f, 0x69, 0x64, 0x73, 0x18, 0x01, 0x20, 0x03, 0x28, 0x09, 0x52, 0x0f, 0x6c, 0x69,
++	0x76, 0x65, 0x49, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x63, 0x65, 0x49, 0x64, 0x73, 0x22, 0x36, 0x0a,
++	0x18, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x52, 0x65, 0x63, 0x6f, 0x6e, 0x63, 0x69, 0x6c,
++	0x65, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x1a, 0x0a, 0x08, 0x72, 0x65, 0x6c,
++	0x65, 0x61, 0x73, 0x65, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0d, 0x52, 0x08, 0x72, 0x65, 0x6c,
++	0x65, 0x61, 0x73, 0x65, 0x64, 0x2a, 0x5b, 0x0a, 0x12, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78,
++	0x41, 0x63, 0x71, 0x75, 0x69, 0x72, 0x65, 0x50, 0x61, 0x74, 0x68, 0x12, 0x24, 0x0a, 0x20, 0x53,
++	0x41, 0x4e, 0x44, 0x42, 0x4f, 0x58, 0x5f, 0x41, 0x43, 0x51, 0x55, 0x49, 0x52, 0x45, 0x5f, 0x50,
++	0x41, 0x54, 0x48, 0x5f, 0x55, 0x4e, 0x53, 0x50, 0x45, 0x43, 0x49, 0x46, 0x49, 0x45, 0x44, 0x10,
++	0x00, 0x12, 0x08, 0x0a, 0x04, 0x50, 0x4f, 0x4f, 0x4c, 0x10, 0x01, 0x12, 0x0b, 0x0a, 0x07, 0x52,
++	0x45, 0x53, 0x54, 0x4f, 0x52, 0x45, 0x10, 0x02, 0x12, 0x08, 0x0a, 0x04, 0x42, 0x4f, 0x4f, 0x54,
++	0x10, 0x03, 0x32, 0xc8, 0x09, 0x0a, 0x07, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x12, 0x65,
++	0x0a, 0x04, 0x49, 0x6e, 0x69, 0x74, 0x12, 0x2c, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72,
++	0x6f, 0x74, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76,
++	0x31, 0x2e, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x49, 0x6e, 0x69, 0x74, 0x52, 0x65, 0x71,
++	0x75, 0x65, 0x73, 0x74, 0x1a, 0x2d, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74,
++	0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e,
++	0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x49, 0x6e, 0x69, 0x74, 0x52, 0x65, 0x73, 0x70, 0x6f,
++	0x6e, 0x73, 0x65, 0x22, 0x00, 0x12, 0x63, 0x0a, 0x08, 0x46, 0x65, 0x61, 0x74, 0x75, 0x72, 0x65,
++	0x73, 0x12, 0x29, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63,
++	0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x46, 0x65, 0x61,
++	0x74, 0x75, 0x72, 0x65, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x2a, 0x2e, 0x64,
++	0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e,
++	0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x46, 0x65, 0x61, 0x74, 0x75, 0x72, 0x65, 0x73,
++	0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x00, 0x12, 0x57, 0x0a, 0x04, 0x50, 0x69,
++	0x6e, 0x67, 0x12, 0x25, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e,
++	0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x50, 0x69,
++	0x6e, 0x67, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x26, 0x2e, 0x64, 0x61, 0x70, 0x72,
++	0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74,
++	0x73, 0x2e, 0x76, 0x31, 0x2e, 0x50, 0x69, 0x6e, 0x67, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73,
++	0x65, 0x22, 0x00, 0x12, 0x68, 0x0a, 0x05, 0x52, 0x65, 0x61, 0x64, 0x79, 0x12, 0x2d, 0x2e, 0x64,
++	0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e,
++	0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x52,
++	0x65, 0x61, 0x64, 0x79, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x2e, 0x2e, 0x64, 0x61,
++	0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65,
++	0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x52, 0x65,
++	0x61, 0x64, 0x79, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x00, 0x12, 0x6e, 0x0a,
++	0x07, 0x41, 0x63, 0x71, 0x75, 0x69, 0x72, 0x65, 0x12, 0x2f, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e,
++	0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73,
++	0x2e, 0x76, 0x31, 0x2e, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x41, 0x63, 0x71, 0x75, 0x69,
++	0x72, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x30, 0x2e, 0x64, 0x61, 0x70, 0x72,
++	0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74,
++	0x73, 0x2e, 0x76, 0x31, 0x2e, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x41, 0x63, 0x71, 0x75,
++	0x69, 0x72, 0x65, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x00, 0x12, 0x65, 0x0a,
++	0x04, 0x45, 0x78, 0x65, 0x63, 0x12, 0x2c, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f,
++	0x74, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31,
++	0x2e, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x45, 0x78, 0x65, 0x63, 0x52, 0x65, 0x71, 0x75,
++	0x65, 0x73, 0x74, 0x1a, 0x2d, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f,
++	0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x53,
++	0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x45, 0x78, 0x65, 0x63, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e,
++	0x73, 0x65, 0x22, 0x00, 0x12, 0x7d, 0x0a, 0x0c, 0x53, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x53,
++	0x74, 0x61, 0x72, 0x74, 0x12, 0x34, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74,
++	0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e,
++	0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x53, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x53, 0x74,
++	0x61, 0x72, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x35, 0x2e, 0x64, 0x61, 0x70,
++	0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e,
++	0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x53, 0x65, 0x73,
++	0x73, 0x69, 0x6f, 0x6e, 0x53, 0x74, 0x61, 0x72, 0x74, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73,
++	0x65, 0x22, 0x00, 0x12, 0x73, 0x0a, 0x0b, 0x53, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x53, 0x65,
++	0x6e, 0x64, 0x12, 0x33, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e,
++	0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x53, 0x61,
++	0x6e, 0x64, 0x62, 0x6f, 0x78, 0x53, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x53, 0x65, 0x6e, 0x64,
++	0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x2d, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70,
++	0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e,
++	0x76, 0x31, 0x2e, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x45, 0x78, 0x65, 0x63, 0x52, 0x65,
++	0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x00, 0x12, 0x7d, 0x0a, 0x0c, 0x53, 0x65, 0x73, 0x73,
++	0x69, 0x6f, 0x6e, 0x43, 0x6c, 0x6f, 0x73, 0x65, 0x12, 0x34, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e,
++	0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73,
++	0x2e, 0x76, 0x31, 0x2e, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x53, 0x65, 0x73, 0x73, 0x69,
++	0x6f, 0x6e, 0x43, 0x6c, 0x6f, 0x73, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x35,
++	0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70,
++	0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f,
++	0x78, 0x53, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x43, 0x6c, 0x6f, 0x73, 0x65, 0x52, 0x65, 0x73,
++	0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x00, 0x12, 0x6e, 0x0a, 0x07, 0x52, 0x65, 0x6c, 0x65, 0x61,
++	0x73, 0x65, 0x12, 0x2f, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e,
++	0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x53, 0x61,
++	0x6e, 0x64, 0x62, 0x6f, 0x78, 0x52, 0x65, 0x6c, 0x65, 0x61, 0x73, 0x65, 0x52, 0x65, 0x71, 0x75,
++	0x65, 0x73, 0x74, 0x1a, 0x30, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f,
++	0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x53,
++	0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x52, 0x65, 0x6c, 0x65, 0x61, 0x73, 0x65, 0x52, 0x65, 0x73,
++	0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x00, 0x12, 0x74, 0x0a, 0x09, 0x52, 0x65, 0x63, 0x6f, 0x6e,
++	0x63, 0x69, 0x6c, 0x65, 0x12, 0x31, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74,
++	0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e, 0x76, 0x31, 0x2e,
++	0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x52, 0x65, 0x63, 0x6f, 0x6e, 0x63, 0x69, 0x6c, 0x65,
++	0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x32, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70,
++	0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2e,
++	0x76, 0x31, 0x2e, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x52, 0x65, 0x63, 0x6f, 0x6e, 0x63,
++	0x69, 0x6c, 0x65, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x00, 0x42, 0x39, 0x5a,
++	0x37, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x64, 0x61, 0x70, 0x72,
++	0x2f, 0x64, 0x61, 0x70, 0x72, 0x2f, 0x70, 0x6b, 0x67, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2f,
++	0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x2f, 0x76, 0x31, 0x3b, 0x63, 0x6f,
++	0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x73, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
++}
++
++var (
++	file_dapr_proto_components_v1_sandbox_proto_rawDescOnce sync.Once
++	file_dapr_proto_components_v1_sandbox_proto_rawDescData = file_dapr_proto_components_v1_sandbox_proto_rawDesc
++)
++
++func file_dapr_proto_components_v1_sandbox_proto_rawDescGZIP() []byte {
++	file_dapr_proto_components_v1_sandbox_proto_rawDescOnce.Do(func() {
++		file_dapr_proto_components_v1_sandbox_proto_rawDescData = protoimpl.X.CompressGZIP(file_dapr_proto_components_v1_sandbox_proto_rawDescData)
++	})
++	return file_dapr_proto_components_v1_sandbox_proto_rawDescData
++}
++
++var file_dapr_proto_components_v1_sandbox_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
++var file_dapr_proto_components_v1_sandbox_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
++var file_dapr_proto_components_v1_sandbox_proto_goTypes = []interface{}{
++	(SandboxAcquirePath)(0),             // 0: dapr.proto.components.v1.SandboxAcquirePath
++	(*SandboxInitRequest)(nil),          // 1: dapr.proto.components.v1.SandboxInitRequest
++	(*SandboxInitResponse)(nil),         // 2: dapr.proto.components.v1.SandboxInitResponse
++	(*SandboxReadyRequest)(nil),         // 3: dapr.proto.components.v1.SandboxReadyRequest
++	(*SandboxReadyResponse)(nil),        // 4: dapr.proto.components.v1.SandboxReadyResponse
++	(*SandboxAcquireRequest)(nil),       // 5: dapr.proto.components.v1.SandboxAcquireRequest
++	(*SandboxAcquireResponse)(nil),      // 6: dapr.proto.components.v1.SandboxAcquireResponse
++	(*SandboxExecSpec)(nil),             // 7: dapr.proto.components.v1.SandboxExecSpec
++	(*SandboxExecRequest)(nil),          // 8: dapr.proto.components.v1.SandboxExecRequest
++	(*SandboxExecResponse)(nil),         // 9: dapr.proto.components.v1.SandboxExecResponse
++	(*SandboxSessionStartRequest)(nil),  // 10: dapr.proto.components.v1.SandboxSessionStartRequest
++	(*SandboxSessionStartResponse)(nil), // 11: dapr.proto.components.v1.SandboxSessionStartResponse
++	(*SandboxSessionSendRequest)(nil),   // 12: dapr.proto.components.v1.SandboxSessionSendRequest
++	(*SandboxSessionCloseRequest)(nil),  // 13: dapr.proto.components.v1.SandboxSessionCloseRequest
++	(*SandboxSessionCloseResponse)(nil), // 14: dapr.proto.components.v1.SandboxSessionCloseResponse
++	(*SandboxReleaseRequest)(nil),       // 15: dapr.proto.components.v1.SandboxReleaseRequest
++	(*SandboxReleaseResponse)(nil),      // 16: dapr.proto.components.v1.SandboxReleaseResponse
++	(*SandboxReconcileRequest)(nil),     // 17: dapr.proto.components.v1.SandboxReconcileRequest
++	(*SandboxReconcileResponse)(nil),    // 18: dapr.proto.components.v1.SandboxReconcileResponse
++	nil,                                 // 19: dapr.proto.components.v1.SandboxExecSpec.EnvEntry
++	(*MetadataRequest)(nil),             // 20: dapr.proto.components.v1.MetadataRequest
++	(*FeaturesRequest)(nil),             // 21: dapr.proto.components.v1.FeaturesRequest
++	(*PingRequest)(nil),                 // 22: dapr.proto.components.v1.PingRequest
++	(*FeaturesResponse)(nil),            // 23: dapr.proto.components.v1.FeaturesResponse
++	(*PingResponse)(nil),                // 24: dapr.proto.components.v1.PingResponse
++}
++var file_dapr_proto_components_v1_sandbox_proto_depIdxs = []int32{
++	20, // 0: dapr.proto.components.v1.SandboxInitRequest.metadata:type_name -> dapr.proto.components.v1.MetadataRequest
++	0,  // 1: dapr.proto.components.v1.SandboxAcquireResponse.path:type_name -> dapr.proto.components.v1.SandboxAcquirePath
++	19, // 2: dapr.proto.components.v1.SandboxExecSpec.env:type_name -> dapr.proto.components.v1.SandboxExecSpec.EnvEntry
++	7,  // 3: dapr.proto.components.v1.SandboxExecRequest.spec:type_name -> dapr.proto.components.v1.SandboxExecSpec
++	7,  // 4: dapr.proto.components.v1.SandboxSessionStartRequest.spec:type_name -> dapr.proto.components.v1.SandboxExecSpec
++	1,  // 5: dapr.proto.components.v1.Sandbox.Init:input_type -> dapr.proto.components.v1.SandboxInitRequest
++	21, // 6: dapr.proto.components.v1.Sandbox.Features:input_type -> dapr.proto.components.v1.FeaturesRequest
++	22, // 7: dapr.proto.components.v1.Sandbox.Ping:input_type -> dapr.proto.components.v1.PingRequest
++	3,  // 8: dapr.proto.components.v1.Sandbox.Ready:input_type -> dapr.proto.components.v1.SandboxReadyRequest
++	5,  // 9: dapr.proto.components.v1.Sandbox.Acquire:input_type -> dapr.proto.components.v1.SandboxAcquireRequest
++	8,  // 10: dapr.proto.components.v1.Sandbox.Exec:input_type -> dapr.proto.components.v1.SandboxExecRequest
++	10, // 11: dapr.proto.components.v1.Sandbox.SessionStart:input_type -> dapr.proto.components.v1.SandboxSessionStartRequest
++	12, // 12: dapr.proto.components.v1.Sandbox.SessionSend:input_type -> dapr.proto.components.v1.SandboxSessionSendRequest
++	13, // 13: dapr.proto.components.v1.Sandbox.SessionClose:input_type -> dapr.proto.components.v1.SandboxSessionCloseRequest
++	15, // 14: dapr.proto.components.v1.Sandbox.Release:input_type -> dapr.proto.components.v1.SandboxReleaseRequest
++	17, // 15: dapr.proto.components.v1.Sandbox.Reconcile:input_type -> dapr.proto.components.v1.SandboxReconcileRequest
++	2,  // 16: dapr.proto.components.v1.Sandbox.Init:output_type -> dapr.proto.components.v1.SandboxInitResponse
++	23, // 17: dapr.proto.components.v1.Sandbox.Features:output_type -> dapr.proto.components.v1.FeaturesResponse
++	24, // 18: dapr.proto.components.v1.Sandbox.Ping:output_type -> dapr.proto.components.v1.PingResponse
++	4,  // 19: dapr.proto.components.v1.Sandbox.Ready:output_type -> dapr.proto.components.v1.SandboxReadyResponse
++	6,  // 20: dapr.proto.components.v1.Sandbox.Acquire:output_type -> dapr.proto.components.v1.SandboxAcquireResponse
++	9,  // 21: dapr.proto.components.v1.Sandbox.Exec:output_type -> dapr.proto.components.v1.SandboxExecResponse
++	11, // 22: dapr.proto.components.v1.Sandbox.SessionStart:output_type -> dapr.proto.components.v1.SandboxSessionStartResponse
++	9,  // 23: dapr.proto.components.v1.Sandbox.SessionSend:output_type -> dapr.proto.components.v1.SandboxExecResponse
++	14, // 24: dapr.proto.components.v1.Sandbox.SessionClose:output_type -> dapr.proto.components.v1.SandboxSessionCloseResponse
++	16, // 25: dapr.proto.components.v1.Sandbox.Release:output_type -> dapr.proto.components.v1.SandboxReleaseResponse
++	18, // 26: dapr.proto.components.v1.Sandbox.Reconcile:output_type -> dapr.proto.components.v1.SandboxReconcileResponse
++	16, // [16:27] is the sub-list for method output_type
++	5,  // [5:16] is the sub-list for method input_type
++	5,  // [5:5] is the sub-list for extension type_name
++	5,  // [5:5] is the sub-list for extension extendee
++	0,  // [0:5] is the sub-list for field type_name
++}
++
++func init() { file_dapr_proto_components_v1_sandbox_proto_init() }
++func file_dapr_proto_components_v1_sandbox_proto_init() {
++	if File_dapr_proto_components_v1_sandbox_proto != nil {
++		return
++	}
++	file_dapr_proto_components_v1_common_proto_init()
++	if !protoimpl.UnsafeEnabled {
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[0].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxInitRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[1].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxInitResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[2].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxReadyRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[3].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxReadyResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[4].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxAcquireRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[5].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxAcquireResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[6].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxExecSpec); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[7].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxExecRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[8].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxExecResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[9].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxSessionStartRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[10].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxSessionStartResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[11].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxSessionSendRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[12].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxSessionCloseRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[13].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxSessionCloseResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[14].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxReleaseRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[15].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxReleaseResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[16].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxReconcileRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_components_v1_sandbox_proto_msgTypes[17].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxReconcileResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++	}
++	type x struct{}
++	out := protoimpl.TypeBuilder{
++		File: protoimpl.DescBuilder{
++			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
++			RawDescriptor: file_dapr_proto_components_v1_sandbox_proto_rawDesc,
++			NumEnums:      1,
++			NumMessages:   19,
++			NumExtensions: 0,
++			NumServices:   1,
++		},
++		GoTypes:           file_dapr_proto_components_v1_sandbox_proto_goTypes,
++		DependencyIndexes: file_dapr_proto_components_v1_sandbox_proto_depIdxs,
++		EnumInfos:         file_dapr_proto_components_v1_sandbox_proto_enumTypes,
++		MessageInfos:      file_dapr_proto_components_v1_sandbox_proto_msgTypes,
++	}.Build()
++	File_dapr_proto_components_v1_sandbox_proto = out.File
++	file_dapr_proto_components_v1_sandbox_proto_rawDesc = nil
++	file_dapr_proto_components_v1_sandbox_proto_goTypes = nil
++	file_dapr_proto_components_v1_sandbox_proto_depIdxs = nil
++}
+diff --git a/pkg/proto/components/v1/sandbox_grpc.pb.go b/pkg/proto/components/v1/sandbox_grpc.pb.go
+new file mode 100644
+index 000000000..5320a02ff
+--- /dev/null
++++ b/pkg/proto/components/v1/sandbox_grpc.pb.go
+@@ -0,0 +1,495 @@
++//
++//Copyright 2026 The Dapr Authors
++//Licensed under the Apache License, Version 2.0 (the "License");
++//you may not use this file except in compliance with the License.
++//You may obtain a copy of the License at
++//http://www.apache.org/licenses/LICENSE-2.0
++//Unless required by applicable law or agreed to in writing, software
++//distributed under the License is distributed on an "AS IS" BASIS,
++//WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//See the License for the specific language governing permissions and
++//limitations under the License.
++
++// Code generated by protoc-gen-go-grpc. DO NOT EDIT.
++// versions:
++// - protoc-gen-go-grpc v1.3.0
++// - protoc             v7.34.1
++// source: dapr/proto/components/v1/sandbox.proto
++
++package components
++
++import (
++	context "context"
++	grpc "google.golang.org/grpc"
++	codes "google.golang.org/grpc/codes"
++	status "google.golang.org/grpc/status"
++)
++
++// This is a compile-time assertion to ensure that this generated file
++// is compatible with the grpc package it is being compiled against.
++// Requires gRPC-Go v1.32.0 or later.
++const _ = grpc.SupportPackageIsVersion7
++
++const (
++	Sandbox_Init_FullMethodName         = "/dapr.proto.components.v1.Sandbox/Init"
++	Sandbox_Features_FullMethodName     = "/dapr.proto.components.v1.Sandbox/Features"
++	Sandbox_Ping_FullMethodName         = "/dapr.proto.components.v1.Sandbox/Ping"
++	Sandbox_Ready_FullMethodName        = "/dapr.proto.components.v1.Sandbox/Ready"
++	Sandbox_Acquire_FullMethodName      = "/dapr.proto.components.v1.Sandbox/Acquire"
++	Sandbox_Exec_FullMethodName         = "/dapr.proto.components.v1.Sandbox/Exec"
++	Sandbox_SessionStart_FullMethodName = "/dapr.proto.components.v1.Sandbox/SessionStart"
++	Sandbox_SessionSend_FullMethodName  = "/dapr.proto.components.v1.Sandbox/SessionSend"
++	Sandbox_SessionClose_FullMethodName = "/dapr.proto.components.v1.Sandbox/SessionClose"
++	Sandbox_Release_FullMethodName      = "/dapr.proto.components.v1.Sandbox/Release"
++	Sandbox_Reconcile_FullMethodName    = "/dapr.proto.components.v1.Sandbox/Reconcile"
++)
++
++// SandboxClient is the client API for Sandbox service.
++//
++// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
++type SandboxClient interface {
++	Init(ctx context.Context, in *SandboxInitRequest, opts ...grpc.CallOption) (*SandboxInitResponse, error)
++	Features(ctx context.Context, in *FeaturesRequest, opts ...grpc.CallOption) (*FeaturesResponse, error)
++	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error)
++	Ready(ctx context.Context, in *SandboxReadyRequest, opts ...grpc.CallOption) (*SandboxReadyResponse, error)
++	// RESOURCE_EXHAUSTED when full.
++	Acquire(ctx context.Context, in *SandboxAcquireRequest, opts ...grpc.CallOption) (*SandboxAcquireResponse, error)
++	// NOT_FOUND if instance unknown.
++	Exec(ctx context.Context, in *SandboxExecRequest, opts ...grpc.CallOption) (*SandboxExecResponse, error)
++	SessionStart(ctx context.Context, in *SandboxSessionStartRequest, opts ...grpc.CallOption) (*SandboxSessionStartResponse, error)
++	SessionSend(ctx context.Context, in *SandboxSessionSendRequest, opts ...grpc.CallOption) (*SandboxExecResponse, error)
++	SessionClose(ctx context.Context, in *SandboxSessionCloseRequest, opts ...grpc.CallOption) (*SandboxSessionCloseResponse, error)
++	// Returns immediately.
++	Release(ctx context.Context, in *SandboxReleaseRequest, opts ...grpc.CallOption) (*SandboxReleaseResponse, error)
++	Reconcile(ctx context.Context, in *SandboxReconcileRequest, opts ...grpc.CallOption) (*SandboxReconcileResponse, error)
++}
++
++type sandboxClient struct {
++	cc grpc.ClientConnInterface
++}
++
++func NewSandboxClient(cc grpc.ClientConnInterface) SandboxClient {
++	return &sandboxClient{cc}
++}
++
++func (c *sandboxClient) Init(ctx context.Context, in *SandboxInitRequest, opts ...grpc.CallOption) (*SandboxInitResponse, error) {
++	out := new(SandboxInitResponse)
++	err := c.cc.Invoke(ctx, Sandbox_Init_FullMethodName, in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *sandboxClient) Features(ctx context.Context, in *FeaturesRequest, opts ...grpc.CallOption) (*FeaturesResponse, error) {
++	out := new(FeaturesResponse)
++	err := c.cc.Invoke(ctx, Sandbox_Features_FullMethodName, in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *sandboxClient) Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error) {
++	out := new(PingResponse)
++	err := c.cc.Invoke(ctx, Sandbox_Ping_FullMethodName, in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *sandboxClient) Ready(ctx context.Context, in *SandboxReadyRequest, opts ...grpc.CallOption) (*SandboxReadyResponse, error) {
++	out := new(SandboxReadyResponse)
++	err := c.cc.Invoke(ctx, Sandbox_Ready_FullMethodName, in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *sandboxClient) Acquire(ctx context.Context, in *SandboxAcquireRequest, opts ...grpc.CallOption) (*SandboxAcquireResponse, error) {
++	out := new(SandboxAcquireResponse)
++	err := c.cc.Invoke(ctx, Sandbox_Acquire_FullMethodName, in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *sandboxClient) Exec(ctx context.Context, in *SandboxExecRequest, opts ...grpc.CallOption) (*SandboxExecResponse, error) {
++	out := new(SandboxExecResponse)
++	err := c.cc.Invoke(ctx, Sandbox_Exec_FullMethodName, in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *sandboxClient) SessionStart(ctx context.Context, in *SandboxSessionStartRequest, opts ...grpc.CallOption) (*SandboxSessionStartResponse, error) {
++	out := new(SandboxSessionStartResponse)
++	err := c.cc.Invoke(ctx, Sandbox_SessionStart_FullMethodName, in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *sandboxClient) SessionSend(ctx context.Context, in *SandboxSessionSendRequest, opts ...grpc.CallOption) (*SandboxExecResponse, error) {
++	out := new(SandboxExecResponse)
++	err := c.cc.Invoke(ctx, Sandbox_SessionSend_FullMethodName, in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *sandboxClient) SessionClose(ctx context.Context, in *SandboxSessionCloseRequest, opts ...grpc.CallOption) (*SandboxSessionCloseResponse, error) {
++	out := new(SandboxSessionCloseResponse)
++	err := c.cc.Invoke(ctx, Sandbox_SessionClose_FullMethodName, in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *sandboxClient) Release(ctx context.Context, in *SandboxReleaseRequest, opts ...grpc.CallOption) (*SandboxReleaseResponse, error) {
++	out := new(SandboxReleaseResponse)
++	err := c.cc.Invoke(ctx, Sandbox_Release_FullMethodName, in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *sandboxClient) Reconcile(ctx context.Context, in *SandboxReconcileRequest, opts ...grpc.CallOption) (*SandboxReconcileResponse, error) {
++	out := new(SandboxReconcileResponse)
++	err := c.cc.Invoke(ctx, Sandbox_Reconcile_FullMethodName, in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++// SandboxServer is the server API for Sandbox service.
++// All implementations should embed UnimplementedSandboxServer
++// for forward compatibility
++type SandboxServer interface {
++	Init(context.Context, *SandboxInitRequest) (*SandboxInitResponse, error)
++	Features(context.Context, *FeaturesRequest) (*FeaturesResponse, error)
++	Ping(context.Context, *PingRequest) (*PingResponse, error)
++	Ready(context.Context, *SandboxReadyRequest) (*SandboxReadyResponse, error)
++	// RESOURCE_EXHAUSTED when full.
++	Acquire(context.Context, *SandboxAcquireRequest) (*SandboxAcquireResponse, error)
++	// NOT_FOUND if instance unknown.
++	Exec(context.Context, *SandboxExecRequest) (*SandboxExecResponse, error)
++	SessionStart(context.Context, *SandboxSessionStartRequest) (*SandboxSessionStartResponse, error)
++	SessionSend(context.Context, *SandboxSessionSendRequest) (*SandboxExecResponse, error)
++	SessionClose(context.Context, *SandboxSessionCloseRequest) (*SandboxSessionCloseResponse, error)
++	// Returns immediately.
++	Release(context.Context, *SandboxReleaseRequest) (*SandboxReleaseResponse, error)
++	Reconcile(context.Context, *SandboxReconcileRequest) (*SandboxReconcileResponse, error)
++}
++
++// UnimplementedSandboxServer should be embedded to have forward compatible implementations.
++type UnimplementedSandboxServer struct {
++}
++
++func (UnimplementedSandboxServer) Init(context.Context, *SandboxInitRequest) (*SandboxInitResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method Init not implemented")
++}
++func (UnimplementedSandboxServer) Features(context.Context, *FeaturesRequest) (*FeaturesResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method Features not implemented")
++}
++func (UnimplementedSandboxServer) Ping(context.Context, *PingRequest) (*PingResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method Ping not implemented")
++}
++func (UnimplementedSandboxServer) Ready(context.Context, *SandboxReadyRequest) (*SandboxReadyResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method Ready not implemented")
++}
++func (UnimplementedSandboxServer) Acquire(context.Context, *SandboxAcquireRequest) (*SandboxAcquireResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method Acquire not implemented")
++}
++func (UnimplementedSandboxServer) Exec(context.Context, *SandboxExecRequest) (*SandboxExecResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method Exec not implemented")
++}
++func (UnimplementedSandboxServer) SessionStart(context.Context, *SandboxSessionStartRequest) (*SandboxSessionStartResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method SessionStart not implemented")
++}
++func (UnimplementedSandboxServer) SessionSend(context.Context, *SandboxSessionSendRequest) (*SandboxExecResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method SessionSend not implemented")
++}
++func (UnimplementedSandboxServer) SessionClose(context.Context, *SandboxSessionCloseRequest) (*SandboxSessionCloseResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method SessionClose not implemented")
++}
++func (UnimplementedSandboxServer) Release(context.Context, *SandboxReleaseRequest) (*SandboxReleaseResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method Release not implemented")
++}
++func (UnimplementedSandboxServer) Reconcile(context.Context, *SandboxReconcileRequest) (*SandboxReconcileResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method Reconcile not implemented")
++}
++
++// UnsafeSandboxServer may be embedded to opt out of forward compatibility for this service.
++// Use of this interface is not recommended, as added methods to SandboxServer will
++// result in compilation errors.
++type UnsafeSandboxServer interface {
++	mustEmbedUnimplementedSandboxServer()
++}
++
++func RegisterSandboxServer(s grpc.ServiceRegistrar, srv SandboxServer) {
++	s.RegisterService(&Sandbox_ServiceDesc, srv)
++}
++
++func _Sandbox_Init_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(SandboxInitRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(SandboxServer).Init(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: Sandbox_Init_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(SandboxServer).Init(ctx, req.(*SandboxInitRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _Sandbox_Features_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(FeaturesRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(SandboxServer).Features(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: Sandbox_Features_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(SandboxServer).Features(ctx, req.(*FeaturesRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _Sandbox_Ping_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(PingRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(SandboxServer).Ping(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: Sandbox_Ping_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(SandboxServer).Ping(ctx, req.(*PingRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _Sandbox_Ready_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(SandboxReadyRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(SandboxServer).Ready(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: Sandbox_Ready_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(SandboxServer).Ready(ctx, req.(*SandboxReadyRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _Sandbox_Acquire_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(SandboxAcquireRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(SandboxServer).Acquire(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: Sandbox_Acquire_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(SandboxServer).Acquire(ctx, req.(*SandboxAcquireRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _Sandbox_Exec_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(SandboxExecRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(SandboxServer).Exec(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: Sandbox_Exec_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(SandboxServer).Exec(ctx, req.(*SandboxExecRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _Sandbox_SessionStart_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(SandboxSessionStartRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(SandboxServer).SessionStart(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: Sandbox_SessionStart_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(SandboxServer).SessionStart(ctx, req.(*SandboxSessionStartRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _Sandbox_SessionSend_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(SandboxSessionSendRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(SandboxServer).SessionSend(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: Sandbox_SessionSend_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(SandboxServer).SessionSend(ctx, req.(*SandboxSessionSendRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _Sandbox_SessionClose_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(SandboxSessionCloseRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(SandboxServer).SessionClose(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: Sandbox_SessionClose_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(SandboxServer).SessionClose(ctx, req.(*SandboxSessionCloseRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _Sandbox_Release_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(SandboxReleaseRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(SandboxServer).Release(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: Sandbox_Release_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(SandboxServer).Release(ctx, req.(*SandboxReleaseRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _Sandbox_Reconcile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(SandboxReconcileRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(SandboxServer).Reconcile(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: Sandbox_Reconcile_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(SandboxServer).Reconcile(ctx, req.(*SandboxReconcileRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++// Sandbox_ServiceDesc is the grpc.ServiceDesc for Sandbox service.
++// It's only intended for direct use with grpc.RegisterService,
++// and not to be introspected or modified (even as a copy)
++var Sandbox_ServiceDesc = grpc.ServiceDesc{
++	ServiceName: "dapr.proto.components.v1.Sandbox",
++	HandlerType: (*SandboxServer)(nil),
++	Methods: []grpc.MethodDesc{
++		{
++			MethodName: "Init",
++			Handler:    _Sandbox_Init_Handler,
++		},
++		{
++			MethodName: "Features",
++			Handler:    _Sandbox_Features_Handler,
++		},
++		{
++			MethodName: "Ping",
++			Handler:    _Sandbox_Ping_Handler,
++		},
++		{
++			MethodName: "Ready",
++			Handler:    _Sandbox_Ready_Handler,
++		},
++		{
++			MethodName: "Acquire",
++			Handler:    _Sandbox_Acquire_Handler,
++		},
++		{
++			MethodName: "Exec",
++			Handler:    _Sandbox_Exec_Handler,
++		},
++		{
++			MethodName: "SessionStart",
++			Handler:    _Sandbox_SessionStart_Handler,
++		},
++		{
++			MethodName: "SessionSend",
++			Handler:    _Sandbox_SessionSend_Handler,
++		},
++		{
++			MethodName: "SessionClose",
++			Handler:    _Sandbox_SessionClose_Handler,
++		},
++		{
++			MethodName: "Release",
++			Handler:    _Sandbox_Release_Handler,
++		},
++		{
++			MethodName: "Reconcile",
++			Handler:    _Sandbox_Reconcile_Handler,
++		},
++	},
++	Streams:  []grpc.StreamDesc{},
++	Metadata: "dapr/proto/components/v1/sandbox.proto",
++}
+-- 
+2.47.0
+

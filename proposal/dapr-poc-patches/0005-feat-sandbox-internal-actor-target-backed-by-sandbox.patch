@@ -1,0 +1,2869 @@
+From e432520cf7e413b481b9e056e78fe385a8afff6c Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Wed, 28 Oct 2026 20:13:30 +0100
+Subject: [PATCH 05/12] feat(sandbox): internal actor target backed by sandbox
+ drivers
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dapr/proto/runtime/v1/sandbox.proto        |  132 +++
+ pkg/actors/targets/sandbox/factory.go      |  294 +++++
+ pkg/actors/targets/sandbox/sandbox.go      |  524 +++++++++
+ pkg/actors/targets/sandbox/sandbox_test.go |  655 +++++++++++
+ pkg/proto/runtime/v1/sandbox.pb.go         | 1211 ++++++++++++++++++++
+ 5 files changed, 2816 insertions(+)
+ create mode 100644 dapr/proto/runtime/v1/sandbox.proto
+ create mode 100644 pkg/actors/targets/sandbox/factory.go
+ create mode 100644 pkg/actors/targets/sandbox/sandbox.go
+ create mode 100644 pkg/actors/targets/sandbox/sandbox_test.go
+ create mode 100644 pkg/proto/runtime/v1/sandbox.pb.go
+
+diff --git a/dapr/proto/runtime/v1/sandbox.proto b/dapr/proto/runtime/v1/sandbox.proto
+new file mode 100644
+index 000000000..3ba10af2e
+--- /dev/null
++++ b/dapr/proto/runtime/v1/sandbox.proto
+@@ -0,0 +1,132 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++syntax = "proto3";
++
++package dapr.proto.runtime.v1;
++
++option csharp_namespace = "Dapr.Client.Autogen.Grpc.v1";
++option java_outer_classname = "DaprSandboxProtos";
++option java_package = "io.dapr.v1";
++option go_package = "github.com/dapr/dapr/pkg/proto/runtime/v1;runtime";
++
++// SandboxTimingAlpha1 is a per-call latency breakdown, in microseconds.
++message SandboxTimingAlpha1 {
++  // Time from the API receiving the request to sending the response.
++  uint64 total_us = 1;
++  // Time spent inside the sandbox actor on the hosting sidecar.
++  uint64 host_us = 2;
++  // Time spent acquiring the sandbox from the driver on this call (0 when it
++  // was already acquired).
++  uint64 activate_us = 3;
++  // Time spent in the driver's exec or session send call.
++  uint64 exec_us = 4;
++  // How the driver acquired the sandbox: POOL, RESTORE or BOOT. Only set on
++  // the call that acquired it.
++  string acquire_path = 5;
++}
++
++// SandboxExecRequestAlpha1 runs a one-shot command in a sandbox.
++message SandboxExecRequestAlpha1 {
++  // Name of the sandbox component.
++  string component = 1;
++  // ID of the sandbox. The first call for an unknown ID activates it.
++  string sandbox_id = 2;
++  // App ID hosting the sandbox. Defaults to the caller's own app ID.
++  string app_id = 3;
++  // Optional activation token from an earlier response. If the sandbox was
++  // recreated since, the call fails with a "sandbox lost" error.
++  string expected_activation = 4;
++  string command = 5;
++  repeated string args = 6;
++  map<string, string> env = 7;
++  string cwd = 8;
++  bytes stdin = 9;
++  uint32 timeout_ms = 10;
++}
++
++// SandboxExecResponseAlpha1 is the result of a command or a session send.
++message SandboxExecResponseAlpha1 {
++  string sandbox_id = 1;
++  // Activation token of the sandbox that served the call.
++  string activation = 2;
++  bytes stdout = 3;
++  bytes stderr = 4;
++  int32 exit_code = 5;
++  bool truncated = 6;
++  bool timed_out = 7;
++  SandboxTimingAlpha1 timing = 8;
++}
++
++// SandboxCreateRequestAlpha1 creates a sandbox with an ID chosen by the
++// sidecar.
++message SandboxCreateRequestAlpha1 {
++  string component = 1;
++  string app_id = 2;
++}
++
++// SandboxCreateResponseAlpha1 is the response for creating a sandbox.
++message SandboxCreateResponseAlpha1 {
++  string sandbox_id = 1;
++  string activation = 2;
++  SandboxTimingAlpha1 timing = 3;
++}
++
++// SandboxDeleteRequestAlpha1 releases a sandbox.
++message SandboxDeleteRequestAlpha1 {
++  string component = 1;
++  string sandbox_id = 2;
++  string app_id = 3;
++}
++
++// SandboxSessionStartRequestAlpha1 starts a long-lived process in a sandbox.
++message SandboxSessionStartRequestAlpha1 {
++  string component = 1;
++  string sandbox_id = 2;
++  string app_id = 3;
++  string expected_activation = 4;
++  string command = 5;
++  repeated string args = 6;
++  map<string, string> env = 7;
++  string cwd = 8;
++}
++
++// SandboxSessionStartResponseAlpha1 is the response for starting a session.
++message SandboxSessionStartResponseAlpha1 {
++  string session_id = 1;
++  string activation = 2;
++}
++
++// SandboxSessionSendRequestAlpha1 writes input to a session and reads its
++// output until the `until` marker or the timeout. The response is a
++// SandboxExecResponseAlpha1.
++message SandboxSessionSendRequestAlpha1 {
++  string component = 1;
++  string sandbox_id = 2;
++  string app_id = 3;
++  string expected_activation = 4;
++  string session_id = 5;
++  bytes input = 6;
++  bytes until = 7;
++  uint32 timeout_ms = 8;
++}
++
++// SandboxSessionCloseRequestAlpha1 closes a session.
++message SandboxSessionCloseRequestAlpha1 {
++  string component = 1;
++  string sandbox_id = 2;
++  string app_id = 3;
++  string session_id = 4;
++}
+diff --git a/pkg/actors/targets/sandbox/factory.go b/pkg/actors/targets/sandbox/factory.go
+new file mode 100644
+index 000000000..56f7f5e80
+--- /dev/null
++++ b/pkg/actors/targets/sandbox/factory.go
+@@ -0,0 +1,294 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"context"
++	"slices"
++	"sync"
++	"time"
++
++	"github.com/google/uuid"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++	"k8s.io/utils/clock"
++
++	"github.com/dapr/dapr/pkg/actors/api"
++	"github.com/dapr/dapr/pkg/actors/targets"
++	"github.com/dapr/dapr/pkg/components/sandbox"
++	compv1pb "github.com/dapr/dapr/pkg/proto/components/v1"
++	"github.com/dapr/kit/events/queue"
++)
++
++const (
++	// DefaultIdleTimeout is used when Options.IdleTimeout is not positive.
++	DefaultIdleTimeout = 5 * time.Minute
++
++	// releaseTimeout bounds each background driver Release call.
++	releaseTimeout = 10 * time.Second
++
++	// idleSlack covers the idler queue firing an item slightly before its
++	// scheduled time.
++	idleSlack = time.Millisecond
++)
++
++// Options configures the actor targets of one sandbox component.
++type Options struct {
++	// ActorType is the internal actor type, for example
++	// `dapr.internal.<namespace>.<appID>.sandbox.<component>`.
++	ActorType string
++	// Component is the name of the sandbox component.
++	Component string
++	// Driver provides the sandbox VMs.
++	Driver sandbox.Sandbox
++	// IdleTimeout is how long a sandbox may go without calls before its VM is
++	// released. Defaults to DefaultIdleTimeout.
++	IdleTimeout time.Duration
++	// Clock defaults to the real clock.
++	Clock clock.Clock
++}
++
++// Factory creates and tracks the sandbox actor targets of one sandbox
++// component. It implements targets.Factory.
++//
++// Locking: a target's turn lock may be held while taking Factory.lock, never
++// the other way round, and Factory.lock is never held while calling the
++// driver.
++type Factory struct {
++	actorType   string
++	component   string
++	driver      sandbox.Sandbox
++	idleTimeout time.Duration
++	clock       clock.Clock
++	idlerQueue  *queue.Processor[string, *target]
++
++	// lock guards table and each target's instanceID and removed fields. A
++	// target is in table exactly while its removed field is false.
++	lock  sync.RWMutex
++	table map[string]*target
++}
++
++var _ targets.Factory = (*Factory)(nil)
++
++// New returns a Factory for one sandbox component.
++func New(opts Options) *Factory {
++	if opts.Clock == nil {
++		opts.Clock = clock.RealClock{}
++	}
++	if opts.IdleTimeout <= 0 {
++		opts.IdleTimeout = DefaultIdleTimeout
++	}
++
++	f := &Factory{
++		actorType:   opts.ActorType,
++		component:   opts.Component,
++		driver:      opts.Driver,
++		idleTimeout: opts.IdleTimeout,
++		clock:       opts.Clock,
++		table:       make(map[string]*target),
++	}
++
++	f.idlerQueue = queue.NewProcessor[string, *target](queue.Options[string, *target]{
++		ExecuteFn: f.handleIdle,
++		Clock:     f.clock,
++	})
++
++	return f
++}
++
++// GetOrCreate returns the target for the sandbox ID, creating it with a new
++// activation token if there is none. It does not touch the driver: the VM is
++// acquired on the first call.
++func (f *Factory) GetOrCreate(actorID string) targets.Interface {
++	f.lock.RLock()
++	t, ok := f.table[actorID]
++	f.lock.RUnlock()
++	if ok {
++		return t
++	}
++
++	f.lock.Lock()
++	defer f.lock.Unlock()
++
++	if t, ok = f.table[actorID]; ok {
++		return t
++	}
++
++	t = &target{
++		factory:    f,
++		actorID:    actorID,
++		activation: uuid.NewString(),
++	}
++	t.idleAt.Store(new(f.clock.Now().Add(f.idleTimeout)))
++	f.table[actorID] = t
++	f.idlerQueue.Enqueue(t)
++
++	return t
++}
++
++// Exists reports whether a target for the sandbox ID is active.
++func (f *Factory) Exists(actorID string) bool {
++	f.lock.RLock()
++	defer f.lock.RUnlock()
++	_, ok := f.table[actorID]
++	return ok
++}
++
++// Len returns the number of active targets.
++func (f *Factory) Len() int {
++	f.lock.RLock()
++	defer f.lock.RUnlock()
++	return len(f.table)
++}
++
++// LiveInstanceIDs returns the driver instance IDs held by active targets, for
++// the driver's Reconcile.
++func (f *Factory) LiveInstanceIDs() []string {
++	f.lock.RLock()
++	ids := make([]string, 0, len(f.table))
++	for _, t := range f.table {
++		if t.instanceID != "" {
++			ids = append(ids, t.instanceID)
++		}
++	}
++	f.lock.RUnlock()
++
++	slices.Sort(ids)
++	return ids
++}
++
++// HaltAll removes every target and releases their VMs in the background. It
++// does not wait for the driver.
++func (f *Factory) HaltAll(context.Context) error {
++	f.haltWhere(func(string) bool { return true })
++	return nil
++}
++
++// HaltNonHosted removes the targets that fn reports as no longer hosted here
++// and releases their VMs in the background. It does not wait for the driver.
++func (f *Factory) HaltNonHosted(_ context.Context, fn func(*api.LookupActorRequest) bool) error {
++	f.haltWhere(func(actorID string) bool {
++		return !fn(&api.LookupActorRequest{
++			ActorType: f.actorType,
++			ActorID:   actorID,
++		})
++	})
++	return nil
++}
++
++func (f *Factory) haltWhere(halt func(actorID string) bool) {
++	f.lock.RLock()
++	all := make([]*target, 0, len(f.table))
++	for _, t := range f.table {
++		all = append(all, t)
++	}
++	f.lock.RUnlock()
++
++	for _, t := range all {
++		if halt(t.actorID) {
++			log.Debugf("Halting sandbox actor '%s'", t.Key())
++			f.remove(t)
++		}
++	}
++}
++
++// remove takes t out of the table and releases its VM, if it has one, in
++// the background. It is idempotent: a later call for the same sandbox ID
++// gets a new target with a new activation token.
++func (f *Factory) remove(t *target) {
++	f.lock.Lock()
++	instanceID, ok := f.removeLocked(t)
++	f.lock.Unlock()
++
++	if ok && instanceID != "" {
++		f.releaseAsync(instanceID)
++	}
++}
++
++// removeLocked must be called with f.lock held for writing. It reports
++// whether t was still in the table and returns its instance ID.
++func (f *Factory) removeLocked(t *target) (string, bool) {
++	if t.removed {
++		return "", false
++	}
++	t.removed = true
++	delete(f.table, t.actorID)
++	// While t was in the table no other target had its key, so the queued
++	// item for the key, if any, is t's.
++	f.idlerQueue.Dequeue(t.Key())
++	return t.instanceID, true
++}
++
++// handleIdle is called by the idler queue when a target's idle deadline
++// passed.
++func (f *Factory) handleIdle(t *target) {
++	f.lock.Lock()
++
++	if t.removed {
++		f.lock.Unlock()
++		return
++	}
++
++	// A call that is waiting or running keeps the sandbox: check again one
++	// idle period from now (the call also re-arms the timer when it ends).
++	if t.inflight.Load() > 0 {
++		t.touchIdleLocked()
++		f.lock.Unlock()
++		return
++	}
++
++	// A call that ended after the processor popped this item already pushed
++	// the deadline back and re-queued t. The processor may fire up to 500µs
++	// early, so a deadline that close still counts as reached.
++	if f.clock.Now().Add(idleSlack).Before(*t.idleAt.Load()) {
++		f.lock.Unlock()
++		return
++	}
++
++	log.Debugf("Sandbox actor '%s' is idle, releasing it", t.Key())
++	instanceID, ok := f.removeLocked(t)
++	f.lock.Unlock()
++
++	if ok && instanceID != "" {
++		f.releaseAsync(instanceID)
++	}
++}
++
++// releaseAsync releases a driver instance in the background. Errors are
++// logged: the driver's Reconcile cleans up anything left behind.
++func (f *Factory) releaseAsync(instanceID string) {
++	go func() {
++		ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
++		defer cancel()
++
++		_, err := f.driver.Release(ctx, &compv1pb.SandboxReleaseRequest{InstanceId: instanceID})
++		switch {
++		case err == nil:
++			log.Debugf("Released sandbox instance '%s' of component '%s'", instanceID, f.component)
++		case status.Code(err) == codes.NotFound:
++			log.Debugf("Sandbox instance '%s' of component '%s' was already gone", instanceID, f.component)
++		default:
++			log.Errorf("Failed to release sandbox instance '%s' of component '%s': %v", instanceID, f.component, err)
++		}
++	}()
++}
++
++// sinceUs returns the microseconds elapsed since start on the factory clock.
++func (f *Factory) sinceUs(start time.Time) uint64 {
++	d := f.clock.Since(start)
++	if d <= 0 {
++		return 0
++	}
++	return uint64(d.Microseconds())
++}
+diff --git a/pkg/actors/targets/sandbox/sandbox.go b/pkg/actors/targets/sandbox/sandbox.go
+new file mode 100644
+index 000000000..e89e75fc8
+--- /dev/null
++++ b/pkg/actors/targets/sandbox/sandbox.go
+@@ -0,0 +1,524 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package sandbox implements the internal actor target of the Sandbox
++// building block: each sandbox ID is an actor whose VM comes from a sandbox
++// driver.
++package sandbox
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"google.golang.org/genproto/googleapis/rpc/errdetails"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/types/known/anypb"
++
++	"github.com/dapr/dapr/pkg/actors/api"
++	targetserrors "github.com/dapr/dapr/pkg/actors/targets/errors"
++	commonv1pb "github.com/dapr/dapr/pkg/proto/common/v1"
++	compv1pb "github.com/dapr/dapr/pkg/proto/components/v1"
++	internalv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
++	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
++	"github.com/dapr/kit/logger"
++)
++
++var log = logger.NewLogger("dapr.runtime.actors.targets.sandbox")
++
++// Actor methods. Request and response data are proto-marshalled runtime
++// messages.
++const (
++	// MethodActivate acquires the VM if needed (idempotent).
++	// SandboxCreateRequestAlpha1 -> SandboxCreateResponseAlpha1.
++	MethodActivate = "activate"
++	// MethodExec runs a one-shot command.
++	// SandboxExecRequestAlpha1 -> SandboxExecResponseAlpha1.
++	MethodExec = "exec"
++	// MethodRelease releases the VM and removes the sandbox.
++	// SandboxDeleteRequestAlpha1 -> empty data.
++	MethodRelease = "release"
++	// MethodSessionStart starts a long-lived process.
++	// SandboxSessionStartRequestAlpha1 -> SandboxSessionStartResponseAlpha1.
++	MethodSessionStart = "session.start"
++	// MethodSessionSend writes to a session and reads its output.
++	// SandboxSessionSendRequestAlpha1 -> SandboxExecResponseAlpha1.
++	MethodSessionSend = "session.send"
++	// MethodSessionClose closes a session.
++	// SandboxSessionCloseRequestAlpha1 -> empty data.
++	MethodSessionClose = "session.close"
++)
++
++const (
++	// ReasonSandboxLost is the ErrorInfo reason of the "sandbox lost" error:
++	// the caller's expected activation token no longer matches, or the
++	// driver no longer knows the sandbox's VM.
++	ReasonSandboxLost = "DAPR_SANDBOX_LOST"
++	// ErrorDomain is the ErrorInfo domain of the errors of this package.
++	ErrorDomain = "dapr.io"
++)
++
++// ErrSandboxLost returns the "sandbox lost" error: FailedPrecondition with an
++// ErrorInfo detail whose reason is ReasonSandboxLost.
++func ErrSandboxLost() error {
++	st, err := status.New(codes.FailedPrecondition, "sandbox lost").WithDetails(&errdetails.ErrorInfo{
++		Reason: ReasonSandboxLost,
++		Domain: ErrorDomain,
++	})
++	if err != nil {
++		return status.Error(codes.FailedPrecondition, "sandbox lost")
++	}
++	return st.Err()
++}
++
++// IsSandboxLost reports whether err is the "sandbox lost" error.
++func IsSandboxLost(err error) bool {
++	st, ok := status.FromError(err)
++	if !ok || st.Code() != codes.FailedPrecondition {
++		return false
++	}
++	for _, d := range st.Details() {
++		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetReason() == ReasonSandboxLost {
++			return true
++		}
++	}
++	return false
++}
++
++// target is the actor for one sandbox ID.
++type target struct {
++	factory *Factory
++
++	actorID    string
++	activation string
++
++	// idleAt is when the target becomes idle; it is pushed back at the start
++	// and the end of every call.
++	idleAt atomic.Pointer[time.Time]
++	// inflight counts calls that entered InvokeMethod and have not returned.
++	// It is only incremented while holding factory.lock for reading, so
++	// holding it for writing gives a stable value.
++	inflight atomic.Int32
++
++	// lock makes calls turn-based: every InvokeMethod holds it for the whole
++	// call.
++	lock sync.Mutex
++
++	// instanceID is the driver instance, or "" before it was acquired. It is
++	// written while holding both lock and factory.lock; reading it requires
++	// either.
++	instanceID string
++	// removed is set once the target left the table. Guarded by
++	// factory.lock.
++	removed bool
++}
++
++// InvokeMethod runs one sandbox operation. The VM is acquired on the first
++// call that needs it.
++func (t *target) InvokeMethod(ctx context.Context, req *internalv1pb.InternalInvokeRequest) (*internalv1pb.InternalInvokeResponse, error) {
++	start := t.factory.clock.Now()
++	method := req.GetMessage().GetMethod()
++
++	if !t.enter() {
++		return nil, targetserrors.NewClosed(method)
++	}
++	defer t.exit()
++
++	t.lock.Lock()
++	defer t.lock.Unlock()
++
++	// The target may have been removed while this call waited for its turn.
++	// The router then retries on a new target.
++	if t.isRemoved() {
++		return nil, targetserrors.NewClosed(method)
++	}
++
++	data := req.GetMessage().GetData().GetValue()
++
++	var (
++		res proto.Message
++		err error
++	)
++	switch method {
++	case MethodActivate:
++		res, err = t.activate(ctx, data, start)
++	case MethodExec:
++		res, err = t.exec(ctx, data, start)
++	case MethodRelease:
++		err = t.release(data)
++	case MethodSessionStart:
++		res, err = t.sessionStart(ctx, data)
++	case MethodSessionSend:
++		res, err = t.sessionSend(ctx, data, start)
++	case MethodSessionClose:
++		err = t.sessionClose(ctx, data)
++	default:
++		return nil, status.Errorf(codes.InvalidArgument, "unknown sandbox actor method %q", method)
++	}
++	if err != nil {
++		return nil, err
++	}
++
++	return newResponse(res)
++}
++
++func (t *target) activate(ctx context.Context, data []byte, start time.Time) (proto.Message, error) {
++	var req runtimev1pb.SandboxCreateRequestAlpha1
++	if err := unmarshal(MethodActivate, data, &req); err != nil {
++		return nil, err
++	}
++
++	timing := new(runtimev1pb.SandboxTimingAlpha1)
++	if _, err := t.acquire(ctx, timing); err != nil {
++		return nil, err
++	}
++
++	timing.HostUs = t.factory.sinceUs(start)
++	return &runtimev1pb.SandboxCreateResponseAlpha1{
++		SandboxId:  t.actorID,
++		Activation: t.activation,
++		Timing:     timing,
++	}, nil
++}
++
++func (t *target) exec(ctx context.Context, data []byte, start time.Time) (proto.Message, error) {
++	var req runtimev1pb.SandboxExecRequestAlpha1
++	if err := unmarshal(MethodExec, data, &req); err != nil {
++		return nil, err
++	}
++	if err := t.checkActivation(req.GetExpectedActivation()); err != nil {
++		return nil, err
++	}
++
++	timing := new(runtimev1pb.SandboxTimingAlpha1)
++	instanceID, err := t.acquire(ctx, timing)
++	if err != nil {
++		return nil, err
++	}
++
++	execStart := t.factory.clock.Now()
++	res, err := t.factory.driver.Exec(ctx, &compv1pb.SandboxExecRequest{
++		InstanceId: instanceID,
++		Spec: &compv1pb.SandboxExecSpec{
++			Command:   req.GetCommand(),
++			Args:      req.GetArgs(),
++			Env:       req.GetEnv(),
++			Cwd:       req.GetCwd(),
++			Stdin:     req.GetStdin(),
++			TimeoutMs: req.GetTimeoutMs(),
++		},
++	})
++	timing.ExecUs = t.factory.sinceUs(execStart)
++	if err != nil {
++		return nil, t.instanceErr("exec", err)
++	}
++
++	return t.execResponse(res, timing, start), nil
++}
++
++func (t *target) release(data []byte) error {
++	var req runtimev1pb.SandboxDeleteRequestAlpha1
++	if err := unmarshal(MethodRelease, data, &req); err != nil {
++		return err
++	}
++
++	t.factory.remove(t)
++	return nil
++}
++
++func (t *target) sessionStart(ctx context.Context, data []byte) (proto.Message, error) {
++	var req runtimev1pb.SandboxSessionStartRequestAlpha1
++	if err := unmarshal(MethodSessionStart, data, &req); err != nil {
++		return nil, err
++	}
++	if err := t.checkActivation(req.GetExpectedActivation()); err != nil {
++		return nil, err
++	}
++
++	instanceID, err := t.acquire(ctx, new(runtimev1pb.SandboxTimingAlpha1))
++	if err != nil {
++		return nil, err
++	}
++
++	res, err := t.factory.driver.SessionStart(ctx, &compv1pb.SandboxSessionStartRequest{
++		InstanceId: instanceID,
++		Spec: &compv1pb.SandboxExecSpec{
++			Command: req.GetCommand(),
++			Args:    req.GetArgs(),
++			Env:     req.GetEnv(),
++			Cwd:     req.GetCwd(),
++		},
++	})
++	if err != nil {
++		return nil, t.instanceErr("session start", err)
++	}
++
++	return &runtimev1pb.SandboxSessionStartResponseAlpha1{
++		SessionId:  res.GetSessionId(),
++		Activation: t.activation,
++	}, nil
++}
++
++func (t *target) sessionSend(ctx context.Context, data []byte, start time.Time) (proto.Message, error) {
++	var req runtimev1pb.SandboxSessionSendRequestAlpha1
++	if err := unmarshal(MethodSessionSend, data, &req); err != nil {
++		return nil, err
++	}
++	if err := t.checkActivation(req.GetExpectedActivation()); err != nil {
++		return nil, err
++	}
++	// A sandbox without a VM has no sessions: don't acquire one just to fail.
++	if t.instanceID == "" {
++		return nil, unknownSession(req.GetSessionId())
++	}
++
++	timing := new(runtimev1pb.SandboxTimingAlpha1)
++	execStart := t.factory.clock.Now()
++	res, err := t.factory.driver.SessionSend(ctx, &compv1pb.SandboxSessionSendRequest{
++		InstanceId: t.instanceID,
++		SessionId:  req.GetSessionId(),
++		Input:      req.GetInput(),
++		Until:      req.GetUntil(),
++		TimeoutMs:  req.GetTimeoutMs(),
++	})
++	timing.ExecUs = t.factory.sinceUs(execStart)
++	if err != nil {
++		// NotFound here can mean an unknown session, so it is not treated as
++		// a lost sandbox.
++		return nil, driverErr("session send", err)
++	}
++
++	return t.execResponse(res, timing, start), nil
++}
++
++func (t *target) sessionClose(ctx context.Context, data []byte) error {
++	var req runtimev1pb.SandboxSessionCloseRequestAlpha1
++	if err := unmarshal(MethodSessionClose, data, &req); err != nil {
++		return err
++	}
++	if t.instanceID == "" {
++		return unknownSession(req.GetSessionId())
++	}
++
++	_, err := t.factory.driver.SessionClose(ctx, &compv1pb.SandboxSessionCloseRequest{
++		InstanceId: t.instanceID,
++		SessionId:  req.GetSessionId(),
++	})
++	if err != nil {
++		return driverErr("session close", err)
++	}
++	return nil
++}
++
++func (t *target) execResponse(res *compv1pb.SandboxExecResponse, timing *runtimev1pb.SandboxTimingAlpha1, start time.Time) *runtimev1pb.SandboxExecResponseAlpha1 {
++	timing.HostUs = t.factory.sinceUs(start)
++	return &runtimev1pb.SandboxExecResponseAlpha1{
++		SandboxId:  t.actorID,
++		Activation: t.activation,
++		Stdout:     res.GetStdout(),
++		Stderr:     res.GetStderr(),
++		ExitCode:   res.GetExitCode(),
++		Truncated:  res.GetTruncated(),
++		TimedOut:   res.GetTimedOut(),
++		Timing:     timing,
++	}
++}
++
++// checkActivation returns the "sandbox lost" error if the caller expects a
++// different activation than this one. Must be called with t.lock held.
++func (t *target) checkActivation(expected string) error {
++	if expected == "" || expected == t.activation {
++		return nil
++	}
++	// A target without a VM exists only because of this call, so drop it.
++	// One with a VM is a newer activation that other callers may be using.
++	if t.instanceID == "" {
++		t.factory.remove(t)
++	}
++	return ErrSandboxLost()
++}
++
++// acquire returns the target's driver instance, acquiring it on first use
++// and recording the activation time and path in timing. On a driver error
++// the target is removed: it holds no VM, and a later call starts over with a
++// new activation. Must be called with t.lock held.
++func (t *target) acquire(ctx context.Context, timing *runtimev1pb.SandboxTimingAlpha1) (string, error) {
++	if t.instanceID != "" {
++		return t.instanceID, nil
++	}
++
++	f := t.factory
++	start := f.clock.Now()
++	res, err := f.driver.Acquire(ctx, &compv1pb.SandboxAcquireRequest{
++		SandboxId:    t.actorID,
++		ActivationId: t.activation,
++	})
++	activateUs := f.sinceUs(start)
++	if err == nil && res.GetInstanceId() == "" {
++		err = status.Error(codes.Internal, "sandbox driver returned no instance ID")
++	}
++	if err != nil {
++		f.remove(t)
++		return "", driverErr("acquire", err)
++	}
++
++	f.lock.Lock()
++	if t.removed {
++		// Halted or idle while acquiring: hand the VM straight back and let
++		// the router retry on a new target. No command ran yet.
++		f.lock.Unlock()
++		f.releaseAsync(res.GetInstanceId())
++		return "", targetserrors.NewClosed("acquire")
++	}
++	t.instanceID = res.GetInstanceId()
++	f.lock.Unlock()
++
++	timing.ActivateUs = activateUs
++	if path := res.GetPath(); path != compv1pb.SandboxAcquirePath_SANDBOX_ACQUIRE_PATH_UNSPECIFIED {
++		timing.AcquirePath = path.String()
++	}
++	return t.instanceID, nil
++}
++
++// instanceErr maps a driver error for a call on the instance itself: NotFound
++// means the VM is gone, so the sandbox is lost and the target is removed.
++func (t *target) instanceErr(op string, err error) error {
++	if status.Code(err) == codes.NotFound {
++		log.Debugf("Sandbox actor '%s' lost its instance: %v", t.Key(), err)
++		t.factory.remove(t)
++		return ErrSandboxLost()
++	}
++	return driverErr(op, err)
++}
++
++// enter registers a call and pushes back the idle deadline. It returns false
++// if the target was already removed.
++func (t *target) enter() bool {
++	t.factory.lock.RLock()
++	defer t.factory.lock.RUnlock()
++
++	if t.removed {
++		return false
++	}
++	t.inflight.Add(1)
++	t.touchIdleLocked()
++	return true
++}
++
++// exit ends a call and restarts the idle period.
++func (t *target) exit() {
++	t.factory.lock.RLock()
++	defer t.factory.lock.RUnlock()
++
++	t.inflight.Add(-1)
++	if !t.removed {
++		t.touchIdleLocked()
++	}
++}
++
++// touchIdleLocked must be called with factory.lock held and t not removed.
++func (t *target) touchIdleLocked() {
++	t.idleAt.Store(new(t.factory.clock.Now().Add(t.factory.idleTimeout)))
++	t.factory.idlerQueue.Enqueue(t)
++}
++
++func (t *target) isRemoved() bool {
++	t.factory.lock.RLock()
++	defer t.factory.lock.RUnlock()
++	return t.removed
++}
++
++func (t *target) InvokeReminder(context.Context, *api.Reminder) error {
++	return status.Error(codes.Unimplemented, "sandbox actors do not support reminders")
++}
++
++func (t *target) InvokeTimer(context.Context, *api.Reminder) error {
++	return status.Error(codes.Unimplemented, "sandbox actors do not support timers")
++}
++
++func (t *target) InvokeStream(context.Context, *internalv1pb.InternalInvokeRequest, func(*internalv1pb.InternalInvokeResponse) (bool, error)) error {
++	return status.Error(codes.Unimplemented, "sandbox actors do not support streams")
++}
++
++// Deactivate removes the target and releases its VM in the background. It
++// does not wait for the driver or for a running call.
++func (t *target) Deactivate(context.Context) error {
++	t.factory.remove(t)
++	return nil
++}
++
++// Key returns the key for this unique actor.
++func (t *target) Key() string {
++	return t.factory.actorType + api.DaprSeparator + t.actorID
++}
++
++// Type returns the actor type.
++func (t *target) Type() string {
++	return t.factory.actorType
++}
++
++// ID returns the sandbox ID.
++func (t *target) ID() string {
++	return t.actorID
++}
++
++// ScheduledTime returns when the target becomes idle, for the idler queue.
++func (t *target) ScheduledTime() time.Time {
++	return *t.idleAt.Load()
++}
++
++func newResponse(msg proto.Message) (*internalv1pb.InternalInvokeResponse, error) {
++	var data []byte
++	if msg != nil {
++		var err error
++		data, err = proto.Marshal(msg)
++		if err != nil {
++			return nil, status.Errorf(codes.Internal, "failed to marshal sandbox response: %v", err)
++		}
++	}
++
++	return &internalv1pb.InternalInvokeResponse{
++		Status: &internalv1pb.Status{Code: int32(codes.OK)},
++		Message: &commonv1pb.InvokeResponse{
++			Data:        &anypb.Any{Value: data},
++			ContentType: internalv1pb.ProtobufContentType,
++		},
++	}, nil
++}
++
++func unmarshal(method string, data []byte, msg proto.Message) error {
++	if err := proto.Unmarshal(data, msg); err != nil {
++		return status.Errorf(codes.InvalidArgument, "invalid %s request: %v", method, err)
++	}
++	return nil
++}
++
++func unknownSession(id string) error {
++	return status.Errorf(codes.NotFound, "unknown session %q", id)
++}
++
++// driverErr keeps gRPC status errors from the driver and turns anything else
++// into one.
++func driverErr(op string, err error) error {
++	if _, ok := status.FromError(err); ok {
++		return err
++	}
++	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
++		return status.FromContextError(err).Err()
++	}
++	return status.Errorf(codes.Internal, "sandbox %s: %v", op, err)
++}
+diff --git a/pkg/actors/targets/sandbox/sandbox_test.go b/pkg/actors/targets/sandbox/sandbox_test.go
+new file mode 100644
+index 000000000..55fadf111
+--- /dev/null
++++ b/pkg/actors/targets/sandbox/sandbox_test.go
+@@ -0,0 +1,655 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"context"
++	"strconv"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/genproto/googleapis/rpc/errdetails"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++	"google.golang.org/protobuf/proto"
++	clocktesting "k8s.io/utils/clock/testing"
++
++	"github.com/dapr/components-contrib/metadata"
++	"github.com/dapr/dapr/pkg/actors/api"
++	"github.com/dapr/dapr/pkg/actors/targets"
++	targetserrors "github.com/dapr/dapr/pkg/actors/targets/errors"
++	"github.com/dapr/dapr/pkg/components/sandbox"
++	compv1pb "github.com/dapr/dapr/pkg/proto/components/v1"
++	internalv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
++	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
++)
++
++const testActorType = "dapr.internal.default.app.sandbox.mysandbox"
++
++var _ targets.Factory = (*Factory)(nil)
++
++// fakeDriver is a deterministic sandbox.Sandbox that counts calls and can be
++// told to delay or fail.
++type fakeDriver struct {
++	acquireCount atomic.Int32
++	execCount    atomic.Int32
++	releaseCount atomic.Int32
++	// releaseStarted counts Release calls, including ones still blocked.
++	releaseStarted atomic.Int32
++
++	acquireDelay time.Duration
++	execDelay    time.Duration
++	acquireErr   error
++	execErr      error
++	// releaseBlock, when set, makes Release wait until it is closed (or the
++	// context is done).
++	releaseBlock chan struct{}
++	// execStarted and execBlock, when set, make Exec signal that it started
++	// and wait until execBlock is closed.
++	execStarted chan struct{}
++	execBlock   chan struct{}
++
++	nextID atomic.Int32
++
++	lock     sync.Mutex
++	released []string
++	execs    []*compv1pb.SandboxExecRequest
++	sends    []*compv1pb.SandboxSessionSendRequest
++	starts   []*compv1pb.SandboxSessionStartRequest
++	closes   []*compv1pb.SandboxSessionCloseRequest
++}
++
++var _ sandbox.Sandbox = (*fakeDriver)(nil)
++
++func (d *fakeDriver) Init(context.Context, metadata.Base) error { return nil }
++func (d *fakeDriver) Close() error                              { return nil }
++
++func (d *fakeDriver) Ready(context.Context, *compv1pb.SandboxReadyRequest) (*compv1pb.SandboxReadyResponse, error) {
++	return &compv1pb.SandboxReadyResponse{Ready: true}, nil
++}
++
++func (d *fakeDriver) Acquire(ctx context.Context, req *compv1pb.SandboxAcquireRequest) (*compv1pb.SandboxAcquireResponse, error) {
++	d.acquireCount.Add(1)
++	if d.acquireDelay > 0 {
++		time.Sleep(d.acquireDelay)
++	}
++	if d.acquireErr != nil {
++		return nil, d.acquireErr
++	}
++	return &compv1pb.SandboxAcquireResponse{
++		InstanceId: "inst-" + strconv.Itoa(int(d.nextID.Add(1))),
++		Path:       compv1pb.SandboxAcquirePath_POOL,
++	}, nil
++}
++
++func (d *fakeDriver) Exec(ctx context.Context, req *compv1pb.SandboxExecRequest) (*compv1pb.SandboxExecResponse, error) {
++	d.execCount.Add(1)
++	d.lock.Lock()
++	d.execs = append(d.execs, req)
++	d.lock.Unlock()
++	if d.execStarted != nil {
++		d.execStarted <- struct{}{}
++	}
++	if d.execBlock != nil {
++		<-d.execBlock
++	}
++	if d.execDelay > 0 {
++		time.Sleep(d.execDelay)
++	}
++	if d.execErr != nil {
++		return nil, d.execErr
++	}
++	return &compv1pb.SandboxExecResponse{
++		Stdout:   []byte("out:" + req.GetSpec().GetCommand()),
++		Stderr:   []byte("err"),
++		ExitCode: 3,
++	}, nil
++}
++
++func (d *fakeDriver) SessionStart(ctx context.Context, req *compv1pb.SandboxSessionStartRequest) (*compv1pb.SandboxSessionStartResponse, error) {
++	d.lock.Lock()
++	d.starts = append(d.starts, req)
++	d.lock.Unlock()
++	return &compv1pb.SandboxSessionStartResponse{SessionId: "sess-1"}, nil
++}
++
++func (d *fakeDriver) SessionSend(ctx context.Context, req *compv1pb.SandboxSessionSendRequest) (*compv1pb.SandboxExecResponse, error) {
++	d.lock.Lock()
++	d.sends = append(d.sends, req)
++	d.lock.Unlock()
++	if d.execDelay > 0 {
++		time.Sleep(d.execDelay)
++	}
++	return &compv1pb.SandboxExecResponse{Stdout: append([]byte("echo:"), req.GetInput()...), TimedOut: true}, nil
++}
++
++func (d *fakeDriver) SessionClose(ctx context.Context, req *compv1pb.SandboxSessionCloseRequest) (*compv1pb.SandboxSessionCloseResponse, error) {
++	d.lock.Lock()
++	d.closes = append(d.closes, req)
++	d.lock.Unlock()
++	return &compv1pb.SandboxSessionCloseResponse{}, nil
++}
++
++func (d *fakeDriver) Release(ctx context.Context, req *compv1pb.SandboxReleaseRequest) (*compv1pb.SandboxReleaseResponse, error) {
++	d.releaseStarted.Add(1)
++	if d.releaseBlock != nil {
++		select {
++		case <-d.releaseBlock:
++		case <-ctx.Done():
++		}
++	}
++	d.lock.Lock()
++	d.released = append(d.released, req.GetInstanceId())
++	d.lock.Unlock()
++	d.releaseCount.Add(1)
++	return &compv1pb.SandboxReleaseResponse{}, nil
++}
++
++func (d *fakeDriver) Reconcile(context.Context, *compv1pb.SandboxReconcileRequest) (*compv1pb.SandboxReconcileResponse, error) {
++	return &compv1pb.SandboxReconcileResponse{}, nil
++}
++
++func (d *fakeDriver) releasedIDs() []string {
++	d.lock.Lock()
++	defer d.lock.Unlock()
++	return append([]string(nil), d.released...)
++}
++
++func newFactory(t *testing.T, d *fakeDriver, opts ...func(*Options)) *Factory {
++	t.Helper()
++	o := Options{
++		ActorType:   testActorType,
++		Component:   "mysandbox",
++		Driver:      d,
++		IdleTimeout: 5 * time.Minute,
++	}
++	for _, fn := range opts {
++		fn(&o)
++	}
++	f := New(o)
++	t.Cleanup(func() {
++		require.NoError(t, f.HaltAll(context.Background()))
++	})
++	return f
++}
++
++func invoke(t *testing.T, f *Factory, id, method string, in proto.Message) (*internalv1pb.InternalInvokeResponse, error) {
++	t.Helper()
++	var data []byte
++	if in != nil {
++		var err error
++		data, err = proto.Marshal(in)
++		require.NoError(t, err)
++	}
++	req := internalv1pb.NewInternalInvokeRequest(method).
++		WithActor(testActorType, id).
++		WithData(data).
++		WithContentType(internalv1pb.ProtobufContentType)
++	return f.GetOrCreate(id).InvokeMethod(t.Context(), req)
++}
++
++func execOK(t *testing.T, f *Factory, id string, in *runtimev1pb.SandboxExecRequestAlpha1) *runtimev1pb.SandboxExecResponseAlpha1 {
++	t.Helper()
++	res, err := invoke(t, f, id, MethodExec, in)
++	require.NoError(t, err)
++	var out runtimev1pb.SandboxExecResponseAlpha1
++	require.NoError(t, proto.Unmarshal(res.GetMessage().GetData().GetValue(), &out))
++	return &out
++}
++
++func requireLost(t *testing.T, err error) {
++	t.Helper()
++	require.Error(t, err)
++	s, ok := status.FromError(err)
++	require.True(t, ok, "expected a gRPC status, got %v", err)
++	assert.Equal(t, codes.FailedPrecondition, s.Code())
++	var found bool
++	for _, d := range s.Details() {
++		if info, ok := d.(*errdetails.ErrorInfo); ok {
++			assert.Equal(t, ReasonSandboxLost, info.GetReason())
++			assert.Equal(t, ErrorDomain, info.GetDomain())
++			found = true
++		}
++	}
++	assert.True(t, found, "expected an ErrorInfo detail")
++	assert.True(t, IsSandboxLost(err))
++}
++
++// stepUntil keeps stepping the fake clock until cond holds. The idler queue
++// reads Now before it arms a timer, so a Step landing in between arms the
++// timer late by that step; checks that something does happen therefore keep
++// stepping, while checks that nothing happens yet use a single Step.
++func stepUntil(t *testing.T, clock *clocktesting.FakeClock, cond func() bool) {
++	t.Helper()
++	assert.Eventually(t, func() bool {
++		if cond() {
++			return true
++		}
++		clock.Step(10 * time.Second)
++		return false
++	}, 5*time.Second, 10*time.Millisecond)
++}
++
++func TestFirstCallAcquiresOnce(t *testing.T) {
++	d := &fakeDriver{acquireDelay: 50 * time.Millisecond}
++	f := newFactory(t, d)
++
++	var wg sync.WaitGroup
++	results := make([]*runtimev1pb.SandboxExecResponseAlpha1, 2)
++	for i := range results {
++		wg.Go(func() {
++			results[i] = execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++		})
++	}
++	wg.Wait()
++
++	assert.Equal(t, int32(1), d.acquireCount.Load())
++	assert.Equal(t, int32(2), d.execCount.Load())
++	require.NotEmpty(t, results[0].GetActivation())
++	assert.Equal(t, results[0].GetActivation(), results[1].GetActivation())
++	assert.Equal(t, "sb1", results[0].GetSandboxId())
++	assert.Equal(t, []byte("out:ls"), results[0].GetStdout())
++	assert.Equal(t, int32(3), results[0].GetExitCode())
++	assert.Equal(t, []string{"inst-1"}, f.LiveInstanceIDs())
++}
++
++func TestExpectedActivationMismatch(t *testing.T) {
++	d := &fakeDriver{}
++	f := newFactory(t, d)
++
++	_, err := invoke(t, f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{
++		Command:            "ls",
++		ExpectedActivation: "stale-token",
++	})
++	requireLost(t, err)
++	assert.Equal(t, int32(0), d.acquireCount.Load())
++	assert.Equal(t, int32(0), d.execCount.Load())
++	assert.False(t, f.Exists("sb1"))
++
++	t.Run("live sandbox is kept for other callers", func(t *testing.T) {
++		res := execOK(t, f, "sb2", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++
++		_, err := invoke(t, f, "sb2", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{
++			Command:            "ls",
++			ExpectedActivation: "stale-token",
++		})
++		requireLost(t, err)
++		assert.True(t, f.Exists("sb2"))
++		assert.Equal(t, int32(0), d.releaseCount.Load())
++
++		again := execOK(t, f, "sb2", &runtimev1pb.SandboxExecRequestAlpha1{
++			Command:            "ls",
++			ExpectedActivation: res.GetActivation(),
++		})
++		assert.Equal(t, res.GetActivation(), again.GetActivation())
++		assert.Equal(t, int32(1), d.acquireCount.Load())
++	})
++}
++
++func TestHostFullRemovesTarget(t *testing.T) {
++	d := &fakeDriver{acquireErr: status.Error(codes.ResourceExhausted, "host is full")}
++	f := newFactory(t, d)
++
++	_, err := invoke(t, f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++	require.Error(t, err)
++	assert.Equal(t, codes.ResourceExhausted, status.Code(err))
++	assert.False(t, f.Exists("sb1"))
++	assert.Equal(t, 0, f.Len())
++	assert.Empty(t, f.LiveInstanceIDs())
++
++	_, err = invoke(t, f, "sb1", MethodActivate, &runtimev1pb.SandboxCreateRequestAlpha1{})
++	assert.Equal(t, codes.ResourceExhausted, status.Code(err))
++	assert.False(t, f.Exists("sb1"))
++}
++
++func TestDriverNotFoundIsLost(t *testing.T) {
++	d := &fakeDriver{execErr: status.Error(codes.NotFound, "unknown instance")}
++	f := newFactory(t, d)
++
++	first := f.GetOrCreate("sb1")
++	_, err := invoke(t, f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++	requireLost(t, err)
++	assert.False(t, f.Exists("sb1"))
++	assert.Eventually(t, func() bool { return d.releaseCount.Load() == 1 }, 5*time.Second, 10*time.Millisecond)
++
++	// A later call gets a new target with a new activation token.
++	d.execErr = nil
++	assert.NotSame(t, first, f.GetOrCreate("sb1"))
++	res := execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++	assert.Equal(t, int32(2), d.acquireCount.Load())
++	assert.NotEqual(t, first.(*target).activation, res.GetActivation())
++}
++
++func TestDeactivateDoesNotBlock(t *testing.T) {
++	block := make(chan struct{})
++	t.Cleanup(func() { close(block) })
++	d := &fakeDriver{releaseBlock: block}
++	f := newFactory(t, d)
++
++	execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++	execOK(t, f, "sb2", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++	execOK(t, f, "sb3", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++
++	start := time.Now()
++	require.NoError(t, f.GetOrCreate("sb1").Deactivate(t.Context()))
++	assert.Less(t, time.Since(start), 50*time.Millisecond)
++	assert.False(t, f.Exists("sb1"))
++
++	// Creating a new target is not blocked by the pending release.
++	start = time.Now()
++	f.GetOrCreate("sb1")
++	assert.Less(t, time.Since(start), 50*time.Millisecond)
++
++	start = time.Now()
++	require.NoError(t, f.HaltNonHosted(t.Context(), func(req *api.LookupActorRequest) bool {
++		assert.Equal(t, testActorType, req.ActorType)
++		return req.ActorID != "sb2"
++	}))
++	assert.Less(t, time.Since(start), 50*time.Millisecond)
++	assert.False(t, f.Exists("sb2"))
++	assert.True(t, f.Exists("sb3"))
++
++	start = time.Now()
++	require.NoError(t, f.HaltAll(t.Context()))
++	assert.Less(t, time.Since(start), 50*time.Millisecond)
++	assert.Equal(t, 0, f.Len())
++	assert.Empty(t, f.LiveInstanceIDs())
++
++	// The three VMs are being released in the background (the recreated sb1
++	// never acquired one), and none of the calls above waited for that.
++	assert.Eventually(t, func() bool { return d.releaseStarted.Load() == 3 }, 5*time.Second, 10*time.Millisecond)
++	assert.Equal(t, int32(0), d.releaseCount.Load())
++}
++
++func TestIdleExpiry(t *testing.T) {
++	clock := clocktesting.NewFakeClock(time.Now())
++	d := &fakeDriver{}
++	f := newFactory(t, d, func(o *Options) { o.Clock = clock })
++
++	execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++	assert.Equal(t, []string{"inst-1"}, f.LiveInstanceIDs())
++
++	assert.Eventually(t, clock.HasWaiters, 5*time.Second, 10*time.Millisecond)
++	clock.Step(4 * time.Minute)
++	assert.Never(t, func() bool { return d.releaseCount.Load() > 0 }, 100*time.Millisecond, 10*time.Millisecond)
++	assert.True(t, f.Exists("sb1"))
++
++	clock.Step(time.Minute)
++	stepUntil(t, clock, func() bool { return d.releaseCount.Load() == 1 })
++	assert.Empty(t, f.LiveInstanceIDs())
++	assert.False(t, f.Exists("sb1"))
++	assert.Equal(t, []string{"inst-1"}, d.releasedIDs())
++
++	// Nothing else is released later.
++	clock.Step(10 * time.Minute)
++	assert.Never(t, func() bool { return d.releaseCount.Load() > 1 }, 100*time.Millisecond, 10*time.Millisecond)
++}
++
++func TestIdleExpiryResetByCalls(t *testing.T) {
++	clock := clocktesting.NewFakeClock(time.Now())
++	d := &fakeDriver{}
++	f := newFactory(t, d, func(o *Options) { o.Clock = clock })
++
++	execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++	assert.Eventually(t, clock.HasWaiters, 5*time.Second, 10*time.Millisecond)
++	clock.Step(4 * time.Minute)
++	execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++
++	// Without the reset the first deadline (5m) would have passed here.
++	clock.Step(4 * time.Minute)
++	assert.Never(t, func() bool { return d.releaseCount.Load() > 0 }, 100*time.Millisecond, 10*time.Millisecond)
++	assert.True(t, f.Exists("sb1"))
++
++	clock.Step(time.Minute)
++	stepUntil(t, clock, func() bool { return d.releaseCount.Load() == 1 })
++	assert.False(t, f.Exists("sb1"))
++}
++
++func TestIdleWhileCallRunning(t *testing.T) {
++	clock := clocktesting.NewFakeClock(time.Now())
++	d := &fakeDriver{execStarted: make(chan struct{}, 1), execBlock: make(chan struct{})}
++	f := newFactory(t, d, func(o *Options) { o.Clock = clock })
++
++	done := make(chan *runtimev1pb.SandboxExecResponseAlpha1)
++	go func() {
++		done <- execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "sleep"})
++	}()
++	<-d.execStarted
++
++	// The idle deadline passes while the call runs: the sandbox is kept.
++	assert.Eventually(t, clock.HasWaiters, 5*time.Second, 10*time.Millisecond)
++	clock.Step(6 * time.Minute)
++	assert.Never(t, func() bool { return d.releaseCount.Load() > 0 }, 100*time.Millisecond, 10*time.Millisecond)
++	assert.True(t, f.Exists("sb1"))
++
++	close(d.execBlock)
++	res := <-done
++	assert.NotEmpty(t, res.GetActivation())
++
++	// The idle period restarts when the call ends.
++	clock.Step(4 * time.Minute)
++	assert.Never(t, func() bool { return d.releaseCount.Load() > 0 }, 100*time.Millisecond, 10*time.Millisecond)
++	clock.Step(time.Minute)
++	stepUntil(t, clock, func() bool { return d.releaseCount.Load() == 1 })
++	assert.False(t, f.Exists("sb1"))
++}
++
++func TestIdleExpiryRealClock(t *testing.T) {
++	d := &fakeDriver{}
++	f := newFactory(t, d, func(o *Options) { o.IdleTimeout = 50 * time.Millisecond })
++
++	execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++	f.GetOrCreate("never-called")
++	assert.Eventually(t, func() bool { return f.Len() == 0 }, 5*time.Second, 5*time.Millisecond)
++	assert.Eventually(t, func() bool { return d.releaseCount.Load() == 1 }, 5*time.Second, 5*time.Millisecond)
++	assert.Empty(t, f.LiveInstanceIDs())
++}
++
++func TestTimingFilled(t *testing.T) {
++	d := &fakeDriver{acquireDelay: 2 * time.Millisecond, execDelay: 2 * time.Millisecond}
++	f := newFactory(t, d)
++
++	res := execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++	timing := res.GetTiming()
++	require.NotNil(t, timing)
++	assert.Positive(t, timing.GetActivateUs())
++	assert.Positive(t, timing.GetExecUs())
++	assert.GreaterOrEqual(t, timing.GetHostUs(), timing.GetActivateUs()+timing.GetExecUs())
++	assert.Equal(t, "POOL", timing.GetAcquirePath())
++	assert.Zero(t, timing.GetTotalUs())
++
++	// Already acquired: no activation time or path on later calls.
++	res = execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++	assert.Zero(t, res.GetTiming().GetActivateUs())
++	assert.Empty(t, res.GetTiming().GetAcquirePath())
++	assert.Positive(t, res.GetTiming().GetExecUs())
++}
++
++func TestActivate(t *testing.T) {
++	d := &fakeDriver{acquireDelay: time.Millisecond}
++	f := newFactory(t, d)
++
++	res, err := invoke(t, f, "sb1", MethodActivate, &runtimev1pb.SandboxCreateRequestAlpha1{Component: "mysandbox"})
++	require.NoError(t, err)
++	assert.Equal(t, int32(codes.OK), res.GetStatus().GetCode())
++	assert.Equal(t, internalv1pb.ProtobufContentType, res.GetMessage().GetContentType())
++	var out runtimev1pb.SandboxCreateResponseAlpha1
++	require.NoError(t, proto.Unmarshal(res.GetMessage().GetData().GetValue(), &out))
++	assert.Equal(t, "sb1", out.GetSandboxId())
++	assert.NotEmpty(t, out.GetActivation())
++	assert.Equal(t, "POOL", out.GetTiming().GetAcquirePath())
++	assert.Positive(t, out.GetTiming().GetActivateUs())
++
++	// Idempotent.
++	res, err = invoke(t, f, "sb1", MethodActivate, &runtimev1pb.SandboxCreateRequestAlpha1{})
++	require.NoError(t, err)
++	var again runtimev1pb.SandboxCreateResponseAlpha1
++	require.NoError(t, proto.Unmarshal(res.GetMessage().GetData().GetValue(), &again))
++	assert.Equal(t, out.GetActivation(), again.GetActivation())
++	assert.Empty(t, again.GetTiming().GetAcquirePath())
++	assert.Equal(t, int32(1), d.acquireCount.Load())
++}
++
++func TestExecPassesSpec(t *testing.T) {
++	d := &fakeDriver{}
++	f := newFactory(t, d)
++
++	execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{
++		Command:   "python3",
++		Args:      []string{"-c", "print(1)"},
++		Env:       map[string]string{"A": "B"},
++		Cwd:       "work",
++		Stdin:     []byte("in"),
++		TimeoutMs: 1234,
++	})
++	d.lock.Lock()
++	defer d.lock.Unlock()
++	require.Len(t, d.execs, 1)
++	assert.Equal(t, "inst-1", d.execs[0].GetInstanceId())
++	assert.True(t, proto.Equal(&compv1pb.SandboxExecSpec{
++		Command:   "python3",
++		Args:      []string{"-c", "print(1)"},
++		Env:       map[string]string{"A": "B"},
++		Cwd:       "work",
++		Stdin:     []byte("in"),
++		TimeoutMs: 1234,
++	}, d.execs[0].GetSpec()))
++}
++
++func TestSessions(t *testing.T) {
++	d := &fakeDriver{execDelay: time.Millisecond}
++	f := newFactory(t, d)
++
++	res, err := invoke(t, f, "sb1", MethodSessionStart, &runtimev1pb.SandboxSessionStartRequestAlpha1{
++		Command: "python3", Args: []string{"-i"}, Env: map[string]string{"A": "B"}, Cwd: "w",
++	})
++	require.NoError(t, err)
++	var started runtimev1pb.SandboxSessionStartResponseAlpha1
++	require.NoError(t, proto.Unmarshal(res.GetMessage().GetData().GetValue(), &started))
++	assert.Equal(t, "sess-1", started.GetSessionId())
++	assert.NotEmpty(t, started.GetActivation())
++
++	res, err = invoke(t, f, "sb1", MethodSessionSend, &runtimev1pb.SandboxSessionSendRequestAlpha1{
++		SessionId:          "sess-1",
++		ExpectedActivation: started.GetActivation(),
++		Input:              []byte("x=1\n"),
++		Until:              []byte(">>> "),
++		TimeoutMs:          500,
++	})
++	require.NoError(t, err)
++	var sent runtimev1pb.SandboxExecResponseAlpha1
++	require.NoError(t, proto.Unmarshal(res.GetMessage().GetData().GetValue(), &sent))
++	assert.Equal(t, []byte("echo:x=1\n"), sent.GetStdout())
++	assert.True(t, sent.GetTimedOut())
++	assert.Equal(t, started.GetActivation(), sent.GetActivation())
++	assert.Equal(t, "sb1", sent.GetSandboxId())
++	assert.Positive(t, sent.GetTiming().GetExecUs())
++
++	res, err = invoke(t, f, "sb1", MethodSessionClose, &runtimev1pb.SandboxSessionCloseRequestAlpha1{SessionId: "sess-1"})
++	require.NoError(t, err)
++	assert.Empty(t, res.GetMessage().GetData().GetValue())
++
++	d.lock.Lock()
++	defer d.lock.Unlock()
++	require.Len(t, d.starts, 1)
++	assert.Equal(t, "inst-1", d.starts[0].GetInstanceId())
++	assert.Equal(t, "python3", d.starts[0].GetSpec().GetCommand())
++	assert.Equal(t, []string{"-i"}, d.starts[0].GetSpec().GetArgs())
++	require.Len(t, d.sends, 1)
++	assert.Equal(t, "inst-1", d.sends[0].GetInstanceId())
++	assert.Equal(t, "sess-1", d.sends[0].GetSessionId())
++	assert.Equal(t, []byte(">>> "), d.sends[0].GetUntil())
++	assert.Equal(t, uint32(500), d.sends[0].GetTimeoutMs())
++	require.Len(t, d.closes, 1)
++	assert.Equal(t, "inst-1", d.closes[0].GetInstanceId())
++	assert.Equal(t, "sess-1", d.closes[0].GetSessionId())
++}
++
++func TestSessionOnFreshSandboxIsNotFound(t *testing.T) {
++	d := &fakeDriver{}
++	f := newFactory(t, d)
++
++	_, err := invoke(t, f, "sb1", MethodSessionSend, &runtimev1pb.SandboxSessionSendRequestAlpha1{SessionId: "sess-1"})
++	assert.Equal(t, codes.NotFound, status.Code(err))
++	_, err = invoke(t, f, "sb1", MethodSessionClose, &runtimev1pb.SandboxSessionCloseRequestAlpha1{SessionId: "sess-1"})
++	assert.Equal(t, codes.NotFound, status.Code(err))
++	assert.Equal(t, int32(0), d.acquireCount.Load())
++}
++
++func TestRelease(t *testing.T) {
++	d := &fakeDriver{}
++	f := newFactory(t, d)
++
++	first := execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++	res, err := invoke(t, f, "sb1", MethodRelease, &runtimev1pb.SandboxDeleteRequestAlpha1{SandboxId: "sb1"})
++	require.NoError(t, err)
++	assert.Empty(t, res.GetMessage().GetData().GetValue())
++	assert.False(t, f.Exists("sb1"))
++	assert.Eventually(t, func() bool { return d.releaseCount.Load() == 1 }, 5*time.Second, 10*time.Millisecond)
++	assert.Equal(t, []string{"inst-1"}, d.releasedIDs())
++
++	// The old token is now lost; a call without it gets a new sandbox.
++	_, err = invoke(t, f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{
++		Command: "ls", ExpectedActivation: first.GetActivation(),
++	})
++	requireLost(t, err)
++	second := execOK(t, f, "sb1", &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++	assert.NotEqual(t, first.GetActivation(), second.GetActivation())
++
++	// Releasing a never-acquired sandbox does not call the driver.
++	_, err = invoke(t, f, "sb9", MethodRelease, &runtimev1pb.SandboxDeleteRequestAlpha1{})
++	require.NoError(t, err)
++	assert.False(t, f.Exists("sb9"))
++	assert.Never(t, func() bool { return d.releaseCount.Load() > 1 }, 100*time.Millisecond, 10*time.Millisecond)
++}
++
++func TestCallOnRemovedTargetIsClosed(t *testing.T) {
++	d := &fakeDriver{}
++	f := newFactory(t, d)
++
++	tgt := f.GetOrCreate("sb1")
++	require.NoError(t, tgt.Deactivate(t.Context()))
++	data, err := proto.Marshal(&runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++	require.NoError(t, err)
++	_, err = tgt.InvokeMethod(t.Context(), internalv1pb.NewInternalInvokeRequest(MethodExec).WithData(data))
++	require.Error(t, err)
++	assert.True(t, targetserrors.IsClosed(err))
++	assert.Equal(t, int32(0), d.acquireCount.Load())
++}
++
++func TestInvalidRequests(t *testing.T) {
++	d := &fakeDriver{}
++	f := newFactory(t, d)
++
++	_, err := invoke(t, f, "sb1", "nope", nil)
++	assert.Equal(t, codes.InvalidArgument, status.Code(err))
++
++	req := internalv1pb.NewInternalInvokeRequest(MethodExec).WithData([]byte{0xff, 0xff, 0xff})
++	_, err = f.GetOrCreate("sb1").InvokeMethod(t.Context(), req)
++	assert.Equal(t, codes.InvalidArgument, status.Code(err))
++	assert.Equal(t, int32(0), d.acquireCount.Load())
++
++	tgt := f.GetOrCreate("sb1")
++	assert.Equal(t, codes.Unimplemented, status.Code(tgt.InvokeReminder(t.Context(), &api.Reminder{})))
++	assert.Equal(t, codes.Unimplemented, status.Code(tgt.InvokeTimer(t.Context(), &api.Reminder{})))
++	assert.Equal(t, codes.Unimplemented, status.Code(tgt.InvokeStream(t.Context(), req, nil)))
++
++	assert.Equal(t, testActorType, tgt.Type())
++	assert.Equal(t, "sb1", tgt.ID())
++	assert.Equal(t, testActorType+api.DaprSeparator+"sb1", tgt.Key())
++}
+diff --git a/pkg/proto/runtime/v1/sandbox.pb.go b/pkg/proto/runtime/v1/sandbox.pb.go
+new file mode 100644
+index 000000000..6633e92cc
+--- /dev/null
++++ b/pkg/proto/runtime/v1/sandbox.pb.go
+@@ -0,0 +1,1211 @@
++//
++//Copyright 2026 The Dapr Authors
++//Licensed under the Apache License, Version 2.0 (the "License");
++//you may not use this file except in compliance with the License.
++//You may obtain a copy of the License at
++//
++//http://www.apache.org/licenses/LICENSE-2.0
++//
++//Unless required by applicable law or agreed to in writing, software
++//distributed under the License is distributed on an "AS IS" BASIS,
++//WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//See the License for the specific language governing permissions and
++//limitations under the License.
++
++// Code generated by protoc-gen-go. DO NOT EDIT.
++// versions:
++// 	protoc-gen-go v1.32.0
++// 	protoc        v7.34.1
++// source: dapr/proto/runtime/v1/sandbox.proto
++
++package runtime
++
++import (
++	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
++	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
++	reflect "reflect"
++	sync "sync"
++)
++
++const (
++	// Verify that this generated code is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
++	// Verify that runtime/protoimpl is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
++)
++
++// SandboxTimingAlpha1 is a per-call latency breakdown, in microseconds.
++type SandboxTimingAlpha1 struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	// Time from the API receiving the request to sending the response.
++	TotalUs uint64 `protobuf:"varint,1,opt,name=total_us,json=totalUs,proto3" json:"total_us,omitempty"`
++	// Time spent inside the sandbox actor on the hosting sidecar.
++	HostUs uint64 `protobuf:"varint,2,opt,name=host_us,json=hostUs,proto3" json:"host_us,omitempty"`
++	// Time spent acquiring the sandbox from the driver on this call (0 when it
++	// was already acquired).
++	ActivateUs uint64 `protobuf:"varint,3,opt,name=activate_us,json=activateUs,proto3" json:"activate_us,omitempty"`
++	// Time spent in the driver's exec or session send call.
++	ExecUs uint64 `protobuf:"varint,4,opt,name=exec_us,json=execUs,proto3" json:"exec_us,omitempty"`
++	// How the driver acquired the sandbox: POOL, RESTORE or BOOT. Only set on
++	// the call that acquired it.
++	AcquirePath string `protobuf:"bytes,5,opt,name=acquire_path,json=acquirePath,proto3" json:"acquire_path,omitempty"`
++}
++
++func (x *SandboxTimingAlpha1) Reset() {
++	*x = SandboxTimingAlpha1{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[0]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxTimingAlpha1) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxTimingAlpha1) ProtoMessage() {}
++
++func (x *SandboxTimingAlpha1) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[0]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxTimingAlpha1.ProtoReflect.Descriptor instead.
++func (*SandboxTimingAlpha1) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_runtime_v1_sandbox_proto_rawDescGZIP(), []int{0}
++}
++
++func (x *SandboxTimingAlpha1) GetTotalUs() uint64 {
++	if x != nil {
++		return x.TotalUs
++	}
++	return 0
++}
++
++func (x *SandboxTimingAlpha1) GetHostUs() uint64 {
++	if x != nil {
++		return x.HostUs
++	}
++	return 0
++}
++
++func (x *SandboxTimingAlpha1) GetActivateUs() uint64 {
++	if x != nil {
++		return x.ActivateUs
++	}
++	return 0
++}
++
++func (x *SandboxTimingAlpha1) GetExecUs() uint64 {
++	if x != nil {
++		return x.ExecUs
++	}
++	return 0
++}
++
++func (x *SandboxTimingAlpha1) GetAcquirePath() string {
++	if x != nil {
++		return x.AcquirePath
++	}
++	return ""
++}
++
++// SandboxExecRequestAlpha1 runs a one-shot command in a sandbox.
++type SandboxExecRequestAlpha1 struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	// Name of the sandbox component.
++	Component string `protobuf:"bytes,1,opt,name=component,proto3" json:"component,omitempty"`
++	// ID of the sandbox. The first call for an unknown ID activates it.
++	SandboxId string `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
++	// App ID hosting the sandbox. Defaults to the caller's own app ID.
++	AppId string `protobuf:"bytes,3,opt,name=app_id,json=appId,proto3" json:"app_id,omitempty"`
++	// Optional activation token from an earlier response. If the sandbox was
++	// recreated since, the call fails with a "sandbox lost" error.
++	ExpectedActivation string            `protobuf:"bytes,4,opt,name=expected_activation,json=expectedActivation,proto3" json:"expected_activation,omitempty"`
++	Command            string            `protobuf:"bytes,5,opt,name=command,proto3" json:"command,omitempty"`
++	Args               []string          `protobuf:"bytes,6,rep,name=args,proto3" json:"args,omitempty"`
++	Env                map[string]string `protobuf:"bytes,7,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
++	Cwd                string            `protobuf:"bytes,8,opt,name=cwd,proto3" json:"cwd,omitempty"`
++	Stdin              []byte            `protobuf:"bytes,9,opt,name=stdin,proto3" json:"stdin,omitempty"`
++	TimeoutMs          uint32            `protobuf:"varint,10,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
++}
++
++func (x *SandboxExecRequestAlpha1) Reset() {
++	*x = SandboxExecRequestAlpha1{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[1]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxExecRequestAlpha1) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxExecRequestAlpha1) ProtoMessage() {}
++
++func (x *SandboxExecRequestAlpha1) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[1]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxExecRequestAlpha1.ProtoReflect.Descriptor instead.
++func (*SandboxExecRequestAlpha1) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_runtime_v1_sandbox_proto_rawDescGZIP(), []int{1}
++}
++
++func (x *SandboxExecRequestAlpha1) GetComponent() string {
++	if x != nil {
++		return x.Component
++	}
++	return ""
++}
++
++func (x *SandboxExecRequestAlpha1) GetSandboxId() string {
++	if x != nil {
++		return x.SandboxId
++	}
++	return ""
++}
++
++func (x *SandboxExecRequestAlpha1) GetAppId() string {
++	if x != nil {
++		return x.AppId
++	}
++	return ""
++}
++
++func (x *SandboxExecRequestAlpha1) GetExpectedActivation() string {
++	if x != nil {
++		return x.ExpectedActivation
++	}
++	return ""
++}
++
++func (x *SandboxExecRequestAlpha1) GetCommand() string {
++	if x != nil {
++		return x.Command
++	}
++	return ""
++}
++
++func (x *SandboxExecRequestAlpha1) GetArgs() []string {
++	if x != nil {
++		return x.Args
++	}
++	return nil
++}
++
++func (x *SandboxExecRequestAlpha1) GetEnv() map[string]string {
++	if x != nil {
++		return x.Env
++	}
++	return nil
++}
++
++func (x *SandboxExecRequestAlpha1) GetCwd() string {
++	if x != nil {
++		return x.Cwd
++	}
++	return ""
++}
++
++func (x *SandboxExecRequestAlpha1) GetStdin() []byte {
++	if x != nil {
++		return x.Stdin
++	}
++	return nil
++}
++
++func (x *SandboxExecRequestAlpha1) GetTimeoutMs() uint32 {
++	if x != nil {
++		return x.TimeoutMs
++	}
++	return 0
++}
++
++// SandboxExecResponseAlpha1 is the result of a command or a session send.
++type SandboxExecResponseAlpha1 struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	SandboxId string `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
++	// Activation token of the sandbox that served the call.
++	Activation string               `protobuf:"bytes,2,opt,name=activation,proto3" json:"activation,omitempty"`
++	Stdout     []byte               `protobuf:"bytes,3,opt,name=stdout,proto3" json:"stdout,omitempty"`
++	Stderr     []byte               `protobuf:"bytes,4,opt,name=stderr,proto3" json:"stderr,omitempty"`
++	ExitCode   int32                `protobuf:"varint,5,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
++	Truncated  bool                 `protobuf:"varint,6,opt,name=truncated,proto3" json:"truncated,omitempty"`
++	TimedOut   bool                 `protobuf:"varint,7,opt,name=timed_out,json=timedOut,proto3" json:"timed_out,omitempty"`
++	Timing     *SandboxTimingAlpha1 `protobuf:"bytes,8,opt,name=timing,proto3" json:"timing,omitempty"`
++}
++
++func (x *SandboxExecResponseAlpha1) Reset() {
++	*x = SandboxExecResponseAlpha1{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[2]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxExecResponseAlpha1) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxExecResponseAlpha1) ProtoMessage() {}
++
++func (x *SandboxExecResponseAlpha1) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[2]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxExecResponseAlpha1.ProtoReflect.Descriptor instead.
++func (*SandboxExecResponseAlpha1) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_runtime_v1_sandbox_proto_rawDescGZIP(), []int{2}
++}
++
++func (x *SandboxExecResponseAlpha1) GetSandboxId() string {
++	if x != nil {
++		return x.SandboxId
++	}
++	return ""
++}
++
++func (x *SandboxExecResponseAlpha1) GetActivation() string {
++	if x != nil {
++		return x.Activation
++	}
++	return ""
++}
++
++func (x *SandboxExecResponseAlpha1) GetStdout() []byte {
++	if x != nil {
++		return x.Stdout
++	}
++	return nil
++}
++
++func (x *SandboxExecResponseAlpha1) GetStderr() []byte {
++	if x != nil {
++		return x.Stderr
++	}
++	return nil
++}
++
++func (x *SandboxExecResponseAlpha1) GetExitCode() int32 {
++	if x != nil {
++		return x.ExitCode
++	}
++	return 0
++}
++
++func (x *SandboxExecResponseAlpha1) GetTruncated() bool {
++	if x != nil {
++		return x.Truncated
++	}
++	return false
++}
++
++func (x *SandboxExecResponseAlpha1) GetTimedOut() bool {
++	if x != nil {
++		return x.TimedOut
++	}
++	return false
++}
++
++func (x *SandboxExecResponseAlpha1) GetTiming() *SandboxTimingAlpha1 {
++	if x != nil {
++		return x.Timing
++	}
++	return nil
++}
++
++// SandboxCreateRequestAlpha1 creates a sandbox with an ID chosen by the
++// sidecar.
++type SandboxCreateRequestAlpha1 struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Component string `protobuf:"bytes,1,opt,name=component,proto3" json:"component,omitempty"`
++	AppId     string `protobuf:"bytes,2,opt,name=app_id,json=appId,proto3" json:"app_id,omitempty"`
++}
++
++func (x *SandboxCreateRequestAlpha1) Reset() {
++	*x = SandboxCreateRequestAlpha1{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[3]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxCreateRequestAlpha1) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxCreateRequestAlpha1) ProtoMessage() {}
++
++func (x *SandboxCreateRequestAlpha1) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[3]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxCreateRequestAlpha1.ProtoReflect.Descriptor instead.
++func (*SandboxCreateRequestAlpha1) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_runtime_v1_sandbox_proto_rawDescGZIP(), []int{3}
++}
++
++func (x *SandboxCreateRequestAlpha1) GetComponent() string {
++	if x != nil {
++		return x.Component
++	}
++	return ""
++}
++
++func (x *SandboxCreateRequestAlpha1) GetAppId() string {
++	if x != nil {
++		return x.AppId
++	}
++	return ""
++}
++
++// SandboxCreateResponseAlpha1 is the response for creating a sandbox.
++type SandboxCreateResponseAlpha1 struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	SandboxId  string               `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
++	Activation string               `protobuf:"bytes,2,opt,name=activation,proto3" json:"activation,omitempty"`
++	Timing     *SandboxTimingAlpha1 `protobuf:"bytes,3,opt,name=timing,proto3" json:"timing,omitempty"`
++}
++
++func (x *SandboxCreateResponseAlpha1) Reset() {
++	*x = SandboxCreateResponseAlpha1{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[4]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxCreateResponseAlpha1) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxCreateResponseAlpha1) ProtoMessage() {}
++
++func (x *SandboxCreateResponseAlpha1) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[4]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxCreateResponseAlpha1.ProtoReflect.Descriptor instead.
++func (*SandboxCreateResponseAlpha1) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_runtime_v1_sandbox_proto_rawDescGZIP(), []int{4}
++}
++
++func (x *SandboxCreateResponseAlpha1) GetSandboxId() string {
++	if x != nil {
++		return x.SandboxId
++	}
++	return ""
++}
++
++func (x *SandboxCreateResponseAlpha1) GetActivation() string {
++	if x != nil {
++		return x.Activation
++	}
++	return ""
++}
++
++func (x *SandboxCreateResponseAlpha1) GetTiming() *SandboxTimingAlpha1 {
++	if x != nil {
++		return x.Timing
++	}
++	return nil
++}
++
++// SandboxDeleteRequestAlpha1 releases a sandbox.
++type SandboxDeleteRequestAlpha1 struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Component string `protobuf:"bytes,1,opt,name=component,proto3" json:"component,omitempty"`
++	SandboxId string `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
++	AppId     string `protobuf:"bytes,3,opt,name=app_id,json=appId,proto3" json:"app_id,omitempty"`
++}
++
++func (x *SandboxDeleteRequestAlpha1) Reset() {
++	*x = SandboxDeleteRequestAlpha1{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[5]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxDeleteRequestAlpha1) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxDeleteRequestAlpha1) ProtoMessage() {}
++
++func (x *SandboxDeleteRequestAlpha1) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[5]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxDeleteRequestAlpha1.ProtoReflect.Descriptor instead.
++func (*SandboxDeleteRequestAlpha1) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_runtime_v1_sandbox_proto_rawDescGZIP(), []int{5}
++}
++
++func (x *SandboxDeleteRequestAlpha1) GetComponent() string {
++	if x != nil {
++		return x.Component
++	}
++	return ""
++}
++
++func (x *SandboxDeleteRequestAlpha1) GetSandboxId() string {
++	if x != nil {
++		return x.SandboxId
++	}
++	return ""
++}
++
++func (x *SandboxDeleteRequestAlpha1) GetAppId() string {
++	if x != nil {
++		return x.AppId
++	}
++	return ""
++}
++
++// SandboxSessionStartRequestAlpha1 starts a long-lived process in a sandbox.
++type SandboxSessionStartRequestAlpha1 struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Component          string            `protobuf:"bytes,1,opt,name=component,proto3" json:"component,omitempty"`
++	SandboxId          string            `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
++	AppId              string            `protobuf:"bytes,3,opt,name=app_id,json=appId,proto3" json:"app_id,omitempty"`
++	ExpectedActivation string            `protobuf:"bytes,4,opt,name=expected_activation,json=expectedActivation,proto3" json:"expected_activation,omitempty"`
++	Command            string            `protobuf:"bytes,5,opt,name=command,proto3" json:"command,omitempty"`
++	Args               []string          `protobuf:"bytes,6,rep,name=args,proto3" json:"args,omitempty"`
++	Env                map[string]string `protobuf:"bytes,7,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
++	Cwd                string            `protobuf:"bytes,8,opt,name=cwd,proto3" json:"cwd,omitempty"`
++}
++
++func (x *SandboxSessionStartRequestAlpha1) Reset() {
++	*x = SandboxSessionStartRequestAlpha1{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[6]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxSessionStartRequestAlpha1) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxSessionStartRequestAlpha1) ProtoMessage() {}
++
++func (x *SandboxSessionStartRequestAlpha1) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[6]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxSessionStartRequestAlpha1.ProtoReflect.Descriptor instead.
++func (*SandboxSessionStartRequestAlpha1) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_runtime_v1_sandbox_proto_rawDescGZIP(), []int{6}
++}
++
++func (x *SandboxSessionStartRequestAlpha1) GetComponent() string {
++	if x != nil {
++		return x.Component
++	}
++	return ""
++}
++
++func (x *SandboxSessionStartRequestAlpha1) GetSandboxId() string {
++	if x != nil {
++		return x.SandboxId
++	}
++	return ""
++}
++
++func (x *SandboxSessionStartRequestAlpha1) GetAppId() string {
++	if x != nil {
++		return x.AppId
++	}
++	return ""
++}
++
++func (x *SandboxSessionStartRequestAlpha1) GetExpectedActivation() string {
++	if x != nil {
++		return x.ExpectedActivation
++	}
++	return ""
++}
++
++func (x *SandboxSessionStartRequestAlpha1) GetCommand() string {
++	if x != nil {
++		return x.Command
++	}
++	return ""
++}
++
++func (x *SandboxSessionStartRequestAlpha1) GetArgs() []string {
++	if x != nil {
++		return x.Args
++	}
++	return nil
++}
++
++func (x *SandboxSessionStartRequestAlpha1) GetEnv() map[string]string {
++	if x != nil {
++		return x.Env
++	}
++	return nil
++}
++
++func (x *SandboxSessionStartRequestAlpha1) GetCwd() string {
++	if x != nil {
++		return x.Cwd
++	}
++	return ""
++}
++
++// SandboxSessionStartResponseAlpha1 is the response for starting a session.
++type SandboxSessionStartResponseAlpha1 struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	SessionId  string `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
++	Activation string `protobuf:"bytes,2,opt,name=activation,proto3" json:"activation,omitempty"`
++}
++
++func (x *SandboxSessionStartResponseAlpha1) Reset() {
++	*x = SandboxSessionStartResponseAlpha1{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[7]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxSessionStartResponseAlpha1) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxSessionStartResponseAlpha1) ProtoMessage() {}
++
++func (x *SandboxSessionStartResponseAlpha1) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[7]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxSessionStartResponseAlpha1.ProtoReflect.Descriptor instead.
++func (*SandboxSessionStartResponseAlpha1) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_runtime_v1_sandbox_proto_rawDescGZIP(), []int{7}
++}
++
++func (x *SandboxSessionStartResponseAlpha1) GetSessionId() string {
++	if x != nil {
++		return x.SessionId
++	}
++	return ""
++}
++
++func (x *SandboxSessionStartResponseAlpha1) GetActivation() string {
++	if x != nil {
++		return x.Activation
++	}
++	return ""
++}
++
++// SandboxSessionSendRequestAlpha1 writes input to a session and reads its
++// output until the `until` marker or the timeout. The response is a
++// SandboxExecResponseAlpha1.
++type SandboxSessionSendRequestAlpha1 struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Component          string `protobuf:"bytes,1,opt,name=component,proto3" json:"component,omitempty"`
++	SandboxId          string `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
++	AppId              string `protobuf:"bytes,3,opt,name=app_id,json=appId,proto3" json:"app_id,omitempty"`
++	ExpectedActivation string `protobuf:"bytes,4,opt,name=expected_activation,json=expectedActivation,proto3" json:"expected_activation,omitempty"`
++	SessionId          string `protobuf:"bytes,5,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
++	Input              []byte `protobuf:"bytes,6,opt,name=input,proto3" json:"input,omitempty"`
++	Until              []byte `protobuf:"bytes,7,opt,name=until,proto3" json:"until,omitempty"`
++	TimeoutMs          uint32 `protobuf:"varint,8,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
++}
++
++func (x *SandboxSessionSendRequestAlpha1) Reset() {
++	*x = SandboxSessionSendRequestAlpha1{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[8]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxSessionSendRequestAlpha1) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxSessionSendRequestAlpha1) ProtoMessage() {}
++
++func (x *SandboxSessionSendRequestAlpha1) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[8]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxSessionSendRequestAlpha1.ProtoReflect.Descriptor instead.
++func (*SandboxSessionSendRequestAlpha1) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_runtime_v1_sandbox_proto_rawDescGZIP(), []int{8}
++}
++
++func (x *SandboxSessionSendRequestAlpha1) GetComponent() string {
++	if x != nil {
++		return x.Component
++	}
++	return ""
++}
++
++func (x *SandboxSessionSendRequestAlpha1) GetSandboxId() string {
++	if x != nil {
++		return x.SandboxId
++	}
++	return ""
++}
++
++func (x *SandboxSessionSendRequestAlpha1) GetAppId() string {
++	if x != nil {
++		return x.AppId
++	}
++	return ""
++}
++
++func (x *SandboxSessionSendRequestAlpha1) GetExpectedActivation() string {
++	if x != nil {
++		return x.ExpectedActivation
++	}
++	return ""
++}
++
++func (x *SandboxSessionSendRequestAlpha1) GetSessionId() string {
++	if x != nil {
++		return x.SessionId
++	}
++	return ""
++}
++
++func (x *SandboxSessionSendRequestAlpha1) GetInput() []byte {
++	if x != nil {
++		return x.Input
++	}
++	return nil
++}
++
++func (x *SandboxSessionSendRequestAlpha1) GetUntil() []byte {
++	if x != nil {
++		return x.Until
++	}
++	return nil
++}
++
++func (x *SandboxSessionSendRequestAlpha1) GetTimeoutMs() uint32 {
++	if x != nil {
++		return x.TimeoutMs
++	}
++	return 0
++}
++
++// SandboxSessionCloseRequestAlpha1 closes a session.
++type SandboxSessionCloseRequestAlpha1 struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Component string `protobuf:"bytes,1,opt,name=component,proto3" json:"component,omitempty"`
++	SandboxId string `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
++	AppId     string `protobuf:"bytes,3,opt,name=app_id,json=appId,proto3" json:"app_id,omitempty"`
++	SessionId string `protobuf:"bytes,4,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
++}
++
++func (x *SandboxSessionCloseRequestAlpha1) Reset() {
++	*x = SandboxSessionCloseRequestAlpha1{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[9]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SandboxSessionCloseRequestAlpha1) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SandboxSessionCloseRequestAlpha1) ProtoMessage() {}
++
++func (x *SandboxSessionCloseRequestAlpha1) ProtoReflect() protoreflect.Message {
++	mi := &file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[9]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SandboxSessionCloseRequestAlpha1.ProtoReflect.Descriptor instead.
++func (*SandboxSessionCloseRequestAlpha1) Descriptor() ([]byte, []int) {
++	return file_dapr_proto_runtime_v1_sandbox_proto_rawDescGZIP(), []int{9}
++}
++
++func (x *SandboxSessionCloseRequestAlpha1) GetComponent() string {
++	if x != nil {
++		return x.Component
++	}
++	return ""
++}
++
++func (x *SandboxSessionCloseRequestAlpha1) GetSandboxId() string {
++	if x != nil {
++		return x.SandboxId
++	}
++	return ""
++}
++
++func (x *SandboxSessionCloseRequestAlpha1) GetAppId() string {
++	if x != nil {
++		return x.AppId
++	}
++	return ""
++}
++
++func (x *SandboxSessionCloseRequestAlpha1) GetSessionId() string {
++	if x != nil {
++		return x.SessionId
++	}
++	return ""
++}
++
++var File_dapr_proto_runtime_v1_sandbox_proto protoreflect.FileDescriptor
++
++var file_dapr_proto_runtime_v1_sandbox_proto_rawDesc = []byte{
++	0x0a, 0x23, 0x64, 0x61, 0x70, 0x72, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2f, 0x72, 0x75, 0x6e,
++	0x74, 0x69, 0x6d, 0x65, 0x2f, 0x76, 0x31, 0x2f, 0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x2e,
++	0x70, 0x72, 0x6f, 0x74, 0x6f, 0x12, 0x15, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74,
++	0x6f, 0x2e, 0x72, 0x75, 0x6e, 0x74, 0x69, 0x6d, 0x65, 0x2e, 0x76, 0x31, 0x22, 0xa6, 0x01, 0x0a,
++	0x13, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x54, 0x69, 0x6d, 0x69, 0x6e, 0x67, 0x41, 0x6c,
++	0x70, 0x68, 0x61, 0x31, 0x12, 0x19, 0x0a, 0x08, 0x74, 0x6f, 0x74, 0x61, 0x6c, 0x5f, 0x75, 0x73,
++	0x18, 0x01, 0x20, 0x01, 0x28, 0x04, 0x52, 0x07, 0x74, 0x6f, 0x74, 0x61, 0x6c, 0x55, 0x73, 0x12,
++	0x17, 0x0a, 0x07, 0x68, 0x6f, 0x73, 0x74, 0x5f, 0x75, 0x73, 0x18, 0x02, 0x20, 0x01, 0x28, 0x04,
++	0x52, 0x06, 0x68, 0x6f, 0x73, 0x74, 0x55, 0x73, 0x12, 0x1f, 0x0a, 0x0b, 0x61, 0x63, 0x74, 0x69,
++	0x76, 0x61, 0x74, 0x65, 0x5f, 0x75, 0x73, 0x18, 0x03, 0x20, 0x01, 0x28, 0x04, 0x52, 0x0a, 0x61,
++	0x63, 0x74, 0x69, 0x76, 0x61, 0x74, 0x65, 0x55, 0x73, 0x12, 0x17, 0x0a, 0x07, 0x65, 0x78, 0x65,
++	0x63, 0x5f, 0x75, 0x73, 0x18, 0x04, 0x20, 0x01, 0x28, 0x04, 0x52, 0x06, 0x65, 0x78, 0x65, 0x63,
++	0x55, 0x73, 0x12, 0x21, 0x0a, 0x0c, 0x61, 0x63, 0x71, 0x75, 0x69, 0x72, 0x65, 0x5f, 0x70, 0x61,
++	0x74, 0x68, 0x18, 0x05, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0b, 0x61, 0x63, 0x71, 0x75, 0x69, 0x72,
++	0x65, 0x50, 0x61, 0x74, 0x68, 0x22, 0x98, 0x03, 0x0a, 0x18, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f,
++	0x78, 0x45, 0x78, 0x65, 0x63, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x41, 0x6c, 0x70, 0x68,
++	0x61, 0x31, 0x12, 0x1c, 0x0a, 0x09, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x18,
++	0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74,
++	0x12, 0x1d, 0x0a, 0x0a, 0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x5f, 0x69, 0x64, 0x18, 0x02,
++	0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x49, 0x64, 0x12,
++	0x15, 0x0a, 0x06, 0x61, 0x70, 0x70, 0x5f, 0x69, 0x64, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52,
++	0x05, 0x61, 0x70, 0x70, 0x49, 0x64, 0x12, 0x2f, 0x0a, 0x13, 0x65, 0x78, 0x70, 0x65, 0x63, 0x74,
++	0x65, 0x64, 0x5f, 0x61, 0x63, 0x74, 0x69, 0x76, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x18, 0x04, 0x20,
++	0x01, 0x28, 0x09, 0x52, 0x12, 0x65, 0x78, 0x70, 0x65, 0x63, 0x74, 0x65, 0x64, 0x41, 0x63, 0x74,
++	0x69, 0x76, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x12, 0x18, 0x0a, 0x07, 0x63, 0x6f, 0x6d, 0x6d, 0x61,
++	0x6e, 0x64, 0x18, 0x05, 0x20, 0x01, 0x28, 0x09, 0x52, 0x07, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e,
++	0x64, 0x12, 0x12, 0x0a, 0x04, 0x61, 0x72, 0x67, 0x73, 0x18, 0x06, 0x20, 0x03, 0x28, 0x09, 0x52,
++	0x04, 0x61, 0x72, 0x67, 0x73, 0x12, 0x4a, 0x0a, 0x03, 0x65, 0x6e, 0x76, 0x18, 0x07, 0x20, 0x03,
++	0x28, 0x0b, 0x32, 0x38, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e,
++	0x72, 0x75, 0x6e, 0x74, 0x69, 0x6d, 0x65, 0x2e, 0x76, 0x31, 0x2e, 0x53, 0x61, 0x6e, 0x64, 0x62,
++	0x6f, 0x78, 0x45, 0x78, 0x65, 0x63, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x41, 0x6c, 0x70,
++	0x68, 0x61, 0x31, 0x2e, 0x45, 0x6e, 0x76, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x52, 0x03, 0x65, 0x6e,
++	0x76, 0x12, 0x10, 0x0a, 0x03, 0x63, 0x77, 0x64, 0x18, 0x08, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03,
++	0x63, 0x77, 0x64, 0x12, 0x14, 0x0a, 0x05, 0x73, 0x74, 0x64, 0x69, 0x6e, 0x18, 0x09, 0x20, 0x01,
++	0x28, 0x0c, 0x52, 0x05, 0x73, 0x74, 0x64, 0x69, 0x6e, 0x12, 0x1d, 0x0a, 0x0a, 0x74, 0x69, 0x6d,
++	0x65, 0x6f, 0x75, 0x74, 0x5f, 0x6d, 0x73, 0x18, 0x0a, 0x20, 0x01, 0x28, 0x0d, 0x52, 0x09, 0x74,
++	0x69, 0x6d, 0x65, 0x6f, 0x75, 0x74, 0x4d, 0x73, 0x1a, 0x36, 0x0a, 0x08, 0x45, 0x6e, 0x76, 0x45,
++	0x6e, 0x74, 0x72, 0x79, 0x12, 0x10, 0x0a, 0x03, 0x6b, 0x65, 0x79, 0x18, 0x01, 0x20, 0x01, 0x28,
++	0x09, 0x52, 0x03, 0x6b, 0x65, 0x79, 0x12, 0x14, 0x0a, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x18,
++	0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x3a, 0x02, 0x38, 0x01,
++	0x22, 0xa6, 0x02, 0x0a, 0x19, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x45, 0x78, 0x65, 0x63,
++	0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x41, 0x6c, 0x70, 0x68, 0x61, 0x31, 0x12, 0x1d,
++	0x0a, 0x0a, 0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01,
++	0x28, 0x09, 0x52, 0x09, 0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x49, 0x64, 0x12, 0x1e, 0x0a,
++	0x0a, 0x61, 0x63, 0x74, 0x69, 0x76, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x18, 0x02, 0x20, 0x01, 0x28,
++	0x09, 0x52, 0x0a, 0x61, 0x63, 0x74, 0x69, 0x76, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x12, 0x16, 0x0a,
++	0x06, 0x73, 0x74, 0x64, 0x6f, 0x75, 0x74, 0x18, 0x03, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x06, 0x73,
++	0x74, 0x64, 0x6f, 0x75, 0x74, 0x12, 0x16, 0x0a, 0x06, 0x73, 0x74, 0x64, 0x65, 0x72, 0x72, 0x18,
++	0x04, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x06, 0x73, 0x74, 0x64, 0x65, 0x72, 0x72, 0x12, 0x1b, 0x0a,
++	0x09, 0x65, 0x78, 0x69, 0x74, 0x5f, 0x63, 0x6f, 0x64, 0x65, 0x18, 0x05, 0x20, 0x01, 0x28, 0x05,
++	0x52, 0x08, 0x65, 0x78, 0x69, 0x74, 0x43, 0x6f, 0x64, 0x65, 0x12, 0x1c, 0x0a, 0x09, 0x74, 0x72,
++	0x75, 0x6e, 0x63, 0x61, 0x74, 0x65, 0x64, 0x18, 0x06, 0x20, 0x01, 0x28, 0x08, 0x52, 0x09, 0x74,
++	0x72, 0x75, 0x6e, 0x63, 0x61, 0x74, 0x65, 0x64, 0x12, 0x1b, 0x0a, 0x09, 0x74, 0x69, 0x6d, 0x65,
++	0x64, 0x5f, 0x6f, 0x75, 0x74, 0x18, 0x07, 0x20, 0x01, 0x28, 0x08, 0x52, 0x08, 0x74, 0x69, 0x6d,
++	0x65, 0x64, 0x4f, 0x75, 0x74, 0x12, 0x42, 0x0a, 0x06, 0x74, 0x69, 0x6d, 0x69, 0x6e, 0x67, 0x18,
++	0x08, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x2a, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f,
++	0x74, 0x6f, 0x2e, 0x72, 0x75, 0x6e, 0x74, 0x69, 0x6d, 0x65, 0x2e, 0x76, 0x31, 0x2e, 0x53, 0x61,
++	0x6e, 0x64, 0x62, 0x6f, 0x78, 0x54, 0x69, 0x6d, 0x69, 0x6e, 0x67, 0x41, 0x6c, 0x70, 0x68, 0x61,
++	0x31, 0x52, 0x06, 0x74, 0x69, 0x6d, 0x69, 0x6e, 0x67, 0x22, 0x51, 0x0a, 0x1a, 0x53, 0x61, 0x6e,
++	0x64, 0x62, 0x6f, 0x78, 0x43, 0x72, 0x65, 0x61, 0x74, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
++	0x74, 0x41, 0x6c, 0x70, 0x68, 0x61, 0x31, 0x12, 0x1c, 0x0a, 0x09, 0x63, 0x6f, 0x6d, 0x70, 0x6f,
++	0x6e, 0x65, 0x6e, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x63, 0x6f, 0x6d, 0x70,
++	0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x12, 0x15, 0x0a, 0x06, 0x61, 0x70, 0x70, 0x5f, 0x69, 0x64, 0x18,
++	0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x05, 0x61, 0x70, 0x70, 0x49, 0x64, 0x22, 0xa0, 0x01, 0x0a,
++	0x1b, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x43, 0x72, 0x65, 0x61, 0x74, 0x65, 0x52, 0x65,
++	0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x41, 0x6c, 0x70, 0x68, 0x61, 0x31, 0x12, 0x1d, 0x0a, 0x0a,
++	0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09,
++	0x52, 0x09, 0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x49, 0x64, 0x12, 0x1e, 0x0a, 0x0a, 0x61,
++	0x63, 0x74, 0x69, 0x76, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52,
++	0x0a, 0x61, 0x63, 0x74, 0x69, 0x76, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x12, 0x42, 0x0a, 0x06, 0x74,
++	0x69, 0x6d, 0x69, 0x6e, 0x67, 0x18, 0x03, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x2a, 0x2e, 0x64, 0x61,
++	0x70, 0x72, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x72, 0x75, 0x6e, 0x74, 0x69, 0x6d, 0x65,
++	0x2e, 0x76, 0x31, 0x2e, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x54, 0x69, 0x6d, 0x69, 0x6e,
++	0x67, 0x41, 0x6c, 0x70, 0x68, 0x61, 0x31, 0x52, 0x06, 0x74, 0x69, 0x6d, 0x69, 0x6e, 0x67, 0x22,
++	0x70, 0x0a, 0x1a, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x44, 0x65, 0x6c, 0x65, 0x74, 0x65,
++	0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x41, 0x6c, 0x70, 0x68, 0x61, 0x31, 0x12, 0x1c, 0x0a,
++	0x09, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09,
++	0x52, 0x09, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x12, 0x1d, 0x0a, 0x0a, 0x73,
++	0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x5f, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52,
++	0x09, 0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x49, 0x64, 0x12, 0x15, 0x0a, 0x06, 0x61, 0x70,
++	0x70, 0x5f, 0x69, 0x64, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x05, 0x61, 0x70, 0x70, 0x49,
++	0x64, 0x22, 0xf3, 0x02, 0x0a, 0x20, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x53, 0x65, 0x73,
++	0x73, 0x69, 0x6f, 0x6e, 0x53, 0x74, 0x61, 0x72, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74,
++	0x41, 0x6c, 0x70, 0x68, 0x61, 0x31, 0x12, 0x1c, 0x0a, 0x09, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e,
++	0x65, 0x6e, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x63, 0x6f, 0x6d, 0x70, 0x6f,
++	0x6e, 0x65, 0x6e, 0x74, 0x12, 0x1d, 0x0a, 0x0a, 0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x5f,
++	0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f,
++	0x78, 0x49, 0x64, 0x12, 0x15, 0x0a, 0x06, 0x61, 0x70, 0x70, 0x5f, 0x69, 0x64, 0x18, 0x03, 0x20,
++	0x01, 0x28, 0x09, 0x52, 0x05, 0x61, 0x70, 0x70, 0x49, 0x64, 0x12, 0x2f, 0x0a, 0x13, 0x65, 0x78,
++	0x70, 0x65, 0x63, 0x74, 0x65, 0x64, 0x5f, 0x61, 0x63, 0x74, 0x69, 0x76, 0x61, 0x74, 0x69, 0x6f,
++	0x6e, 0x18, 0x04, 0x20, 0x01, 0x28, 0x09, 0x52, 0x12, 0x65, 0x78, 0x70, 0x65, 0x63, 0x74, 0x65,
++	0x64, 0x41, 0x63, 0x74, 0x69, 0x76, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x12, 0x18, 0x0a, 0x07, 0x63,
++	0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x18, 0x05, 0x20, 0x01, 0x28, 0x09, 0x52, 0x07, 0x63, 0x6f,
++	0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x12, 0x12, 0x0a, 0x04, 0x61, 0x72, 0x67, 0x73, 0x18, 0x06, 0x20,
++	0x03, 0x28, 0x09, 0x52, 0x04, 0x61, 0x72, 0x67, 0x73, 0x12, 0x52, 0x0a, 0x03, 0x65, 0x6e, 0x76,
++	0x18, 0x07, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x40, 0x2e, 0x64, 0x61, 0x70, 0x72, 0x2e, 0x70, 0x72,
++	0x6f, 0x74, 0x6f, 0x2e, 0x72, 0x75, 0x6e, 0x74, 0x69, 0x6d, 0x65, 0x2e, 0x76, 0x31, 0x2e, 0x53,
++	0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x53, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x53, 0x74, 0x61,
++	0x72, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x41, 0x6c, 0x70, 0x68, 0x61, 0x31, 0x2e,
++	0x45, 0x6e, 0x76, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x52, 0x03, 0x65, 0x6e, 0x76, 0x12, 0x10, 0x0a,
++	0x03, 0x63, 0x77, 0x64, 0x18, 0x08, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x63, 0x77, 0x64, 0x1a,
++	0x36, 0x0a, 0x08, 0x45, 0x6e, 0x76, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x12, 0x10, 0x0a, 0x03, 0x6b,
++	0x65, 0x79, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x6b, 0x65, 0x79, 0x12, 0x14, 0x0a,
++	0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x05, 0x76, 0x61,
++	0x6c, 0x75, 0x65, 0x3a, 0x02, 0x38, 0x01, 0x22, 0x62, 0x0a, 0x21, 0x53, 0x61, 0x6e, 0x64, 0x62,
++	0x6f, 0x78, 0x53, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x53, 0x74, 0x61, 0x72, 0x74, 0x52, 0x65,
++	0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x41, 0x6c, 0x70, 0x68, 0x61, 0x31, 0x12, 0x1d, 0x0a, 0x0a,
++	0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09,
++	0x52, 0x09, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x49, 0x64, 0x12, 0x1e, 0x0a, 0x0a, 0x61,
++	0x63, 0x74, 0x69, 0x76, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52,
++	0x0a, 0x61, 0x63, 0x74, 0x69, 0x76, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x22, 0x90, 0x02, 0x0a, 0x1f,
++	0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x53, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x53, 0x65,
++	0x6e, 0x64, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x41, 0x6c, 0x70, 0x68, 0x61, 0x31, 0x12,
++	0x1c, 0x0a, 0x09, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x18, 0x01, 0x20, 0x01,
++	0x28, 0x09, 0x52, 0x09, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x12, 0x1d, 0x0a,
++	0x0a, 0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x5f, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28,
++	0x09, 0x52, 0x09, 0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x49, 0x64, 0x12, 0x15, 0x0a, 0x06,
++	0x61, 0x70, 0x70, 0x5f, 0x69, 0x64, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x05, 0x61, 0x70,
++	0x70, 0x49, 0x64, 0x12, 0x2f, 0x0a, 0x13, 0x65, 0x78, 0x70, 0x65, 0x63, 0x74, 0x65, 0x64, 0x5f,
++	0x61, 0x63, 0x74, 0x69, 0x76, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x18, 0x04, 0x20, 0x01, 0x28, 0x09,
++	0x52, 0x12, 0x65, 0x78, 0x70, 0x65, 0x63, 0x74, 0x65, 0x64, 0x41, 0x63, 0x74, 0x69, 0x76, 0x61,
++	0x74, 0x69, 0x6f, 0x6e, 0x12, 0x1d, 0x0a, 0x0a, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x5f,
++	0x69, 0x64, 0x18, 0x05, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f,
++	0x6e, 0x49, 0x64, 0x12, 0x14, 0x0a, 0x05, 0x69, 0x6e, 0x70, 0x75, 0x74, 0x18, 0x06, 0x20, 0x01,
++	0x28, 0x0c, 0x52, 0x05, 0x69, 0x6e, 0x70, 0x75, 0x74, 0x12, 0x14, 0x0a, 0x05, 0x75, 0x6e, 0x74,
++	0x69, 0x6c, 0x18, 0x07, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x05, 0x75, 0x6e, 0x74, 0x69, 0x6c, 0x12,
++	0x1d, 0x0a, 0x0a, 0x74, 0x69, 0x6d, 0x65, 0x6f, 0x75, 0x74, 0x5f, 0x6d, 0x73, 0x18, 0x08, 0x20,
++	0x01, 0x28, 0x0d, 0x52, 0x09, 0x74, 0x69, 0x6d, 0x65, 0x6f, 0x75, 0x74, 0x4d, 0x73, 0x22, 0x95,
++	0x01, 0x0a, 0x20, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x53, 0x65, 0x73, 0x73, 0x69, 0x6f,
++	0x6e, 0x43, 0x6c, 0x6f, 0x73, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x41, 0x6c, 0x70,
++	0x68, 0x61, 0x31, 0x12, 0x1c, 0x0a, 0x09, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74,
++	0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e,
++	0x74, 0x12, 0x1d, 0x0a, 0x0a, 0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x5f, 0x69, 0x64, 0x18,
++	0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x73, 0x61, 0x6e, 0x64, 0x62, 0x6f, 0x78, 0x49, 0x64,
++	0x12, 0x15, 0x0a, 0x06, 0x61, 0x70, 0x70, 0x5f, 0x69, 0x64, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09,
++	0x52, 0x05, 0x61, 0x70, 0x70, 0x49, 0x64, 0x12, 0x1d, 0x0a, 0x0a, 0x73, 0x65, 0x73, 0x73, 0x69,
++	0x6f, 0x6e, 0x5f, 0x69, 0x64, 0x18, 0x04, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x73, 0x65, 0x73,
++	0x73, 0x69, 0x6f, 0x6e, 0x49, 0x64, 0x42, 0x70, 0x0a, 0x0a, 0x69, 0x6f, 0x2e, 0x64, 0x61, 0x70,
++	0x72, 0x2e, 0x76, 0x31, 0x42, 0x11, 0x44, 0x61, 0x70, 0x72, 0x53, 0x61, 0x6e, 0x64, 0x62, 0x6f,
++	0x78, 0x50, 0x72, 0x6f, 0x74, 0x6f, 0x73, 0x5a, 0x31, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e,
++	0x63, 0x6f, 0x6d, 0x2f, 0x64, 0x61, 0x70, 0x72, 0x2f, 0x64, 0x61, 0x70, 0x72, 0x2f, 0x70, 0x6b,
++	0x67, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2f, 0x72, 0x75, 0x6e, 0x74, 0x69, 0x6d, 0x65, 0x2f,
++	0x76, 0x31, 0x3b, 0x72, 0x75, 0x6e, 0x74, 0x69, 0x6d, 0x65, 0xaa, 0x02, 0x1b, 0x44, 0x61, 0x70,
++	0x72, 0x2e, 0x43, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x2e, 0x41, 0x75, 0x74, 0x6f, 0x67, 0x65, 0x6e,
++	0x2e, 0x47, 0x72, 0x70, 0x63, 0x2e, 0x76, 0x31, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
++}
++
++var (
++	file_dapr_proto_runtime_v1_sandbox_proto_rawDescOnce sync.Once
++	file_dapr_proto_runtime_v1_sandbox_proto_rawDescData = file_dapr_proto_runtime_v1_sandbox_proto_rawDesc
++)
++
++func file_dapr_proto_runtime_v1_sandbox_proto_rawDescGZIP() []byte {
++	file_dapr_proto_runtime_v1_sandbox_proto_rawDescOnce.Do(func() {
++		file_dapr_proto_runtime_v1_sandbox_proto_rawDescData = protoimpl.X.CompressGZIP(file_dapr_proto_runtime_v1_sandbox_proto_rawDescData)
++	})
++	return file_dapr_proto_runtime_v1_sandbox_proto_rawDescData
++}
++
++var file_dapr_proto_runtime_v1_sandbox_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
++var file_dapr_proto_runtime_v1_sandbox_proto_goTypes = []interface{}{
++	(*SandboxTimingAlpha1)(nil),               // 0: dapr.proto.runtime.v1.SandboxTimingAlpha1
++	(*SandboxExecRequestAlpha1)(nil),          // 1: dapr.proto.runtime.v1.SandboxExecRequestAlpha1
++	(*SandboxExecResponseAlpha1)(nil),         // 2: dapr.proto.runtime.v1.SandboxExecResponseAlpha1
++	(*SandboxCreateRequestAlpha1)(nil),        // 3: dapr.proto.runtime.v1.SandboxCreateRequestAlpha1
++	(*SandboxCreateResponseAlpha1)(nil),       // 4: dapr.proto.runtime.v1.SandboxCreateResponseAlpha1
++	(*SandboxDeleteRequestAlpha1)(nil),        // 5: dapr.proto.runtime.v1.SandboxDeleteRequestAlpha1
++	(*SandboxSessionStartRequestAlpha1)(nil),  // 6: dapr.proto.runtime.v1.SandboxSessionStartRequestAlpha1
++	(*SandboxSessionStartResponseAlpha1)(nil), // 7: dapr.proto.runtime.v1.SandboxSessionStartResponseAlpha1
++	(*SandboxSessionSendRequestAlpha1)(nil),   // 8: dapr.proto.runtime.v1.SandboxSessionSendRequestAlpha1
++	(*SandboxSessionCloseRequestAlpha1)(nil),  // 9: dapr.proto.runtime.v1.SandboxSessionCloseRequestAlpha1
++	nil,                                       // 10: dapr.proto.runtime.v1.SandboxExecRequestAlpha1.EnvEntry
++	nil,                                       // 11: dapr.proto.runtime.v1.SandboxSessionStartRequestAlpha1.EnvEntry
++}
++var file_dapr_proto_runtime_v1_sandbox_proto_depIdxs = []int32{
++	10, // 0: dapr.proto.runtime.v1.SandboxExecRequestAlpha1.env:type_name -> dapr.proto.runtime.v1.SandboxExecRequestAlpha1.EnvEntry
++	0,  // 1: dapr.proto.runtime.v1.SandboxExecResponseAlpha1.timing:type_name -> dapr.proto.runtime.v1.SandboxTimingAlpha1
++	0,  // 2: dapr.proto.runtime.v1.SandboxCreateResponseAlpha1.timing:type_name -> dapr.proto.runtime.v1.SandboxTimingAlpha1
++	11, // 3: dapr.proto.runtime.v1.SandboxSessionStartRequestAlpha1.env:type_name -> dapr.proto.runtime.v1.SandboxSessionStartRequestAlpha1.EnvEntry
++	4,  // [4:4] is the sub-list for method output_type
++	4,  // [4:4] is the sub-list for method input_type
++	4,  // [4:4] is the sub-list for extension type_name
++	4,  // [4:4] is the sub-list for extension extendee
++	0,  // [0:4] is the sub-list for field type_name
++}
++
++func init() { file_dapr_proto_runtime_v1_sandbox_proto_init() }
++func file_dapr_proto_runtime_v1_sandbox_proto_init() {
++	if File_dapr_proto_runtime_v1_sandbox_proto != nil {
++		return
++	}
++	if !protoimpl.UnsafeEnabled {
++		file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[0].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxTimingAlpha1); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[1].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxExecRequestAlpha1); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[2].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxExecResponseAlpha1); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[3].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxCreateRequestAlpha1); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[4].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxCreateResponseAlpha1); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[5].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxDeleteRequestAlpha1); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[6].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxSessionStartRequestAlpha1); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[7].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxSessionStartResponseAlpha1); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[8].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxSessionSendRequestAlpha1); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_dapr_proto_runtime_v1_sandbox_proto_msgTypes[9].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SandboxSessionCloseRequestAlpha1); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++	}
++	type x struct{}
++	out := protoimpl.TypeBuilder{
++		File: protoimpl.DescBuilder{
++			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
++			RawDescriptor: file_dapr_proto_runtime_v1_sandbox_proto_rawDesc,
++			NumEnums:      0,
++			NumMessages:   12,
++			NumExtensions: 0,
++			NumServices:   0,
++		},
++		GoTypes:           file_dapr_proto_runtime_v1_sandbox_proto_goTypes,
++		DependencyIndexes: file_dapr_proto_runtime_v1_sandbox_proto_depIdxs,
++		MessageInfos:      file_dapr_proto_runtime_v1_sandbox_proto_msgTypes,
++	}.Build()
++	File_dapr_proto_runtime_v1_sandbox_proto = out.File
++	file_dapr_proto_runtime_v1_sandbox_proto_rawDesc = nil
++	file_dapr_proto_runtime_v1_sandbox_proto_goTypes = nil
++	file_dapr_proto_runtime_v1_sandbox_proto_depIdxs = nil
++}
+-- 
+2.47.0
+
