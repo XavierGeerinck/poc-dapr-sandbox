@@ -14,6 +14,14 @@
 //! (`template=snapshot`, retried with backoff), then fill the warm pool with
 //! up to `refillConcurrency` workers. Every claim tops the pool up again.
 //! [`Pool::shutdown`] destroys every VM and waits, bounded, for in-flight work.
+//!
+//! # Replacement
+//!
+//! Pools of one component share VM names and the template name. A pool that
+//! replaces another ([`Pool::start_after`]) waits, without a bound, until the
+//! old pool has finished every task (in-flight spawns and template
+//! preparation included, and transitively every pool the old one replaced),
+//! then continues its VM numbering. So same-component pools never overlap.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -137,6 +145,8 @@ pub fn template_name(component: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
     New,
+    /// Waiting for the pool this one replaces to finish all its work.
+    Waiting,
     Reaping,
     Preparing {
         attempt: u32,
@@ -160,8 +170,9 @@ struct State {
     phase: Phase,
     /// Warm, unclaimed VMs; claimed oldest first.
     warm: VecDeque<String>,
-    /// Acquired VMs and when they were handed out.
-    live: HashMap<String, Instant>,
+    /// Acquired VMs and when they were handed out. On tokio's clock, so
+    /// tests can pause and advance it.
+    live: HashMap<String, tokio::time::Instant>,
     /// Refill workers in flight (including their failure backoff).
     filling: u32,
     /// On-demand spawns in flight; they count against maxSandboxesPerHost.
@@ -258,18 +269,53 @@ impl Pool {
     /// prepare the template, then fill to `warm_pool_size`. Only the first
     /// call (before `shutdown`) does anything.
     pub fn start(self: &Arc<Self>) {
-        {
-            let mut st = self.lock();
-            if st.phase != Phase::New {
-                return;
-            }
-            st.phase = Phase::Reaping;
-        }
-        let this = Arc::clone(self);
-        self.tasks.spawn(async move { this.run_startup().await });
+        self.start_after(None);
     }
 
-    async fn run_startup(self: Arc<Self>) {
+    /// Like [`start`](Self::start), but for a pool that replaces `previous`
+    /// (same component): closes `previous`, waits without a bound until it
+    /// has finished all its work, then continues its VM numbering and starts.
+    /// `ready` reports "waiting for the previous pool to shut down" meanwhile.
+    ///
+    /// Call it before this pool can itself be closed by a later replacement,
+    /// so that the chain of waits is unbroken (the service does both under
+    /// one lock). On a pool that is already closed it still waits for
+    /// `previous` and carries its numbering, but starts nothing.
+    pub fn start_after(self: &Arc<Self>, previous: Option<Arc<Pool>>) {
+        {
+            let mut st = self.lock();
+            match st.phase {
+                Phase::New => {
+                    st.phase = if previous.is_some() {
+                        Phase::Waiting
+                    } else {
+                        Phase::Reaping
+                    };
+                }
+                Phase::Closed if previous.is_some() => {}
+                _ => return,
+            }
+        }
+        if let Some(prev) = &previous {
+            prev.close();
+        }
+        let this = Arc::clone(self);
+        self.tasks
+            .spawn(async move { this.run_startup(previous).await });
+    }
+
+    async fn run_startup(self: Arc<Self>, previous: Option<Arc<Pool>>) {
+        if let Some(prev) = previous {
+            // Unbounded: the old pool may still be inside a spawn or a
+            // template preparation for names this pool would reuse.
+            prev.wait_closed().await;
+            self.counter
+                .fetch_max(prev.counter.load(Ordering::SeqCst), Ordering::SeqCst);
+            drop(prev);
+            if !self.set_phase(Phase::Reaping) {
+                return;
+            }
+        }
         self.reap_leftovers().await;
 
         if self.cfg.template == Template::Snapshot {
@@ -391,6 +437,7 @@ impl Pool {
         let want = self.cfg.warm_pool_size as usize;
         match &st.phase {
             Phase::New => (false, "starting".into()),
+            Phase::Waiting => (false, "waiting for the previous pool to shut down".into()),
             Phase::Reaping => (false, "reaping leftover VMs".into()),
             Phase::Preparing {
                 last_error: None, ..
@@ -433,7 +480,7 @@ impl Pool {
             let hit = st.warm.pop_front();
             match &hit {
                 Some(name) => {
-                    st.live.insert(name.clone(), start);
+                    st.live.insert(name.clone(), tokio::time::Instant::now());
                 }
                 None => st.inline += 1,
             }
@@ -467,15 +514,17 @@ impl Pool {
         })
     }
 
-    async fn spawn_on_demand(self: Arc<Self>, tx: oneshot::Sender<Result<String, PoolError>>) {
+    async fn spawn_on_demand(self: Arc<Self>, mut tx: oneshot::Sender<Result<String, PoolError>>) {
         // Wait for startup: leftovers must be gone (their names) and the
-        // template must exist. Only matters before the pool is ready.
-        let mut stage = self.stage.subscribe();
-        let stage = stage
-            .wait_for(|s| *s != Stage::Starting)
-            .await
-            .map(|s| *s)
-            .unwrap_or(Stage::Closed);
+        // template must exist. Only matters before the pool is ready. A
+        // caller that goes away meanwhile frees its host slot at once.
+        let mut stage_rx = self.stage.subscribe();
+        let stage = tokio::select! {
+            s = stage_rx.wait_for(|s| *s != Stage::Starting) => {
+                s.map(|s| *s).unwrap_or(Stage::Closed)
+            }
+            () = tx.closed() => Stage::Closed,
+        };
         if stage == Stage::Closed || tx.is_closed() {
             self.lock().inline -= 1;
             let _ = tx.send(Err(PoolError::Closed));
@@ -502,7 +551,7 @@ impl Pool {
                     // before it is recorded as live.
                     match tx.send(Ok(name.clone())) {
                         Ok(()) => {
-                            st.live.insert(name.clone(), Instant::now());
+                            st.live.insert(name.clone(), tokio::time::Instant::now());
                         }
                         Err(_) => {
                             debug!(vm = %name, "acquire caller went away; keeping the VM warm");
@@ -553,6 +602,14 @@ impl Pool {
 
     /// One refill worker: spawns one warm VM, then tops up again.
     async fn fill_one(self: Arc<Self>) {
+        // Boot nothing once the pool is closing.
+        {
+            let mut st = self.lock();
+            if st.phase == Phase::Closed {
+                st.filling -= 1;
+                return;
+            }
+        }
         let name = self.next_name();
         let res = self
             .backend
@@ -621,7 +678,7 @@ impl Pool {
     /// how many were released.
     pub fn reconcile(&self, live: &[String]) -> u32 {
         let keep: HashSet<&str> = live.iter().map(String::as_str).collect();
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let gone: Vec<String> = {
             let mut st = self.lock();
             let gone: Vec<String> = st
@@ -651,6 +708,20 @@ impl Pool {
     /// spawns and destroys. A spawn that finishes later destroys its VM. Safe
     /// to call more than once.
     pub async fn shutdown(&self) {
+        self.close();
+        if tokio::time::timeout(self.opts.shutdown_timeout, self.wait_closed())
+            .await
+            .is_err()
+        {
+            warn!(component = %self.component, pending = self.tasks.len(),
+                timeout = ?self.opts.shutdown_timeout, "shutdown timed out with work in flight");
+        }
+    }
+
+    /// Closes the pool and starts destroying its VMs; returns at once.
+    /// Acquire fails with `Closed` from now on; spawns that finish later
+    /// destroy their VM. Idempotent.
+    pub fn close(&self) {
         let names: Vec<String> = {
             let mut st = self.lock();
             st.phase = Phase::Closed;
@@ -667,13 +738,14 @@ impl Pool {
             self.destroy_later(name);
         }
         self.tasks.close();
-        if tokio::time::timeout(self.opts.shutdown_timeout, self.tasks.wait())
-            .await
-            .is_err()
-        {
-            warn!(component = %self.component, pending = self.tasks.len(),
-                timeout = ?self.opts.shutdown_timeout, "shutdown timed out with work in flight");
-        }
+    }
+
+    /// Waits, without a bound, until a closed pool has finished every task:
+    /// startup (including its wait for the pool it replaced), refills,
+    /// on-demand spawns and destroys. Returns at once on a pool that was
+    /// never started; never returns on a pool that is not closed.
+    pub async fn wait_closed(&self) {
+        self.tasks.wait().await;
     }
 
     pub fn stats(&self) -> PoolStats {

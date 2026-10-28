@@ -136,7 +136,6 @@ dependencies = [
  "async-trait",
  "hyper-util",
  "prost",
- "prost-build",
  "regex",
  "sha2",
  "tempfile",

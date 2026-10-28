@@ -1,11 +1,18 @@
 //! Generates the `dapr.proto.components.v1` Sandbox service (server and
 //! client) and a file descriptor set for gRPC reflection.
 //!
-//! protoc: `$PROTOC` if set; otherwise the pinned protoc 34.1 at
-//! `~/.local/protoc-34.1/bin/protoc` if it exists; otherwise `protoc` on PATH.
+//! Needs protoc: `$PROTOC` if set, else `protoc` on PATH. This repo pins
+//! protoc 34.1 (see the top-level README), so on a dev machine:
+//!
+//! ```sh
+//! export PROTOC=$HOME/.local/protoc-34.1/bin/protoc
+//! ```
+//!
+//! A container build must install protoc or set `PROTOC`.
 
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
 
 const PROTO_ROOT: &str = "proto";
 const PROTOS: &[&str] = &[
@@ -19,14 +26,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-changed={p}");
     }
 
-    let mut config = prost_build::Config::new();
-    if env::var_os("PROTOC").is_none()
-        && let Some(home) = env::var_os("HOME")
-    {
-        let pinned = PathBuf::from(home).join(".local/protoc-34.1/bin/protoc");
-        if pinned.is_file() {
-            config.protoc_executable(pinned);
-        }
+    // prost-build itself uses $PROTOC, else `protoc` on PATH; check first so
+    // that a missing protoc fails with an actionable message.
+    let protoc = env::var_os("PROTOC").unwrap_or_else(|| "protoc".into());
+    if let Err(e) = Command::new(&protoc).arg("--version").output() {
+        return Err(format!(
+            "cannot run protoc ({}: {e}). Install protoc or set PROTOC, e.g. \
+             PROTOC=$HOME/.local/protoc-34.1/bin/protoc",
+            PathBuf::from(&protoc).display()
+        )
+        .into());
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
@@ -34,6 +43,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .file_descriptor_set_path(out_dir.join("sandbox_descriptor.bin"))
-        .compile_with_config(config, PROTOS, &[PROTO_ROOT])?;
+        .compile_protos(PROTOS, &[PROTO_ROOT])?;
     Ok(())
 }

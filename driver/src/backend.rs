@@ -12,10 +12,14 @@
 //! - **Cancellation.** The gRPC layer may drop an `exec`/`session_*` future
 //!   when the caller goes away; those must be cancel-safe. The pool never
 //!   drops `spawn`, `prepare_template`, `destroy` or `list` futures.
-//! - **Errors.** [`BackendError::NotFound`] for an unknown VM or session
-//!   (daprd turns it into "sandbox lost" on exec), including a VM destroyed
-//!   while an `exec` on it was running; [`BackendError::InvalidArgument`] for
-//!   bad input; [`BackendError::Internal`] for everything else.
+//! - **Errors.** [`BackendError::NotFound`] is reserved for an unknown VM or
+//!   session on `exec`, `session_*` and `destroy` (daprd turns it into
+//!   "sandbox lost" on exec), including a VM destroyed while an `exec` on it
+//!   was running. [`BackendError::InvalidArgument`] for bad input;
+//!   [`BackendError::Internal`] for everything else. Failures of `spawn`,
+//!   `prepare_template` and `list` reach daprd as `INTERNAL` whatever their
+//!   variant (the service maps them), since daprd would read `NOT_FOUND` on
+//!   Acquire as "invalid request".
 //! - **Output.** At most [`OUTPUT_CAP`] bytes per stream; drop the rest and
 //!   set `truncated`. The service enforces the cap again.
 
@@ -166,6 +170,7 @@ pub mod fake {
         prepare_delay: Duration,
         exec_delay: Duration,
         fail_spawns: u32,
+        spawn_error: Option<BackendError>,
         fail_prepares: u32,
         fail_list: bool,
         spawn_gate: Option<Arc<Semaphore>>,
@@ -214,7 +219,14 @@ pub mod fake {
 
         /// The next `n` spawns fail with `Internal`.
         pub fn fail_next_spawns(&self, n: u32) {
-            self.lock().fail_spawns = n;
+            self.fail_next_spawns_with(n, BackendError::Internal("injected spawn failure".into()));
+        }
+
+        /// The next `n` spawns fail with `err`.
+        pub fn fail_next_spawns_with(&self, n: u32, err: BackendError) {
+            let mut st = self.lock();
+            st.fail_spawns = n;
+            st.spawn_error = Some(err);
         }
 
         /// The next `n` template preparations fail with `Internal`.
@@ -344,7 +356,10 @@ pub mod fake {
             let mut st = self.lock();
             if st.fail_spawns > 0 {
                 st.fail_spawns -= 1;
-                return Err(BackendError::Internal("injected spawn failure".into()));
+                return Err(st
+                    .spawn_error
+                    .clone()
+                    .unwrap_or_else(|| BackendError::Internal("injected spawn failure".into())));
             }
             if let Some(t) = from_template
                 && !st.templates.contains(t)

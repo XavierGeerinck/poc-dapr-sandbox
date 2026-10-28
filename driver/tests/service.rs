@@ -1,15 +1,15 @@
 //! The gRPC service over a temp Unix socket, with a tonic client, and the
 //! binary itself.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dapr_sandbox_microvm::backend::fake::FakeBackend;
-use dapr_sandbox_microvm::backend::{ExecResult, VmBackend};
-use dapr_sandbox_microvm::pool::{PoolOptions, vm_prefix};
+use dapr_sandbox_microvm::backend::{BackendError, ExecResult, VmBackend};
+use dapr_sandbox_microvm::pool::{PoolOptions, vm_name, vm_prefix};
 use dapr_sandbox_microvm::proto::sandbox_client::SandboxClient;
 use dapr_sandbox_microvm::proto::*;
 use dapr_sandbox_microvm::service::{COMPONENT_HEADER, SandboxService, serve};
@@ -136,6 +136,15 @@ impl Harness {
         self.service.shutdown().await;
         let _ = self.stop.take().unwrap().send(());
         self.server.take().unwrap().await.unwrap();
+    }
+}
+
+/// Polls `f` every 2 ms until it holds or `WAIT` passes.
+async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !f() {
+        assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
 }
 
@@ -324,9 +333,22 @@ async fn init_returns_before_the_pool_is_ready() {
         "{:?}",
         start.elapsed()
     );
-    let r = h.ready("a").await;
-    assert!(!r.ready);
-    assert_eq!(r.reason, "preparing template");
+    // Startup moves through reaping to the 500 ms template preparation.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let r = h.ready("a").await;
+        assert!(!r.ready, "ready before the template: {}", r.reason);
+        if r.reason == "preparing template" {
+            break;
+        }
+        assert!(
+            ["starting", "reaping leftover VMs"].contains(&r.reason.as_str()),
+            "{}",
+            r.reason
+        );
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
     h.wait_ready("a").await;
     h.stop().await;
 }
@@ -347,6 +369,124 @@ async fn init_again_replaces_the_pool() {
     assert!(h.fake.destroyed().contains(&old));
     // Only the new pool's two warm VMs remain.
     assert_eq!(h.fake.vms().len(), 2, "{:?}", h.fake.vms());
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_init_serialises_replacement() {
+    let mut h = Harness::new().await;
+    h.fake.pause_spawns();
+    h.init("a", &[("warmPoolSize", "2")]).await;
+    let p0 = h.service.pool("a").unwrap();
+    // P0 is inside two spawns (VMs 0 and 1) when daprd initializes the
+    // component twice more in quick succession (P1, then P2).
+    eventually("P0 spawning", || p0.stats().filling == 2).await;
+    h.init("a", &[("warmPoolSize", "2")]).await;
+    h.init("a", &[("warmPoolSize", "2")]).await;
+
+    // P2 waits for P0's in-flight spawns (through P1, which never starts);
+    // nothing touched P0's names or template meanwhile.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let r = h.ready("a").await;
+    assert!(!r.ready);
+    assert_eq!(r.reason, "waiting for the previous pool to shut down");
+    assert_eq!(h.fake.prepared().len(), 1);
+
+    h.fake.resume_spawns();
+    h.wait_ready("a").await;
+    // Every name was used once: P0's late VMs were destroyed and P2 numbered
+    // past them. Only P0 and P2 prepared the template.
+    let spawned: Vec<String> = h.fake.spawned().into_iter().map(|(n, _)| n).collect();
+    let unique: HashSet<&String> = spawned.iter().collect();
+    assert_eq!(unique.len(), spawned.len(), "{spawned:?}");
+    assert_eq!(h.fake.prepared().len(), 2);
+    assert_eq!(h.fake.vms(), vec![vm_name("a", 2), vm_name("a", 3)]);
+
+    let id = h.acquire("a").await.unwrap().instance_id;
+    let out = h.exec("a", &id, cmd("echo", &["ok"])).await.unwrap();
+    assert_eq!(out.stdout, b"ok\n");
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_on_demand_spawn_is_internal() {
+    let mut h = Harness::new().await;
+    h.init("a", &[("warmPoolSize", "0")]).await;
+    h.wait_ready("a").await;
+    // Whatever the backend calls it, a failed spawn is a driver failure:
+    // daprd would read NOT_FOUND on Acquire as "invalid request".
+    h.fake
+        .fail_next_spawns_with(1, BackendError::NotFound("template vanished".into()));
+    let err = h.acquire("a").await.unwrap_err();
+    assert_eq!(err.code(), Code::Internal, "{err:?}");
+    assert!(
+        err.message().contains("template vanished"),
+        "{}",
+        err.message()
+    );
+    h.acquire("a").await.unwrap();
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn component_header() {
+    let mut h = Harness::new().await;
+    let init = || SandboxInitRequest {
+        metadata: Some(MetadataRequest {
+            properties: HashMap::from([("image".to_string(), "img".to_string())]),
+        }),
+    };
+    // Init needs a valid header: missing, empty or not visible ASCII.
+    let err = h.client.init(Request::new(init())).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    let err = h.client.init(req("", init())).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    let mut r = Request::new(init());
+    r.metadata_mut().insert(
+        COMPONENT_HEADER,
+        tonic::metadata::MetadataValue::try_from("ünï".as_bytes()).unwrap(),
+    );
+    let err = h.client.init(r).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    assert!(h.service.pool("").is_none());
+
+    // Other RPCs without it behave as for a component never initialized.
+    h.init("a", &[("warmPoolSize", "1")]).await;
+    h.wait_ready("a").await;
+    let ready = h
+        .client
+        .ready(Request::new(SandboxReadyRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!ready.ready);
+    assert!(ready.reason.contains(COMPONENT_HEADER), "{}", ready.reason);
+    let err = h
+        .client
+        .acquire(Request::new(SandboxAcquireRequest::default()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{err:?}");
+    let id = h.acquire("a").await.unwrap().instance_id;
+    let exec = SandboxExecRequest {
+        instance_id: id.clone(),
+        spec: Some(cmd("echo", &[])),
+    };
+    let err = h.client.exec(Request::new(exec)).await.unwrap_err();
+    assert_eq!(err.code(), Code::NotFound, "{err:?}");
+    let rel = SandboxReleaseRequest { instance_id: id };
+    let err = h.client.release(Request::new(rel)).await.unwrap_err();
+    assert_eq!(err.code(), Code::NotFound, "{err:?}");
+    let rec = SandboxReconcileRequest {
+        live_instance_ids: vec![],
+    };
+    let res = h
+        .client
+        .reconcile(Request::new(rec))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(res.released, 0);
     h.stop().await;
 }
 

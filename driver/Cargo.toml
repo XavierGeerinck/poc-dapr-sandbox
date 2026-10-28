@@ -36,11 +36,12 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 [build-dependencies]
-prost-build = "0.14.1"
 tonic-prost-build = "0.14.2"
 
 [dev-dependencies]
 hyper-util = { version = "0.1.17", features = ["tokio"] }
 regex = "1.12.2"
 tempfile = "3.23.0"
+# Paused, advanceable clock for time-dependent tests.
+tokio = { version = "1.48.0", features = ["test-util"] }
 tower = { version = "0.5.2", features = ["util"] }

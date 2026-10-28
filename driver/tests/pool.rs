@@ -201,7 +201,8 @@ async fn acquire_hit_does_not_wait_for_backend() {
         let a = p.acquire().await.unwrap();
         let took = start.elapsed();
         assert_eq!(a.path, AcquirePath::Pool);
-        assert!(took < Duration::from_millis(5), "pool hit took {took:?}");
+        // Far below the 2 s backend delays; loose enough for a loaded CI box.
+        assert!(took < Duration::from_millis(50), "pool hit took {took:?}");
         assert!(a.elapsed <= took);
     }
     fake.set_spawn_delay(Duration::ZERO);
@@ -253,7 +254,8 @@ async fn failed_spawns_are_retried() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_template_is_retried() {
     let fake = Arc::new(FakeBackend::new());
-    fake.fail_next_prepares(1);
+    // Two failures: the error is visible during 100 ms + 200 ms of backoff.
+    fake.fail_next_prepares(2);
     let p = pool(&fake, "comp", &[("warmPoolSize", "1")]);
     p.start();
     eventually("prepare failure reported", || {
@@ -384,38 +386,33 @@ async fn reconcile_releases_unknown() {
     p.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// The grace runs on tokio's clock, paused here, so the test steps it exactly.
+#[tokio::test(start_paused = true)]
 async fn reconcile_respects_grace() {
     let fake = Arc::new(FakeBackend::new());
-
-    // Default grace (60 s): a fresh instance survives an empty live set.
+    // Default grace: 60 s.
     let p = started(&fake, "comp", &[("warmPoolSize", "1")]).await;
     let a = p.acquire().await.unwrap().instance_id;
-    assert_eq!(p.reconcile(&[]), 0);
-    p.check(&a).unwrap();
-    p.shutdown().await;
-
-    // Short grace: released only once it has passed.
-    let opts = PoolOptions {
-        reconcile_grace: Duration::from_millis(300),
-        ..Default::default()
-    };
-    let p = pool_with(&fake, "comp2", &[("warmPoolSize", "1")], opts);
-    p.start();
-    eventually("ready", || p.ready().0).await;
-    let a = p.acquire().await.unwrap().instance_id;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::advance(Duration::from_secs(30)).await;
     let b = p.acquire().await.unwrap().instance_id;
-    assert_eq!(p.reconcile(&[]), 0, "both within grace");
-    tokio::time::sleep(Duration::from_millis(220)).await;
-    // a is past the grace, b is not.
+    assert_eq!(p.reconcile(&[]), 0, "both within the grace");
+
+    tokio::time::advance(Duration::from_secs(29)).await; // a: 59 s, b: 29 s
+    assert_eq!(p.reconcile(&[]), 0);
+    tokio::time::advance(Duration::from_secs(1)).await; // a: 60 s, b: 30 s
     assert_eq!(p.reconcile(&[]), 1);
     assert!(p.check(&a).is_err());
     p.check(&b).unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    tokio::time::advance(Duration::from_secs(30)).await; // b: 60 s
+    // A listed instance is kept however old.
+    assert_eq!(p.reconcile(std::slice::from_ref(&b)), 0);
     assert_eq!(p.reconcile(&[]), 1);
     assert!(p.check(&b).is_err());
+
     // Warm VMs are never released.
+    eventually("refilled", || p.stats().warm == 1).await;
+    tokio::time::advance(Duration::from_secs(600)).await;
     assert_eq!(p.reconcile(&[]), 0);
     assert_eq!(p.stats().warm, 1);
     p.shutdown().await;
@@ -481,6 +478,76 @@ async fn dropped_inline_acquire_keeps_the_vm() {
     let a = p.acquire().await.unwrap();
     assert_eq!(a.path, AcquirePath::Pool);
     p.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_acquire_frees_its_slot_during_startup() {
+    let fake = Arc::new(FakeBackend::new());
+    fake.set_prepare_delay(Duration::from_millis(500));
+    let p = pool(
+        &fake,
+        "comp",
+        &[("warmPoolSize", "0"), ("maxSandboxesPerHost", "1")],
+    );
+    p.start();
+    // A caller gives up while the template is still being prepared.
+    let r = tokio::time::timeout(Duration::from_millis(20), p.acquire()).await;
+    assert!(r.is_err());
+    eventually("slot freed", || p.stats().inline == 0).await;
+    assert!(!p.ready().0, "startup is still running");
+    // So the host is not full for the next caller.
+    let a = p.acquire().await.unwrap();
+    assert_eq!(a.path, AcquirePath::Restore);
+    assert_eq!(
+        fake.spawned().len(),
+        1,
+        "the abandoned acquire spawned nothing"
+    );
+    p.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacement_waits_for_the_previous_pool() {
+    let fake = Arc::new(FakeBackend::new());
+    fake.pause_spawns();
+    // The old pool is inside two spawns (VMs 0 and 1), and its bounded
+    // shutdown gives up on them.
+    let opts = PoolOptions {
+        shutdown_timeout: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let old = pool_with(&fake, "comp", &[("warmPoolSize", "2")], opts);
+    old.start();
+    eventually("old pool spawning", || old.stats().filling == 2).await;
+    old.shutdown().await;
+
+    let new = pool(&fake, "comp", &[("warmPoolSize", "1")]);
+    new.start_after(Some(old.clone()));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        new.ready(),
+        (
+            false,
+            "waiting for the previous pool to shut down".to_string()
+        )
+    );
+    assert_eq!(
+        fake.prepared().len(),
+        1,
+        "the template is the old pool's alone"
+    );
+
+    fake.resume_spawns();
+    eventually("new pool ready", || new.ready().0).await;
+    // The old pool's late VMs were destroyed, and the new pool numbered past
+    // them instead of reusing their names.
+    let destroyed = fake.destroyed();
+    for n in [vm_name("comp", 0), vm_name("comp", 1)] {
+        assert!(destroyed.contains(&n), "{n} not destroyed: {destroyed:?}");
+    }
+    assert_eq!(fake.vms(), vec![vm_name("comp", 2)]);
+    assert_eq!(fake.prepared().len(), 2);
+    new.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
