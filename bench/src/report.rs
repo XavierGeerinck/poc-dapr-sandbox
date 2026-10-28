@@ -94,7 +94,9 @@ pub struct Meta {
     pub max_late_ms: u64,
     pub request_timeout_ms: u64,
     /// Requests still in flight at the end that were aborted (status-0 rows).
-    pub aborted: u64,
+    pub aborted_requests: u64,
+    /// Cleanup deletes still running at the end that were aborted.
+    pub aborted_cleanups: u64,
     /// Timing values that could not be decoded (counted as 0).
     pub malformed_timing: u64,
 }
@@ -315,10 +317,10 @@ pub fn generate(in_dir: &Path, out_dir: &Path) -> Result<Report> {
                     f.name, m.malformed_timing
                 ));
             }
-            if m.aborted > 0 {
+            if m.aborted_requests > 0 {
                 warnings.push(format!(
                     "WARNING: {}: {} requests aborted at the end of the run",
-                    f.name, m.aborted
+                    f.name, m.aborted_requests
                 ));
             }
         }
@@ -395,7 +397,7 @@ pub fn generate(in_dir: &Path, out_dir: &Path) -> Result<Report> {
                 };
                 write!(
                     s,
-                    "; {} rate {} x {} hosts: expected {}, fired {}, late {} ({pct:.1}%), max lateness {} ms, request timeout {} ms, aborted {}, malformed timing values {}",
+                    "; {} rate {} x {} hosts: expected {}, fired {}, late {} ({pct:.1}%), max lateness {} ms, request timeout {} ms, aborted requests {}, aborted cleanups {}, malformed timing values {}",
                     m.mode,
                     m.rate,
                     m.host_pods,
@@ -404,7 +406,8 @@ pub fn generate(in_dir: &Path, out_dir: &Path) -> Result<Report> {
                     m.late,
                     m.max_late_ms,
                     m.request_timeout_ms,
-                    m.aborted,
+                    m.aborted_requests,
+                    m.aborted_cleanups,
                     m.malformed_timing
                 )?;
             }

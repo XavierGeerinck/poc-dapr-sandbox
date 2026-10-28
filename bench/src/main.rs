@@ -8,7 +8,8 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(
     name = "sandbox-bench",
-    about = "Latency harness for the Dapr sandbox building block"
+    about = "Latency harness for the Dapr sandbox building block",
+    after_help = report::MEASUREMENT_BASIS
 )]
 struct Cli {
     #[command(subcommand)]

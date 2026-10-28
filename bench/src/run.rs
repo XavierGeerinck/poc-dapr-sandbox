@@ -120,7 +120,8 @@ struct Ctx {
     /// The CSV, appended and flushed per row so a killed run keeps its rows.
     csv: Mutex<std::fs::File>,
     timeout: Duration,
-    aborted: AtomicU64,
+    aborted_requests: AtomicU64,
+    aborted_cleanups: AtomicU64,
 }
 
 impl Ctx {
@@ -186,7 +187,7 @@ impl Ctx {
         for mut h in hs {
             if tokio::time::timeout_at(deadline, &mut h).await.is_err() {
                 h.abort();
-                self.aborted.fetch_add(1, Ordering::Relaxed);
+                self.aborted_cleanups.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -362,7 +363,8 @@ pub async fn run(cfg: Config, mode: Mode, out: &Path) -> Result<Vec<Row>> {
         fixed_id: None,
         csv: Mutex::new(file),
         timeout,
-        aborted: AtomicU64::new(0),
+        aborted_requests: AtomicU64::new(0),
+        aborted_cleanups: AtomicU64::new(0),
     };
 
     // Warm keep-alive connections untimed.
@@ -455,7 +457,7 @@ pub async fn run(cfg: Config, mode: Mode, out: &Path) -> Result<Vec<Row>> {
                     failed => {
                         if failed.is_err() {
                             h.abort();
-                            ctx.aborted.fetch_add(1, Ordering::Relaxed);
+                            ctx.aborted_requests.fetch_add(1, Ordering::Relaxed);
                         }
                         eprintln!("seq {seq}: task did not finish (panicked or hung)");
                         let r = row(&ctx, "rate", rate, seq, None, "");
@@ -482,7 +484,8 @@ pub async fn run(cfg: Config, mode: Mode, out: &Path) -> Result<Vec<Row>> {
     }
     ctx.drain_cleanups().await;
 
-    meta.aborted = ctx.aborted.load(Ordering::Relaxed);
+    meta.aborted_requests = ctx.aborted_requests.load(Ordering::Relaxed);
+    meta.aborted_cleanups = ctx.aborted_cleanups.load(Ordering::Relaxed);
     meta.malformed_timing = MALFORMED.load(Ordering::Relaxed);
     if meta.malformed_timing > 0 {
         eprintln!(
@@ -490,10 +493,10 @@ pub async fn run(cfg: Config, mode: Mode, out: &Path) -> Result<Vec<Row>> {
             meta.malformed_timing
         );
     }
-    if meta.aborted > 0 {
+    if meta.aborted_requests > 0 || meta.aborted_cleanups > 0 {
         eprintln!(
-            "warning: {} requests/cleanups aborted at the end",
-            meta.aborted
+            "warning: aborted at the end: {} requests, {} cleanups",
+            meta.aborted_requests, meta.aborted_cleanups
         );
     }
     let mp = meta_path(out);
