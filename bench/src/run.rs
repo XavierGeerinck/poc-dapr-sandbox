@@ -347,6 +347,14 @@ pub async fn run(cfg: Config, mode: Mode, out: &Path) -> Result<Vec<Row>> {
     if let Some(p) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(p)?;
     }
+    // A killed earlier run may have left its sidecar; it must not describe
+    // this run's rows.
+    match std::fs::remove_file(meta_path(out)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("removing {}", meta_path(out).display()));
+        }
+        _ => {}
+    }
     let mut file =
         std::fs::File::create(out).with_context(|| format!("writing {}", out.display()))?;
     writeln!(file, "{CSV_HEADER}")?;
