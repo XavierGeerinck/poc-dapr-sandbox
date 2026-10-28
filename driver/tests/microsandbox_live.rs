@@ -1,0 +1,625 @@
+//! Live tests of the microsandbox backend. They boot real microVMs (a
+//! hypervisor, the `python:3.12-slim` image, a few GiB of RAM), so every test
+//! is `#[ignore]`d:
+//!
+//! ```sh
+//! cargo test --manifest-path driver/Cargo.toml --test microsandbox_live -- --ignored --nocapture
+//! ```
+//!
+//! They use their own microsandbox home, `/tmp/dsb-live-<uid>` (override with
+//! `DSB_LIVE_MSB_HOME`), never the user's: it must be short, because
+//! microsandbox puts Unix sockets under it (see `MAX_MSB_HOME_LEN`). The
+//! tests share one image cache there and run one at a time (a process-wide
+//! lock), so that timings are not skewed by each other. VM and template
+//! names follow the pool's (`dsb-<hash>-NNNNNN`), one component per test.
+//! `live_network_isolation` also needs Internet access from the host.
+
+#![cfg(feature = "microsandbox")]
+
+use std::collections::HashMap;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use dapr_sandbox_microvm::backend::{BackendError, ExecSpec, OUTPUT_CAP, VmBackend};
+use dapr_sandbox_microvm::config::Config;
+use dapr_sandbox_microvm::microsandbox_backend::{MAX_MSB_HOME_LEN, MicrosandboxBackend};
+use dapr_sandbox_microvm::pool::{template_name, vm_name, vm_prefix};
+use dapr_sandbox_microvm::service::SandboxService;
+
+const IMAGE: &str = "python:3.12-slim";
+
+/// One live test at a time.
+static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn live_home() -> PathBuf {
+    if let Some(h) = std::env::var_os("DSB_LIVE_MSB_HOME").filter(|h| !h.is_empty()) {
+        return PathBuf::from(h);
+    }
+    let uid = String::from_utf8(
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let home = PathBuf::from(format!("/tmp/dsb-live-{}", uid.trim()));
+    assert!(home.as_os_str().len() <= MAX_MSB_HOME_LEN);
+    match std::fs::create_dir(&home) {
+        Ok(()) => std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap(),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => panic!("creating {}: {e}", home.display()),
+    }
+    // /tmp is shared: refuse a directory someone else planted.
+    let md = std::fs::symlink_metadata(&home).unwrap();
+    assert!(md.is_dir(), "{} is not a directory", home.display());
+    assert_eq!(
+        md.uid().to_string(),
+        uid.trim(),
+        "{} belongs to someone else",
+        home.display()
+    );
+    assert_eq!(
+        md.mode() & 0o077,
+        0,
+        "{} is accessible to others",
+        home.display()
+    );
+    home
+}
+
+async fn backend() -> Arc<MicrosandboxBackend> {
+    Arc::new(MicrosandboxBackend::new(live_home()).await.unwrap())
+}
+
+fn cfg(kv: &[(&str, &str)]) -> Config {
+    let mut props = HashMap::from([("image".to_string(), IMAGE.to_string())]);
+    for (k, v) in kv {
+        props.insert(k.to_string(), v.to_string());
+    }
+    Config::from_properties(&props).unwrap()
+}
+
+fn spec(command: &str, args: &[&str]) -> ExecSpec {
+    ExecSpec {
+        command: command.into(),
+        args: args.iter().map(|a| a.to_string()).collect(),
+        ..Default::default()
+    }
+}
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
+/// The `p`-th percentile (nearest rank) of `samples`.
+fn percentile(samples: &[Duration], p: f64) -> Duration {
+    let mut s = samples.to_vec();
+    s.sort();
+    let rank = ((p / 100.0) * s.len() as f64).ceil() as usize;
+    s[rank.clamp(1, s.len()) - 1]
+}
+
+/// RAM images realized for copy-on-write restores (see
+/// `MicrosandboxBackend::remove_template`).
+fn ram_images(home: &std::path::Path) -> usize {
+    std::fs::read_dir(home.join("cache/memory/snapshots"))
+        .map(|d| {
+            d.filter(|e| {
+                e.as_ref()
+                    .is_ok_and(|e| e.file_name().to_string_lossy().ends_with(".ram"))
+            })
+            .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Prepares the component's template, timing it, after destroying VMs a
+/// failed earlier run left behind (as a pool's startup does).
+async fn prepare(b: &MicrosandboxBackend, component: &str, cfg: &Config) -> String {
+    for vm in b.list(&vm_prefix(component)).await.unwrap() {
+        b.destroy(&vm).await.unwrap();
+    }
+    let t = template_name(component);
+    let start = Instant::now();
+    b.prepare_template(cfg, &t).await.unwrap();
+    println!(
+        "{component}: prepare_template {:.0} ms",
+        ms(start.elapsed())
+    );
+    t
+}
+
+#[tokio::test]
+#[ignore = "boots microVMs"]
+async fn live_selftest() {
+    let _g = LOCK.lock().await;
+    let b = backend().await;
+    let c = cfg(&[]);
+    let ram_before = ram_images(b.home());
+    let t = prepare(&b, "live-selftest", &c).await;
+    let vm = vm_name("live-selftest", 1);
+
+    let start = Instant::now();
+    b.spawn(&c, &vm, Some(&t)).await.unwrap();
+    println!("restore {:.0} ms", ms(start.elapsed()));
+
+    let r = b.exec(&vm, spec("echo", &["ok"])).await.unwrap();
+    assert_eq!(r.stdout, b"ok\n");
+    assert_eq!(r.exit_code, 0);
+    assert!(!r.timed_out && !r.truncated);
+
+    // The exec relay alone, on a running VM.
+    let mut samples = Vec::new();
+    for _ in 0..20 {
+        let start = Instant::now();
+        let r = b.exec(&vm, spec("echo", &["ok"])).await.unwrap();
+        samples.push(start.elapsed());
+        assert_eq!(r.stdout, b"ok\n");
+    }
+    println!(
+        "exec echo ok x20: p50 {:.2} ms, p90 {:.2} ms, max {:.2} ms",
+        ms(percentile(&samples, 50.0)),
+        ms(percentile(&samples, 90.0)),
+        ms(percentile(&samples, 100.0))
+    );
+
+    // Stdin, env, cwd and exit codes.
+    let mut s = spec("sh", &["-c", "cat; echo \"$FOO\"; pwd; exit 3"]);
+    s.stdin = b"in\n".to_vec();
+    s.env = HashMap::from([("FOO".into(), "bar".into())]);
+    s.cwd = "/tmp".into();
+    let r = b.exec(&vm, s).await.unwrap();
+    assert_eq!(r.stdout, b"in\nbar\n/tmp\n");
+    assert_eq!(r.exit_code, 3);
+
+    // A command that cannot start is the caller's mistake.
+    let e = b.exec(&vm, spec("no-such-command", &[])).await.unwrap_err();
+    assert!(matches!(e, BackendError::InvalidArgument(_)), "{e:?}");
+
+    b.destroy(&vm).await.unwrap();
+    let e = b.exec(&vm, spec("echo", &["ok"])).await.unwrap_err();
+    assert!(matches!(e, BackendError::NotFound(_)), "{e:?}");
+    let e = b.destroy(&vm).await.unwrap_err();
+    assert!(matches!(e, BackendError::NotFound(_)), "{e:?}");
+    b.remove_template(&t).await.unwrap();
+    // The restore's RAM image went with the template.
+    let ram_after = ram_images(b.home());
+    println!("RAM images: {ram_before} before, {ram_after} after");
+    assert!(ram_after <= ram_before);
+}
+
+#[tokio::test]
+#[ignore = "boots microVMs"]
+async fn live_session_turn2() {
+    let _g = LOCK.lock().await;
+    let b = backend().await;
+    let c = cfg(&[]);
+    let t = prepare(&b, "live-session", &c).await;
+    let vm = vm_name("live-session", 1);
+    b.spawn(&c, &vm, Some(&t)).await.unwrap();
+
+    let sid = b
+        .session_start(&vm, spec("python3", &["-u", "-i", "-q"]))
+        .await
+        .unwrap();
+    let start = Instant::now();
+    let r1 = b
+        .session_send(&vm, &sid, b"x = 42\n", b">>> ", Duration::from_secs(10))
+        .await
+        .unwrap();
+    println!("turn 1: {:.1} ms {r1:?}", ms(start.elapsed()));
+    assert!(!r1.timed_out, "{r1:?}");
+    // Stdout and stderr are separate pipes, so the prompt may overtake the
+    // output: wait for the output itself.
+    let start = Instant::now();
+    let r2 = b
+        .session_send(
+            &vm,
+            &sid,
+            b"print(x * 2)\n",
+            b"84\n",
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    println!("turn 2: {:.1} ms {r2:?}", ms(start.elapsed()));
+    assert!(!r2.timed_out, "{r2:?}");
+    assert!(String::from_utf8_lossy(&r2.stdout).contains("84"), "{r2:?}");
+
+    // Without `until` a send waits out its timeout and does not time out.
+    let r3 = b
+        .session_send(&vm, &sid, b"", b"", Duration::from_millis(50))
+        .await
+        .unwrap();
+    assert!(!r3.timed_out);
+
+    // The process exits: the send reports it.
+    let r4 = b
+        .session_send(&vm, &sid, b"exit(7)\n", b"never", Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(r4.exit_code, 7, "{r4:?}");
+    assert!(!r4.timed_out, "{r4:?}");
+
+    b.session_close(&vm, &sid).await.unwrap();
+    let e = b
+        .session_send(&vm, &sid, b"", b"", Duration::ZERO)
+        .await
+        .unwrap_err();
+    assert!(matches!(e, BackendError::NotFound(_)), "{e:?}");
+
+    // Destroying the VM ends its sessions.
+    let sid = b.session_start(&vm, spec("cat", &[])).await.unwrap();
+    b.destroy(&vm).await.unwrap();
+    let e = b
+        .session_send(&vm, &sid, b"x", b"x", Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, BackendError::NotFound(_)), "{e:?}");
+    b.remove_template(&t).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "boots microVMs"]
+async fn live_restore_many() {
+    let _g = LOCK.lock().await;
+    let b = backend().await;
+    let c = cfg(&[]);
+    let t = prepare(&b, "live-many", &c).await;
+
+    let wall = Instant::now();
+    let mut set = tokio::task::JoinSet::new();
+    for i in 1..=8 {
+        let (b, c, t) = (Arc::clone(&b), c.clone(), t.clone());
+        set.spawn(async move {
+            let vm = vm_name("live-many", i);
+            let start = Instant::now();
+            b.spawn(&c, &vm, Some(&t)).await.unwrap();
+            (vm, start.elapsed())
+        });
+    }
+    let mut vms = Vec::new();
+    let mut samples = Vec::new();
+    while let Some(r) = set.join_next().await {
+        let (vm, d) = r.unwrap();
+        vms.push(vm);
+        samples.push(d);
+    }
+    let wall = wall.elapsed();
+    println!(
+        "8 concurrent restores: p50 {:.0} ms, p90 {:.0} ms, max {:.0} ms, wall {:.0} ms",
+        ms(percentile(&samples, 50.0)),
+        ms(percentile(&samples, 90.0)),
+        ms(percentile(&samples, 100.0)),
+        ms(wall)
+    );
+
+    for vm in &vms {
+        let r = b.exec(vm, spec("echo", &[vm])).await.unwrap();
+        assert_eq!(r.stdout, format!("{vm}\n").as_bytes());
+    }
+    let mut listed = b.list(&vm_prefix("live-many")).await.unwrap();
+    listed.sort();
+    vms.sort();
+    assert_eq!(listed, vms);
+    for vm in &vms {
+        b.destroy(vm).await.unwrap();
+    }
+    assert!(b.list(&vm_prefix("live-many")).await.unwrap().is_empty());
+    b.remove_template(&t).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "boots microVMs"]
+async fn live_timeout_and_cap() {
+    let _g = LOCK.lock().await;
+    let b = backend().await;
+    let c = cfg(&[]);
+    let t = prepare(&b, "live-limits", &c).await;
+    let vm = vm_name("live-limits", 1);
+    b.spawn(&c, &vm, Some(&t)).await.unwrap();
+
+    let mut s = spec("python3", &["-c", "while True: pass"]);
+    s.timeout_ms = 500;
+    let start = Instant::now();
+    let r = b.exec(&vm, s).await.unwrap();
+    let took = start.elapsed();
+    println!("timeout 500 ms: returned after {:.0} ms: {r:?}", ms(took));
+    assert!(r.timed_out, "{r:?}");
+    assert_ne!(r.exit_code, 0);
+    assert!(took >= Duration::from_millis(500) && took < Duration::from_secs(5));
+
+    let start = Instant::now();
+    let r = b
+        .exec(&vm, spec("head", &["-c", "10485760", "/dev/zero"]))
+        .await
+        .unwrap();
+    println!(
+        "10 MiB of output: {:.0} ms, kept {} bytes",
+        ms(start.elapsed()),
+        r.stdout.len()
+    );
+    assert_eq!(r.stdout.len(), OUTPUT_CAP);
+    assert_eq!(OUTPUT_CAP, 4194304);
+    assert!(r.truncated);
+    assert_eq!(r.exit_code, 0);
+    assert!(!r.timed_out);
+
+    // The VM is still usable.
+    let r = b.exec(&vm, spec("echo", &["ok"])).await.unwrap();
+    assert_eq!(r.stdout, b"ok\n");
+    b.destroy(&vm).await.unwrap();
+    b.remove_template(&t).await.unwrap();
+}
+
+/// Guest processes whose command line contains `needle`.
+async fn guest_procs(b: &MicrosandboxBackend, vm: &str, needle: &str) -> Vec<String> {
+    let script = "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline 2>/dev/null; echo; done";
+    let r = b.exec(vm, spec("sh", &["-c", script])).await.unwrap();
+    String::from_utf8_lossy(&r.stdout)
+        .lines()
+        .filter(|l| l.contains(needle) && !l.contains("/proc/"))
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "boots microVMs"]
+async fn live_cancel_and_destroy_race() {
+    let _g = LOCK.lock().await;
+    let b = backend().await;
+    let c = cfg(&[]);
+    let t = prepare(&b, "live-race", &c).await;
+    let vm = vm_name("live-race", 1);
+    b.spawn(&c, &vm, Some(&t)).await.unwrap();
+
+    // A dropped exec future kills its command.
+    let fut = b.exec(&vm, spec("sleep", &["1001"]));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), fut)
+            .await
+            .is_err()
+    );
+    // A dropped session start or send leaks nothing either.
+    let sid = b
+        .session_start(&vm, spec("sleep", &["1002"]))
+        .await
+        .unwrap();
+    let fut = b.session_send(&vm, &sid, b"", b"never", Duration::from_secs(60));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), fut)
+            .await
+            .is_err()
+    );
+    b.session_close(&vm, &sid).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = guest_procs(&b, &vm, "sleep 100").await;
+        if left.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "still running: {left:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // An exec on a VM that gets destroyed ends with NotFound.
+    let racer = {
+        let (b, vm) = (Arc::clone(&b), vm.clone());
+        tokio::spawn(async move { b.exec(&vm, spec("sleep", &["30"])).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let start = Instant::now();
+    b.destroy(&vm).await.unwrap();
+    println!(
+        "destroy with an exec in flight: {:.0} ms",
+        ms(start.elapsed())
+    );
+    let e = racer.await.unwrap().unwrap_err();
+    assert!(matches!(e, BackendError::NotFound(_)), "{e:?}");
+    b.remove_template(&t).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "boots microVMs; needs Internet access"]
+async fn live_network_isolation() {
+    let _g = LOCK.lock().await;
+    let b = backend().await;
+    let probe = "import socket\ntry:\n  socket.create_connection(('1.1.1.1', 443), timeout=5).close(); print('NET-OK')\nexcept OSError as e:\n  print('NET-FAIL', e)";
+
+    // Without setup the template has no network device at all.
+    let c = cfg(&[]);
+    let t = prepare(&b, "live-net-off", &c).await;
+    let vm = vm_name("live-net-off", 1);
+    b.spawn(&c, &vm, Some(&t)).await.unwrap();
+    let r = b
+        .exec(&vm, spec("sh", &["-c", "ls /sys/class/net"]))
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&r.stdout).contains("eth"), "{r:?}");
+    let r = b.exec(&vm, spec("python3", &["-c", probe])).await.unwrap();
+    assert!(r.stdout.starts_with(b"NET-FAIL"), "{r:?}");
+    b.destroy(&vm).await.unwrap();
+    b.remove_template(&t).await.unwrap();
+
+    // A setup that needs the network gets it in the template VM only.
+    let setup =
+        "python3 -c \"import socket; socket.create_connection(('1.1.1.1', 443), timeout=5)\"";
+    let c = cfg(&[("setup", setup)]);
+    let t = prepare(&b, "live-net-setup", &c).await;
+    let vm = vm_name("live-net-setup", 1);
+    b.spawn(&c, &vm, Some(&t)).await.unwrap();
+    let r = b.exec(&vm, spec("python3", &["-c", probe])).await.unwrap();
+    println!("restored from a template with network: {r:?}");
+    assert!(r.stdout.starts_with(b"NET-FAIL"), "{r:?}");
+    let r = b
+        .exec(
+            &vm,
+            spec(
+                "python3",
+                &[
+                    "-c",
+                    "import socket; print(socket.getaddrinfo('example.com', 443))",
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(r.exit_code, 0, "DNS resolved: {r:?}");
+    b.destroy(&vm).await.unwrap();
+    b.remove_template(&t).await.unwrap();
+}
+
+/// Command lines of this host's `msb` processes that mention `needle`.
+fn host_msb_procs(needle: &str) -> Vec<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-A", "-o", "command="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains("msb") && l.contains(needle))
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "boots microVMs"]
+async fn live_shutdown_no_orphans() {
+    let _g = LOCK.lock().await;
+    let b = backend().await;
+    let component = "live-shutdown";
+    let prefix = vm_prefix(component);
+    let service = SandboxService::new(b.clone());
+    let pool = service.replace_pool(component, cfg(&[("warmPoolSize", "3")]));
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let (ready, reason) = pool.ready();
+        if ready {
+            break;
+        }
+        assert!(Instant::now() < deadline, "not ready: {reason}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let a = pool.acquire().await.unwrap();
+    let r = b.exec(&a.instance_id, spec("echo", &["ok"])).await.unwrap();
+    assert_eq!(r.stdout, b"ok\n");
+    assert!(!host_msb_procs(&prefix).is_empty());
+
+    service.shutdown().await;
+    assert!(b.list(&prefix).await.unwrap().is_empty());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = host_msb_procs(&prefix);
+        if left.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "orphans: {left:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    b.remove_template(&template_name(component)).await.unwrap();
+}
+
+/// Step 5 stretch: a Python interpreter started by the template's `setup`
+/// (`setsid`, so not a microsandbox exec session or job), with modules
+/// pre-imported, lives on in every restored VM. A shell client hands it code
+/// through two FIFOs, skipping interpreter startup and imports.
+#[tokio::test]
+#[ignore = "boots microVMs"]
+async fn live_stretch_preimported_interpreter() {
+    const SERVER: &str = r#"
+import contextlib, io, os, traceback
+import asyncio, decimal, email.parser, http.client, json  # the pre-imports
+IN, OUT = '/run/pyd.in', '/run/pyd.out'
+g = {}
+for p in (IN, OUT):
+    if not os.path.exists(p):
+        os.mkfifo(p)
+while True:
+    with open(IN) as f:
+        code = f.read()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        try:
+            exec(code, g)
+        except Exception:
+            traceback.print_exc()
+    with open(OUT, 'w') as f:
+        f.write(buf.getvalue())
+"#;
+    let _g = LOCK.lock().await;
+    let b = backend().await;
+    let setup = format!(
+        "mkdir -p /run && cat > /tmp/pyd.py <<'EOF'\n{SERVER}\nEOF\n\
+         setsid python3 -u /tmp/pyd.py </dev/null >/tmp/pyd.log 2>&1 &\n\
+         i=0; while [ ! -p /run/pyd.out ]; do i=$((i+1)); [ $i -gt 200 ] && exit 1; sleep 0.05; done"
+    );
+    let c = cfg(&[("setup", &setup)]);
+    let t = prepare(&b, "live-stretch", &c).await;
+    let vms = [vm_name("live-stretch", 1), vm_name("live-stretch", 2)];
+    for vm in &vms {
+        b.spawn(&c, vm, Some(&t)).await.unwrap();
+    }
+    let client = |code: &str| {
+        spec(
+            "sh",
+            &[
+                "-c",
+                "printf '%s' \"$1\" > /run/pyd.in && cat /run/pyd.out",
+                "sh",
+                code,
+            ],
+        )
+    };
+
+    // The daemon survived snapshot and restore, in each VM separately.
+    for (vm, n) in vms.iter().zip([1, 2]) {
+        let r = b.exec(vm, client(&format!("x = {n}"))).await.unwrap();
+        assert_eq!(r.exit_code, 0, "{r:?}");
+        let r = b
+            .exec(
+                vm,
+                client("import sys; print(x * 10, 'http.client' in sys.modules)"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.stdout, format!("{} True\n", n * 10).as_bytes(), "{r:?}");
+    }
+
+    let vm = &vms[0];
+    let mut cold = Vec::new();
+    let mut warm = Vec::new();
+    for _ in 0..10 {
+        let start = Instant::now();
+        let r = b
+            .exec(
+                vm,
+                spec(
+                    "python3",
+                    &[
+                        "-c",
+                        "import asyncio, decimal, email.parser, http.client, json; print(1)",
+                    ],
+                ),
+            )
+            .await
+            .unwrap();
+        cold.push(start.elapsed());
+        assert_eq!(r.stdout, b"1\n");
+        let start = Instant::now();
+        let r = b.exec(vm, client("print(1)")).await.unwrap();
+        warm.push(start.elapsed());
+        assert_eq!(r.stdout, b"1\n");
+    }
+    println!(
+        "python3 -c with imports: p50 {:.1} ms; pre-imported daemon: p50 {:.1} ms",
+        ms(percentile(&cold, 50.0)),
+        ms(percentile(&warm, 50.0))
+    );
+    for vm in &vms {
+        b.destroy(vm).await.unwrap();
+    }
+    b.remove_template(&t).await.unwrap();
+}

@@ -9,6 +9,13 @@
 //! ```
 //!
 //! A container build must install protoc or set `PROTOC`.
+//!
+//! With feature `microsandbox`, it also records where the `microsandbox`
+//! crate's own build script installed the runtime pair (`msb` and
+//! `libkrunfw`): `$MSB_HOME/{bin,lib}`, else `~/.microsandbox/{bin,lib}`
+//! (see `microsandbox_utils::resolve_home`). This repo's
+//! `.cargo/config.toml` points `MSB_HOME` at `driver/target/msb-runtime`.
+//! The backend reads it as `DSB_MSB_BUILD_HOME`.
 
 use std::env;
 use std::path::PathBuf;
@@ -22,6 +29,16 @@ const PROTOS: &[&str] = &[
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=PROTOC");
+    println!("cargo:rerun-if-env-changed=MSB_HOME");
+    if env::var_os("CARGO_FEATURE_MICROSANDBOX").is_some() {
+        let home = env::var_os("MSB_HOME")
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".microsandbox")));
+        if let Some(home) = home {
+            println!("cargo:rustc-env=DSB_MSB_BUILD_HOME={}", home.display());
+        }
+    }
     for p in PROTOS {
         println!("cargo:rerun-if-changed={p}");
     }

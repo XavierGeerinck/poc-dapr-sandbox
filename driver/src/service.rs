@@ -19,16 +19,18 @@
 //! `FAILED_PRECONDITION` is never used: daprd reserves it for "sandbox lost".
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Request, Response, Status};
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 
 use crate::backend::{BackendError, ExecResult, ExecSpec, OUTPUT_CAP, VmBackend};
 use crate::config::Config;
+use crate::persist::StateDir;
 use crate::pool::{AcquirePath, Pool, PoolError, PoolOptions};
 use crate::proto::sandbox_server::{Sandbox, SandboxServer};
 use crate::proto::*;
@@ -72,6 +74,13 @@ struct Inner {
     opts: PoolOptions,
     /// Never held across an await.
     pools: RwLock<HashMap<String, Arc<Pool>>>,
+    /// Where `Init` persists each component's properties (restart
+    /// recovery, see [`crate::persist`]); `None`: nowhere.
+    state: Option<StateDir>,
+    /// Orders `Init`s (and the startup restore), so that the persisted
+    /// properties of a component are those of its newest pool. Never held
+    /// across an await.
+    init: Mutex<()>,
 }
 
 /// The Sandbox service: one [`Pool`] per component.
@@ -86,13 +95,65 @@ impl SandboxService {
     }
 
     pub fn with_pool_options(backend: Arc<dyn VmBackend>, opts: PoolOptions) -> Self {
+        Self::build(backend, opts, None)
+    }
+
+    /// A service whose `Init` persists each component's properties in
+    /// `state_dir`, for [`restore_persisted`](Self::restore_persisted)
+    /// after a restart.
+    pub fn with_state_dir(
+        backend: Arc<dyn VmBackend>,
+        opts: PoolOptions,
+        state_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self::build(backend, opts, Some(StateDir::new(state_dir)))
+    }
+
+    fn build(backend: Arc<dyn VmBackend>, opts: PoolOptions, state: Option<StateDir>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 backend,
                 opts,
                 pools: RwLock::new(HashMap::new()),
+                state,
+                init: Mutex::new(()),
             }),
         }
+    }
+
+    /// Starts a pool, through [`replace_pool`](Self::replace_pool), for
+    /// every component persisted in the state directory that has none yet,
+    /// so that a restarted driver is Ready without waiting for daprd's
+    /// `Init`. Skips (with a warning) files whose properties no longer
+    /// parse. Returns the number of pools started. Call it before serving.
+    pub fn restore_persisted(&self) -> usize {
+        let Some(state) = &self.inner.state else {
+            return 0;
+        };
+        let persisted = match state.load() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(dir = %state.dir().display(), "reading persisted components: {e}");
+                return 0;
+            }
+        };
+        let _init = self.inner.init.lock().unwrap_or_else(|e| e.into_inner());
+        let mut started = 0;
+        for p in persisted {
+            if self.pool(&p.component).is_some() {
+                continue;
+            }
+            match Config::from_properties(&p.properties) {
+                Ok(cfg) => {
+                    info!(component = %p.component, ?cfg, "restoring persisted component");
+                    self.replace_pool(&p.component, cfg);
+                    started += 1;
+                }
+                Err(e) => warn!(component = %p.component,
+                    "persisted properties no longer valid, not restoring: {e}"),
+            }
+        }
+        started
     }
 
     /// The pool of a component, if `Init` created one.
@@ -278,6 +339,14 @@ impl Sandbox for SandboxService {
         let cfg =
             Config::from_properties(&props).map_err(|e| Status::invalid_argument(e.to_string()))?;
         info!(component = %component, ?cfg, "init");
+        let _init = self.inner.init.lock().unwrap_or_else(|e| e.into_inner());
+        // A failure only costs restart recovery: log it, keep the pool.
+        if let Some(state) = &self.inner.state
+            && let Err(e) = state.save(&component, &props)
+        {
+            error!(component = %component, dir = %state.dir().display(),
+                "persisting the component's properties: {e}");
+        }
         self.replace_pool(&component, cfg);
         Ok(Response::new(SandboxInitResponse {}))
     }

@@ -9,6 +9,9 @@
 
 pub mod backend;
 pub mod config;
+#[cfg(feature = "microsandbox")]
+pub mod microsandbox_backend;
+pub mod persist;
 pub mod pool;
 pub mod service;
 

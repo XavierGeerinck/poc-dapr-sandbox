@@ -380,7 +380,10 @@ async fn repeated_init_serialises_replacement() {
     let p0 = h.service.pool("a").unwrap();
     // P0 is inside two spawns (VMs 0 and 1) when daprd initializes the
     // component twice more in quick succession (P1, then P2).
-    eventually("P0 spawning", || p0.stats().filling == 2).await;
+    eventually("P0 spawning", || {
+        p0.stats().filling == 2 && h.fake.spawns_entered() == 2
+    })
+    .await;
     h.init("a", &[("warmPoolSize", "2")]).await;
     h.init("a", &[("warmPoolSize", "2")]).await;
 
@@ -844,9 +847,12 @@ async fn binary_serves_and_exits_on_sigterm() {
     drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
     assert!(path.exists());
 
+    let state = dir.path().join("state");
     let mut child = Command::new(BIN)
         .arg("--socket")
         .arg(&path)
+        .args(["--backend", "fake", "--state-dir"])
+        .arg(&state)
         .env("RUST_LOG", "info")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -912,18 +918,66 @@ async fn binary_serves_and_exits_on_sigterm() {
     assert!(!path.exists(), "socket left behind");
     assert!(stderr.contains("SIGTERM"), "{stderr}");
     assert!(stderr.contains("FakeBackend"), "{stderr}");
+
+    // Init persisted the component: a restarted driver serves it at once,
+    // without an Init.
+    let mut child = Command::new(BIN)
+        .arg("--socket")
+        .arg(&path)
+        .args(["--backend", "fake", "--state-dir"])
+        .arg(&state)
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_socket(&path).await;
+    let mut client = SandboxClient::new(connect(&path).await);
+    let deadline = Instant::now() + WAIT;
+    while !client
+        .ready(req("microvm", SandboxReadyRequest {}))
+        .await
+        .unwrap()
+        .into_inner()
+        .ready
+    {
+        assert!(Instant::now() < deadline, "not restored");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()
+        .unwrap();
+    let status = wait_exit(&mut child);
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+    assert!(status.success(), "{status:?}\n{stderr}");
+    assert!(stderr.contains("restored persisted components"), "{stderr}");
 }
 
 #[test]
-fn binary_selftest_is_not_available_yet() {
+fn binary_selftest_needs_the_microsandbox_backend() {
     let out = Command::new(BIN)
-        .args(["--selftest", "python:3.12-slim"])
+        .args(["--selftest", "python:3.12-slim", "--backend", "fake"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--selftest"), "{stderr}");
     assert!(stderr.contains("not available"), "{stderr}");
+}
+
+#[cfg(not(feature = "microsandbox"))]
+#[test]
+fn binary_without_the_feature_rejects_the_microsandbox_backend() {
+    let out = Command::new(BIN)
+        .args(["--backend", "microsandbox"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("microsandbox"), "{stderr}");
 }
 
 #[test]

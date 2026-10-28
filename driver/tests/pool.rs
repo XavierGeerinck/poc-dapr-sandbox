@@ -518,7 +518,8 @@ async fn replacement_waits_for_the_previous_pool() {
     };
     let old = pool_with(&fake, "comp", &[("warmPoolSize", "2")], opts);
     old.start();
-    eventually("old pool spawning", || old.stats().filling == 2).await;
+    // Inside the backend's spawn, not just scheduled to call it.
+    eventually("old pool spawning", || fake.spawns_entered() == 2).await;
     old.shutdown().await;
 
     let new = pool(&fake, "comp", &[("warmPoolSize", "1")]);

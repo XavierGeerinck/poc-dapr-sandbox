@@ -1,0 +1,13 @@
+# The driver's `microsandbox` dependency (feature `download-binaries`) installs
+# its runtime pair, `msb` and `libkrunfw`, into `$MSB_HOME/{bin,lib}` from its
+# build script; `$MSB_HOME` defaults to `~/.microsandbox`. Point it into this
+# repo's target dir so that a build never writes to, or replaces, a user's own
+# microsandbox installation. `force` also overrides an `MSB_HOME` exported in
+# the shell for the same reason.
+#
+# This only places the runtime binaries. The driver's microsandbox home (VMs,
+# images, snapshots) is separate: `--msb-home`, else `DAPR_SANDBOX_MSB_HOME`,
+# else `$XDG_STATE_HOME/dapr-sandbox-microvm/msb` (see driver/src/main.rs); the
+# driver finds the runtime pair here through driver/build.rs.
+[env]
+MSB_HOME = { value = "driver/target/msb-runtime", relative = true, force = true }

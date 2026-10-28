@@ -161,6 +161,7 @@ pub mod fake {
         templates: BTreeSet<String>,
         prepared: Vec<String>,
         spawned: Vec<(String, Option<String>)>,
+        spawns_entered: usize,
         destroyed: Vec<String>,
         sessions: HashSet<(String, String)>,
         session_seq: u64,
@@ -279,6 +280,13 @@ pub mod fake {
             self.lock().spawned.clone()
         }
 
+        /// Calls of `spawn` so far, counted on entry: including ones still
+        /// blocked by [`pause_spawns`](Self::pause_spawns) and ones that
+        /// failed.
+        pub fn spawns_entered(&self) -> usize {
+            self.lock().spawns_entered
+        }
+
         /// Every successful destroy, in order.
         pub fn destroyed(&self) -> Vec<String> {
             self.lock().destroyed.clone()
@@ -343,7 +351,11 @@ pub mod fake {
             name: &str,
             from_template: Option<&str>,
         ) -> Result<()> {
-            let gate = self.lock().spawn_gate.clone();
+            let gate = {
+                let mut st = self.lock();
+                st.spawns_entered += 1;
+                st.spawn_gate.clone()
+            };
             if let Some(gate) = gate {
                 // A closed gate (resume_spawns) lets everyone through.
                 if let Ok(permit) = gate.acquire().await {
