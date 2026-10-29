@@ -4,7 +4,8 @@
 # loads no component and runs nothing privileged; its container only holds
 # the tools, so deploy/kind/smoke.sh and the bench exec into it:
 #
-#   kubectl --context kind-sandbox exec deploy/sandbox-caller -c bench -- \
+#   KUBECONFIG=<repo>/.kube/kind-sandbox.yaml kubectl --context kind-sandbox \
+#     exec deploy/sandbox-caller -c bench -- \
 #     sandbox-bench run --app-id sandbox-pool --host-pods 2 ... --out /work/x.csv
 #
 # daprd's HTTP API is on localhost:3500 in the pod.

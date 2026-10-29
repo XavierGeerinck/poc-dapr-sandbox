@@ -8,6 +8,16 @@ networking:
   # host's loopback; up.sh checks that the host port is free.
   apiServerAddress: 127.0.0.1
   apiServerPort: 36443
+# Every node's kubelet (the KubeletConfiguration kubeadm shares with the
+# joining nodes). On cgroup v2 a kubelet sets memory.oom.group=1 on each
+# container it creates, unless singleProcessOOMKill is true: one OOM kill
+# would then kill the whole container, for the sandbox pool its driver and
+# every VM in the pod. With it, the kernel kills one process, normally the VM
+# that grew. up.sh sets the same on the nodes of an existing cluster.
+kubeadmConfigPatches:
+- |
+  kind: KubeletConfiguration
+  singleProcessOOMKill: true
 nodes:
 - role: control-plane
   extraMounts:

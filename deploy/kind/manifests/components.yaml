@@ -20,12 +20,19 @@
 #     emptyDir ~330-390 MiB. With the whole stack up, 2.2 GiB of the VM's
 #     RAM is in use.
 # Choice: py-fast keeps 8 warm VMs per pod (~145 MiB idle) with 4 refills in
-# parallel, so 16 activations across both pods take a running VM; at most 32
-# acquired VMs per pod at the default 1 vCPU / 512 MiB each. That is ~1.3
-# GiB per pod at the in-use sizes above but 16 GiB if every guest filled its
-# memory, so the microvm container's 4 GiB memory limit (sandbox-pool.yaml)
-# is the backstop that keeps a runaway guest off the node. py-restore has no
-# warm pool and at most 8 VMs per pod (path (c) is sequential).
+# parallel, so 16 activations across both pods take a running VM, and admits
+# at most 32 acquired VMs per pod at the default 1 vCPU / 512 MiB each.
+# py-restore has no warm pool and admits at most 8 (path (c) is sequential).
+# Admission does not fit the memory limit. At the in-use sizes above, a
+# pod's 8 + 32 + 8 VMs take ~1.5-2 GiB, but if every guest filled its 512
+# MiB they would need ~24 GiB, six times the microvm container's 4 GiB limit
+# (sandbox-pool.yaml). The limit is what bounds a pod. When its VMs reach
+# it, the kernel OOM-kills the container's largest process, normally the VM
+# that grew: that sandbox is lost (410 ERR_SANDBOX_LOST on its next call),
+# while the driver and the other VMs keep running, because the kubelets set
+# singleProcessOOMKill (kind.yaml, up.sh). The driver (Rss ~100 MiB, like an
+# idle VM) is not protected: it is the one killed if no VM has outgrown it,
+# and then the container restarts and every sandbox in the pod is lost.
 apiVersion: dapr.io/v1alpha1
 kind: Component
 metadata:

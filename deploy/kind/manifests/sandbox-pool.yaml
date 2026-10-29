@@ -68,7 +68,11 @@ spec:
       # runs each postStart hook before starting the next container, and
       # the injector appends daprd last. daprd discovers pluggable
       # components only when it starts, so the hook holds daprd back until
-      # the driver's socket exists.
+      # the driver's socket exists. This relies on daprd being a regular
+      # container: dapr.io/enable-native-sidecar would break it, since the
+      # injector then makes daprd an init container with restartPolicy
+      # Always (a native sidecar), which starts before every regular
+      # container and so before the driver's socket exists.
       - name: microvm
         image: dapr-sandbox-microvm:dev
         imagePullPolicy: Never
@@ -107,12 +111,16 @@ spec:
                   sleep 0.1
                 done
         # The VMs run inside this container's cgroup, so these cover them
-        # too (sizing and measurements: components.yaml). Requests: 8 idle
-        # warm VMs plus the driver use ~0.5 GiB and ~0.4 CPU. Limit: a
-        # backstop for guests that fill their memory; at 4 GiB per pod both
-        # pods fit in the Lima VM next to the control plane and Dapr. When
-        # it is hit, the OOM killer picks the container's largest process,
-        # normally the guest that grew.
+        # too (sizing, measurements and the worst case: components.yaml).
+        # Requests: 8 idle warm VMs plus the driver use ~0.5 GiB and ~0.4
+        # CPU. Limit: what bounds the pod's guests, far below what the
+        # components admit; at 4 GiB per pod both pods fit in the Lima VM
+        # next to the control plane and Dapr. When it is hit, the kernel
+        # kills one process, the container's largest: normally the VM that
+        # grew, whose sandbox is lost while the rest keep running. That
+        # needs the kubelet's singleProcessOOMKill (kind.yaml, up.sh), which
+        # leaves this cgroup's memory.oom.group at 0; without it, any OOM
+        # kill kills the whole container, the driver and every VM.
         resources:
           requests:
             cpu: 500m
