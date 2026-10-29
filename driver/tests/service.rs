@@ -230,7 +230,7 @@ async fn two_components_get_separate_pools() {
 }
 
 /// `warmupCommand` from Init: each warm VM ran it once before handout;
-/// empty disables it. A warm-up that keeps failing leaves the component
+/// absent or empty, there is none (R22a). A warm-up that keeps failing leaves the component
 /// not ready, with the reason, and Acquire still works (on demand, no
 /// warm-up, never FAILED_PRECONDITION).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -244,8 +244,11 @@ async fn init_warmup_command() {
     .await;
     h.init("b", &[("warmPoolSize", "2"), ("warmupCommand", "")])
         .await;
+    h.init("d", &[("warmPoolSize", "2")]).await;
     h.wait_ready("a").await;
     h.wait_ready("b").await;
+    h.wait_ready("d").await;
+    assert_eq!(h.fake.vms().len(), 6);
     for vm in h.fake.vms() {
         let execs = h.fake.execs_on(&vm);
         if vm.starts_with(&vm_prefix("a")) {

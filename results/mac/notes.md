@@ -224,3 +224,5 @@ An earlier version, with `warmPoolSize` 2 and n = 12, gave the same: warmed VMs,
    - What it costs: one exec, ~30–33 ms (mean), per refill. Refilling 8 VMs took 310–325 ms with it against 261–302 ms without (one sample per run).
    - What it buys: a VM that cannot run commands is replaced before its handout.
 4. Not verified: whether the nested-KVM numbers from Task 15 (first exec 260–425 ms, repeated execs ~9.5–16 ms) are the same idle effect. The Step 5 daemon's 25 ms mode may be this effect too; that is untested as well.
+
+Default off (R22a): the warm-up does not avoid the idle cliff and costs about 30 ms per refill.

@@ -17,10 +17,11 @@
 //!
 //! # Warm-up
 //!
-//! A refill worker runs the component's `warmupCommand`
-//! ([`Config::warmup_command`], default `true`) once in each VM it spawns,
-//! after the spawn and before the VM joins the warm pool, so the warm pool,
-//! and so `ready`, holds only VMs that have run a command. A warm-up that
+//! Off by default (ruling R22a). When a component sets `warmupCommand`
+//! ([`Config::warmup_command`], for example `true`), a refill worker runs it
+//! once in each VM it spawns, after the spawn and before the VM joins the
+//! warm pool, so the warm pool, and so `ready`, holds only VMs that have run
+//! a command. A warm-up that
 //! fails (error, non-zero exit, or no result within
 //! [`PoolOptions::warmup_timeout`]) destroys the VM and counts as a failed
 //! refill: same backoff, same `ready` reason. An on-demand spawn skips it,
@@ -34,8 +35,9 @@
 //! of any exec on a VM idle for more than ~25 ms, so a pooled VM pays it
 //! again at its handout. What the warm-up buys is that a VM which cannot run
 //! commands is replaced before it is handed out; it costs one exec (~30 ms)
-//! of each refill's time. Running the command in the template VM before its
-//! snapshot does not help either (results/mac/notes.md, "Task 15a").
+//! of each refill's time, which is why it is opt-in. Running the command in
+//! the template VM before its snapshot does not help either
+//! (results/mac/notes.md, "Task 15a").
 //!
 //! # Replacement
 //!

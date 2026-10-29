@@ -6,9 +6,9 @@
 //! and reject the same inputs.
 //!
 //! One key is the driver's own: `warmupCommand` (see
-//! [`Config::warmup_command`]). The Go parser ignores keys it does not know,
-//! and daprd passes every metadata item to `Init`, an empty value included,
-//! so an absent key and an empty one differ. Any value parses.
+//! [`Config::warmup_command`]), off unless set. The Go parser ignores keys
+//! it does not know, and daprd passes every metadata item to `Init`. Any
+//! value parses.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -39,26 +39,28 @@ pub struct Config {
     pub template: Template,
     /// `warmupCommand`: the argv the pool runs once in each VM it refills
     /// the warm pool with, after spawning it and before handing it out; a
-    /// VM whose warm-up fails is destroyed and replaced. Empty disables the
-    /// warm-up. See the pool's module docs (`pool`, "Warm-up") for what it
-    /// does and does not save.
+    /// VM whose warm-up fails is destroyed and replaced. Empty means no
+    /// warm-up, and that is the default (ruling R22a): on microsandbox
+    /// 0.7.11 the warm-up does not avoid the slow exec after ~25 ms of VM
+    /// idle, and it costs about 30 ms per refill. See the pool's module docs
+    /// (`pool`, "Warm-up") for what it does and does not save.
     ///
     /// The value is split on whitespace into argv, which maps onto
     /// `ExecSpec { command: argv[0], args: argv[1..] }` with no shell, no
-    /// quoting and no expansion: the default `true` runs the image's `true`
-    /// directly, without a shell. A value of only whitespace splits to
-    /// nothing and also disables it. Work that needs a shell belongs in
-    /// `setup`. The command must exist in the image and exit 0 within the
-    /// pool's warm-up timeout (30 s by default); otherwise every refill
-    /// fails and the pool never becomes ready, so an image without `true`
-    /// needs another command or an empty value.
+    /// quoting and no expansion: `true` runs the image's `true` directly,
+    /// without a shell. A value of only whitespace splits to nothing and
+    /// also disables it. Work that needs a shell belongs in `setup`. The
+    /// command must exist in the image and exit 0 within the pool's warm-up
+    /// timeout (30 s by default); otherwise every refill fails and the pool
+    /// never becomes ready.
     ///
-    /// Absent: [`DEFAULT_WARMUP_COMMAND`]. Explicitly empty: disabled.
+    /// Absent: [`DEFAULT_WARMUP_COMMAND`] (disabled). Empty: disabled.
     pub warmup_command: Vec<String>,
 }
 
-/// The `warmupCommand` when the key is absent: a no-op.
-pub const DEFAULT_WARMUP_COMMAND: &str = "true";
+/// The `warmupCommand` when the key is absent: empty, so no warm-up
+/// (ruling R22a). Set it, for example to `true`, to enable one.
+pub const DEFAULT_WARMUP_COMMAND: &str = "";
 
 /// A metadata error. The messages match the Go ones.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -89,7 +91,6 @@ impl Config {
             refill_concurrency: 2,
             idle_timeout: Duration::from_secs(5 * 60),
             template: Template::Snapshot,
-            // Absent and empty differ here, unlike the Go keys.
             warmup_command: props
                 .get("warmupCommand")
                 .map_or(DEFAULT_WARMUP_COMMAND, String::as_str)
@@ -327,7 +328,7 @@ mod tests {
                 refill_concurrency: 2,
                 idle_timeout: Duration::from_secs(300),
                 template: Template::Snapshot,
-                warmup_command: vec!["true".to_string()],
+                warmup_command: Vec::new(),
             }
         );
     }
@@ -339,9 +340,9 @@ mod tests {
                 .unwrap()
                 .warmup_command
         };
-        // Absent: `true`, run as argv ["true"].
+        // Absent: disabled (R22a).
         let c = Config::from_properties(&props(&[("image", "x")])).unwrap();
-        assert_eq!(c.warmup_command, vec!["true"]);
+        assert!(c.warmup_command.is_empty());
         // Explicitly empty, or only whitespace: disabled.
         assert!(argv("").is_empty());
         assert!(argv(" \t\n ").is_empty());

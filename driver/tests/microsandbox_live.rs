@@ -675,8 +675,8 @@ async fn wait_full(pool: &Pool) {
     }
 }
 
-/// Task 15a: the pool's warm-up on real VMs, with the default
-/// `warmupCommand` (`true`) and with `warmupCommand: ""`. With it, every VM
+/// Task 15a: the pool's warm-up on real VMs, with `warmupCommand: "true"`
+/// and with `warmupCommand: ""` (also the default, R22a). With it, every VM
 /// the pool spawns runs it once, successfully, before it joins the warm
 /// pool; without it, none does. Prints, for both, the first exec on a VM the
 /// pool hands out (each acquire waits for a full pool, so refills do not
@@ -697,12 +697,13 @@ async fn live_pool_warmup() {
     const SIZE: usize = 8;
     let _g = LOCK.lock().await;
     let b = backend().await;
-    for (component, warmup) in [("live-warmup-on", None), ("live-warmup-off", Some(""))] {
+    for (component, warmup) in [("live-warmup-on", "true"), ("live-warmup-off", "")] {
         let size = SIZE.to_string();
-        let mut kv = vec![("warmPoolSize", size.as_str()), ("refillConcurrency", "4")];
-        if let Some(v) = warmup {
-            kv.push(("warmupCommand", v));
-        }
+        let kv = [
+            ("warmPoolSize", size.as_str()),
+            ("refillConcurrency", "4"),
+            ("warmupCommand", warmup),
+        ];
         let pool = Pool::new(component, cfg(&kv), b.clone());
         pool.start();
 
@@ -769,7 +770,7 @@ async fn live_pool_warmup() {
         // The initial fill, the refill after each of the N acquires (each
         // waited for a full pool), and the final refill of SIZE.
         let spawned = (SIZE + N + SIZE) as u64;
-        let want = if warmup.is_none() { spawned } else { 0 };
+        let want = if warmup.is_empty() { 0 } else { spawned };
         assert_eq!(s.warmups, want, "{s:?}");
     }
 }

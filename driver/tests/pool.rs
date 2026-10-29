@@ -599,8 +599,8 @@ async fn names_are_valid() {
     assert_eq!(template_name("comp"), "dsb-f562267f");
 }
 
-// Warm-up (`warmupCommand`): every VM the refill path adds to the warm pool
-// has run the warm-up exactly once; inline spawns skip it.
+// Warm-up (`warmupCommand`, off unless set): every VM the refill path adds
+// to the warm pool has run the warm-up exactly once; inline spawns skip it.
 
 /// The VM's execs, as argv.
 fn argvs(fake: &FakeBackend, vm: &str) -> Vec<Vec<String>> {
@@ -656,11 +656,16 @@ async fn refilled_vms_are_warmed_up_once_before_handout() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn default_warmup_is_true() {
+async fn explicit_true_warms_each_refill_once() {
     let fake = Arc::new(FakeBackend::new());
     fake.record_execs();
     fake.set_exec_delay(Duration::from_millis(20));
-    let p = started(&fake, "comp", &[("warmPoolSize", "3")]).await;
+    let p = started(
+        &fake,
+        "comp",
+        &[("warmPoolSize", "3"), ("warmupCommand", "true")],
+    )
+    .await;
     let warm = fake.vms();
     assert_eq!(warm.len(), 3);
     for vm in &warm {
@@ -691,7 +696,11 @@ async fn inline_spawns_skip_the_warmup() {
         let p = started(
             &fake,
             "comp",
-            &[("warmPoolSize", "0"), ("template", template)],
+            &[
+                ("warmPoolSize", "0"),
+                ("template", template),
+                ("warmupCommand", "true"),
+            ],
         )
         .await;
         let a = p.acquire().await.unwrap();
@@ -703,16 +712,15 @@ async fn inline_spawns_skip_the_warmup() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn empty_warmup_command_disables_it() {
-    for v in ["", " \t "] {
+async fn absent_or_empty_warmup_command_disables_it() {
+    for v in [None, Some(""), Some(" \t ")] {
         let fake = Arc::new(FakeBackend::new());
         fake.record_execs();
-        let p = started(
-            &fake,
-            "comp",
-            &[("warmPoolSize", "2"), ("warmupCommand", v)],
-        )
-        .await;
+        let mut kv = vec![("warmPoolSize", "2")];
+        if let Some(v) = v {
+            kv.push(("warmupCommand", v));
+        }
+        let p = started(&fake, "comp", &kv).await;
         assert_eq!(p.stats().warm, 2);
         assert_eq!(p.acquire().await.unwrap().path, AcquirePath::Pool);
         eventually("refilled", || p.stats().warm == 2).await;
@@ -727,7 +735,11 @@ async fn ready_waits_for_warmed_vms() {
     let fake = Arc::new(FakeBackend::new());
     fake.record_execs();
     fake.pause_execs();
-    let p = pool(&fake, "comp", &[("warmPoolSize", "2")]);
+    let p = pool(
+        &fake,
+        "comp",
+        &[("warmPoolSize", "2"), ("warmupCommand", "true")],
+    );
     p.start();
     eventually("both spawned and warming", || fake.execs().len() == 2).await;
     assert_eq!(fake.spawned().len(), 2);
@@ -769,7 +781,11 @@ async fn failed_warmup_destroys_the_vm_and_is_retried() {
     let p = pool(
         &fake,
         "comp",
-        &[("warmPoolSize", "2"), ("refillConcurrency", "1")],
+        &[
+            ("warmPoolSize", "2"),
+            ("refillConcurrency", "1"),
+            ("warmupCommand", "true"),
+        ],
     );
     let start = Instant::now();
     p.start();
@@ -810,7 +826,11 @@ async fn warmup_timeout_fails_the_refill() {
     let p = pool_with(
         &fake,
         "comp",
-        &[("warmPoolSize", "1"), ("refillConcurrency", "1")],
+        &[
+            ("warmPoolSize", "1"),
+            ("refillConcurrency", "1"),
+            ("warmupCommand", "true"),
+        ],
         opts,
     );
     p.start();
@@ -836,7 +856,11 @@ async fn shutdown_during_warmup_leaks_nothing() {
     let fake = Arc::new(FakeBackend::new());
     fake.record_execs();
     fake.pause_execs();
-    let p = pool(&fake, "comp", &[("warmPoolSize", "2")]);
+    let p = pool(
+        &fake,
+        "comp",
+        &[("warmPoolSize", "2"), ("warmupCommand", "true")],
+    );
     p.start();
     eventually("warming", || fake.execs().len() == 2).await;
     let start = Instant::now();
@@ -859,7 +883,11 @@ async fn abandoned_inline_vm_is_warmed_before_it_joins_the_pool() {
     let p = started(
         &fake,
         "comp",
-        &[("warmPoolSize", "0"), ("maxSandboxesPerHost", "1")],
+        &[
+            ("warmPoolSize", "0"),
+            ("maxSandboxesPerHost", "1"),
+            ("warmupCommand", "true"),
+        ],
     )
     .await;
     fake.set_spawn_delay(Duration::from_millis(100));

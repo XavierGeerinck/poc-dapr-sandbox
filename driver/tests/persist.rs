@@ -147,8 +147,8 @@ async fn a_new_service_restores_persisted_pools_without_init() {
 }
 
 /// `warmupCommand` is persisted with the other properties, and a restored
-/// pool keeps the difference between an absent key (`true`) and an empty one
-/// (disabled).
+/// pool keeps it: absent and empty both disable the warm-up (R22a), and a
+/// value enables it.
 #[tokio::test]
 async fn restored_pools_keep_their_warmup_command() {
     let tmp = tempfile::tempdir().unwrap();
@@ -191,7 +191,7 @@ async fn restored_pools_keep_their_warmup_command() {
     fake.record_execs();
     assert_eq!(svc.restore_persisted(), 3);
     for (component, want) in [
-        ("absent", vec!["true"]),
+        ("absent", vec![]),
         ("empty", vec![]),
         ("custom", vec!["echo", "warm"]),
     ] {
