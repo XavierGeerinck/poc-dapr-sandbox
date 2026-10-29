@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Starts the Kubernetes environment for the sandbox pool: the Lima VM
 # "sandbox" (deploy/kind/lima.yaml, with /dev/kvm through nested
-# virtualization), Docker and kind inside it, and the kind cluster "sandbox"
-# (deploy/kind/kind.yaml). Idempotent: reuses a VM or cluster that exists.
+# virtualization, on Ubuntu's HWE kernel), Docker and kind inside it, and the
+# kind cluster "sandbox" (deploy/kind/kind.yaml). Idempotent: reuses a VM or
+# cluster that exists, and reboots the VM only when a newer kernel is
+# installed than the one it runs.
 #
 # Docker and kind run only inside the VM. This script never changes the
 # host's Docker context or ~/.kube/config: the cluster's kubeconfig goes to
@@ -55,6 +57,24 @@ elif [ "$(limactl list --format '{{.Status}}' "$VM")" != Running ]; then
 else
   log "Lima VM $VM is running"
 fi
+
+# lima.yaml installs Ubuntu's HWE kernel, which takes effect only after a
+# reboot: reboot once when the running kernel is older than the newest
+# installed one (the one GRUB boots by default).
+running_kernel=$(vm uname -r)
+newest_kernel=$(vm sh -c 'ls /boot/vmlinuz-*' | sed 's|^/boot/vmlinuz-||' | sort -V | tail -n 1)
+[ -n "$newest_kernel" ] || die "VM $VM: no kernel in /boot"
+if [ "$running_kernel" != "$newest_kernel" ] &&
+  [ "$(printf '%s\n%s\n' "$running_kernel" "$newest_kernel" | sort -V | tail -n 1)" = "$newest_kernel" ]; then
+  log "VM $VM runs kernel $running_kernel; rebooting it into $newest_kernel"
+  limactl stop "$VM"
+  limactl start --tty=false "$VM"
+  running_kernel=$(vm uname -r)
+  [ "$running_kernel" = "$newest_kernel" ] ||
+    die "VM $VM still runs kernel $running_kernel after a reboot (want $newest_kernel)"
+fi
+log "VM $VM: kernel $running_kernel"
+
 vm test -w "$REPO_DIR" ||
   die "VM $VM does not mount $REPO_DIR writable; it was created for another checkout (deploy/kind/down.sh deletes it)"
 if ! vm test -c /dev/kvm; then

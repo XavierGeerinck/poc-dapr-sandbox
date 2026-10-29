@@ -15,9 +15,11 @@ base:
 vmType: vz
 arch: aarch64
 nestedVirtualization: true
-# Sized by the user ("to start with"); change only with their agreement.
-cpus: 4
-memory: 6GiB
+# Sized by the user (the plan's 8 CPUs / 12 GiB); change only with their
+# agreement. To resize an existing, stopped VM in place:
+#   limactl edit sandbox --cpus 8 --memory 12 --tty=false
+cpus: 8
+memory: 12GiB
 
 mountType: virtiofs
 mounts: []
@@ -59,6 +61,16 @@ provision:
     systemctl daemon-reload
     if [ "$(stat -c %U /run/docker.sock 2>/dev/null)" != "{{.User}}" ]; then
       systemctl restart docker.socket docker.service
+    fi
+
+    # Ubuntu's HWE kernel (7.0 on 24.04) instead of the GA 6.8: under nested
+    # virtualization, steady microVM execs run about 40% faster on it. A new
+    # kernel takes effect at the next boot; up.sh reboots the VM once when
+    # the running kernel is older than the newest installed one.
+    if ! dpkg-query -W -f='${Status}' linux-generic-hwe-24.04 2>/dev/null | grep -q 'ok installed'; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends linux-generic-hwe-24.04
     fi
 
     # kind, pinned and checksummed (kubernetes-sigs/kind release assets).
