@@ -29,6 +29,14 @@ final fix wave fixed are not listed.
   (`pkg/actors/router`, `IsRetryableRemoteError`).
 - **Session close** is not cut short by a release or halt; it waits for the driver's answer
   (`sandbox.go`, `sessionClose`).
+- **Calls queued behind a DELETE** (waiting for the turn, or an exec still in Acquire) get Closed
+  and the router re-runs them on a fresh target, so the ID exists again after a successful
+  DELETE unless the caller sent `expectedActivation`. A DELETE does not cancel a stuck Acquire;
+  that caller waits up to the 60 s bound (`sandbox.go`, `TestReleaseDuringAcquire`).
+- **Router text in `ERR_SANDBOX_EXEC`.** After the remote retries run out, the detail carries
+  the router's message, including the host pod's IP and port (`universal/sandbox.go`,
+  `sandboxExecErr`; `pkg/actors/router/router.go`).
+- **PermissionDenied from the host's ACL** maps to 500 `ERR_SANDBOX_EXEC`, not 403.
 - **429 while hosting is suspended** (host app without an actor state store) looks the same as a
   temporary "retry later".
 - **Invalid-request details** are only logged at debug level; an `ERR_SANDBOX_LOST` without
@@ -136,7 +144,12 @@ final fix wave fixed are not listed.
   it deletes any Lima VM named `sandbox`. A failed `kind delete` inside the VM is ignored.
 - **up.sh:** it calls `brew install` without checking that brew exists; the one-shot reboot
   marker is written before the VM stops; after patching the kubelet config it does not restart
-  pool pods that are already running.
+  pool pods that are already running. On Linux the `API_PORT` check tries `lsof` first, which a
+  non-root user cannot use to see root-owned listeners such as another cluster's `docker-proxy`;
+  `ss` should come first (`kind create` still fails with its own error).
+- **build-images.sh:** the golang tag fallback matches the classic image store's "manifest
+  unknown" message; with Docker's containerd image store a missing tag may read "not found" and
+  take the failure branch instead (loud, not silent).
 - **Images:** base images are pinned by tag, not digest, and the VM's Docker install is not
   pinned (`lima.yaml`, `build-images.sh`).
 - **Manifests:** the `/dev/kvm` group mapping (to `uuidd` in the node image) is only described in

@@ -247,7 +247,7 @@ HTTP routes, all under `/v1.0-alpha1/sandboxes`:
 |---|---|---|
 | `POST /{component}` | `SandboxCreateAlpha1` | Creates a sandbox with an ID chosen by the sidecar and returns the ID. If the host is full, it retries with a fresh ID, up to 5 attempts. |
 | `POST /{component}/{sandboxId}/exec` | `SandboxExecAlpha1` | Runs a one-shot command. The first call for an unknown ID activates it. |
-| `DELETE /{component}/{sandboxId}` | `SandboxDeleteAlpha1` | Releases the sandbox. Idempotent. It does not wait for a running command: that command ends, and its caller gets 410 `ERR_SANDBOX_LOST`. |
+| `DELETE /{component}/{sandboxId}` | `SandboxDeleteAlpha1` | Releases the sandbox. Idempotent. It does not wait for a running command: that command ends, and its caller gets 410 `ERR_SANDBOX_LOST`. Calls that had not started yet (queued for the turn, or still acquiring) run on a fresh sandbox under the same ID, unless they carry `expectedActivation`. |
 | `POST /{component}/{sandboxId}/sessions` | `SandboxSessionStartAlpha1` | Starts a long-lived process and returns a session ID. |
 | `POST /{component}/{sandboxId}/sessions/{sessionId}` | `SandboxSessionSendAlpha1` | Writes input to the session, then reads output until a marker (`until`), the process exits, or `timeoutMs` passes. |
 | `DELETE /{component}/{sandboxId}/sessions/{sessionId}` | `SandboxSessionCloseAlpha1` | Closes the session. |
@@ -494,7 +494,8 @@ and b0ce41dac).**
 - **Tests.** Unit tests in `pkg/api/grpc/workflow_acl_test.go`, and an integration suite with
   Sentry identities, `daprd/sandbox/crossappmtls` (patch 27): a caller of the same namespace is
   allowed; callers from another namespace and calls to another app's sandbox type are denied.
-  Without patches 14 and 15, its allowed cases fail with PermissionDenied.
+  Without patches 14 and 15, its allowed cases fail: the direct actor call with PermissionDenied,
+  the call through the sidecar as 500 `ERR_SANDBOX_EXEC` carrying that error.
 
 #### Operational requirements
 

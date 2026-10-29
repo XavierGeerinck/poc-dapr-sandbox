@@ -80,7 +80,8 @@ on kind the symptom was 500 `ERR_SANDBOX_EXEC`.
   - workflow access policies still apply.
 - **Ordering.** Sandbox types are classified before the workflow and activity suffix check.
 - **Tested under mTLS** by `daprd/sandbox/crossappmtls` (commit 62e16213e). With
-  `workflow_acl.go` as before the patch, its two allowed cases fail with PermissionDenied.
+  `workflow_acl.go` as before the patch, its two allowed cases fail: the direct actor call with
+  PermissionDenied, the call through the sidecar as 500 `ERR_SANDBOX_EXEC` carrying that error.
 
 **This needs a security review.** See also the known limitations below: there is no
 per-sandbox owner binding yet.
