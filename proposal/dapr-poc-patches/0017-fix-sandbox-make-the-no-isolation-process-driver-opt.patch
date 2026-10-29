@@ -1,0 +1,174 @@
+From 768248d0372025fd9dd05c97bb44f440bf057cb4 Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Thu, 29 Oct 2026 16:42:25 +0100
+Subject: [PATCH 17/27] fix(sandbox): make the no-isolation process driver
+ opt-in
+
+sandbox.process runs commands as plain host processes, yet it was
+compiled into the stable flavor and loaded from any component YAML.
+
+- It is no longer in stablecomponents: only allcomponents builds, or the
+  new sandbox_process build tag, include it. The integration test build
+  adds that tag, like the other test-only components.
+- Init fails unless the metadata allowNoIsolation is "true", in every
+  build, with an error that names the key.
+- The integration fixtures set the key.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmd/daprd/components/sandbox_process.go       |  6 +++-
+ pkg/components/sandbox/process/process.go     | 11 +++++++
+ .../sandbox/process/process_test.go           | 29 ++++++++++++++++++-
+ tests/integration/framework/binary/binary.go  |  4 +++
+ .../suite/daprd/sandbox/crossapp.go           |  2 ++
+ .../suite/daprd/sandbox/process.go            |  2 ++
+ 6 files changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/cmd/daprd/components/sandbox_process.go b/cmd/daprd/components/sandbox_process.go
+index f421e1d02..4b1e38917 100644
+--- a/cmd/daprd/components/sandbox_process.go
++++ b/cmd/daprd/components/sandbox_process.go
+@@ -1,4 +1,4 @@
+-//go:build (allcomponents || stablecomponents) && !windows
++//go:build (allcomponents || sandbox_process) && !windows
+ 
+ /*
+ Copyright 2026 The Dapr Authors
+@@ -22,6 +22,10 @@ import (
+ 	"github.com/dapr/dapr/pkg/components/sandbox/process"
+ )
+ 
++// sandbox.process runs commands as plain host processes, with no isolation.
++// It is for tests and local development only, so it is not part of the
++// stable flavor, and a component of this type must also set the metadata
++// allowNoIsolation to "true" (see process.Init).
+ func init() {
+ 	sandbox.DefaultRegistry.RegisterComponent(process.New, "process")
+ }
+diff --git a/pkg/components/sandbox/process/process.go b/pkg/components/sandbox/process/process.go
+index 068029d50..ce264292f 100644
+--- a/pkg/components/sandbox/process/process.go
++++ b/pkg/components/sandbox/process/process.go
+@@ -25,6 +25,10 @@ limitations under the License.
+ // implementation of the sandbox driver contract; never use it to run
+ // untrusted code.
+ //
++// It is opt-in twice over: daprd only includes it in the allcomponents flavor
++// (or with the sandbox_process build tag), and Init fails unless the
++// component's metadata sets MetadataAllowNoIsolation to "true".
++//
+ // Error contract: Exec, SessionStart, SessionSend, SessionClose and Release
+ // return codes.NotFound for an unknown instance (or session) id. Release of an
+ // unknown id therefore also returns NotFound; callers that want idempotent
+@@ -54,6 +58,10 @@ import (
+ 	"github.com/dapr/kit/logger"
+ )
+ 
++// MetadataAllowNoIsolation is the metadata key a sandbox.process component
++// must set to "true", to acknowledge that its commands run without isolation.
++const MetadataAllowNoIsolation = "allowNoIsolation"
++
+ const (
+ 	// outputCap is the per-stream output cap for Exec and per-session buffers.
+ 	outputCap = 4 * 1024 * 1024
+@@ -99,6 +107,9 @@ func New(l logger.Logger) sandbox.Sandbox {
+ }
+ 
+ func (p *Process) Init(_ context.Context, md metadata.Base) error {
++	if md.Properties[MetadataAllowNoIsolation] != "true" {
++		return fmt.Errorf("sandbox.process runs commands as host processes with no isolation: set metadata '%s' to \"true\" to use it, for tests and local development only", MetadataAllowNoIsolation)
++	}
+ 	cfg, err := sandbox.ParseConfig(md.Properties)
+ 	if err != nil {
+ 		return err
+diff --git a/pkg/components/sandbox/process/process_test.go b/pkg/components/sandbox/process/process_test.go
+index 3f09102bf..b3240b832 100644
+--- a/pkg/components/sandbox/process/process_test.go
++++ b/pkg/components/sandbox/process/process_test.go
+@@ -40,7 +40,7 @@ func newDriver(t *testing.T, props map[string]string) *Process {
+ 
+ func newDriverDelay(t *testing.T, props map[string]string, refillDelay time.Duration) *Process {
+ 	t.Helper()
+-	p := map[string]string{"image": "ignored"}
++	p := map[string]string{"image": "ignored", MetadataAllowNoIsolation: "true"}
+ 	for k, v := range props {
+ 		p[k] = v
+ 	}
+@@ -75,6 +75,33 @@ func run(t *testing.T, d *Process, id string, spec *proto.SandboxExecSpec) *prot
+ 	return r
+ }
+ 
++func TestInitRequiresAllowNoIsolation(t *testing.T) {
++	for name, props := range map[string]map[string]string{
++		"unset": {"image": "ignored"},
++		"empty": {"image": "ignored", MetadataAllowNoIsolation: ""},
++		"false": {"image": "ignored", MetadataAllowNoIsolation: "false"},
++		"other": {"image": "ignored", MetadataAllowNoIsolation: "yes"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			d := New(logger.NewLogger("test")).(*Process)
++			t.Cleanup(func() { _ = d.Close() })
++			err := d.Init(t.Context(), metadata.Base{Properties: props})
++			require.Error(t, err)
++			assert.Contains(t, err.Error(), "'allowNoIsolation'")
++			assert.Contains(t, err.Error(), "no isolation")
++			// Nothing was started.
++			assert.Empty(t, d.pool)
++			assert.Equal(t, 0, d.inflight)
++		})
++	}
++
++	d := New(logger.NewLogger("test")).(*Process)
++	t.Cleanup(func() { _ = d.Close() })
++	require.NoError(t, d.Init(t.Context(), metadata.Base{Properties: map[string]string{
++		"image": "ignored", MetadataAllowNoIsolation: "true",
++	}}))
++}
++
+ func TestAcquirePoolThenBoot(t *testing.T) {
+ 	d := newDriverDelay(t, map[string]string{"warmPoolSize": "1", "refillConcurrency": "1"}, time.Hour)
+ 	a := acquire(t, d)
+diff --git a/tests/integration/framework/binary/binary.go b/tests/integration/framework/binary/binary.go
+index 1a6d8dc82..87a4fb57f 100644
+--- a/tests/integration/framework/binary/binary.go
++++ b/tests/integration/framework/binary/binary.go
+@@ -44,6 +44,10 @@ var buildTags = []string{
+ 	"conversation_echo",
+ 	"search_inmemory",
+ 	"vector_inmemory",
++	// sandbox_process compiles in the sandbox.process driver, which runs
++	// commands as host processes with no isolation and is therefore not in
++	// the stable flavor.
++	"sandbox_process",
+ 	// state_spiffeprobe compiles in an integration-test-only state store that
+ 	// reports whether the SPIFFE identity reached the component operation
+ 	// context. Never set for released daprd flavors.
+diff --git a/tests/integration/suite/daprd/sandbox/crossapp.go b/tests/integration/suite/daprd/sandbox/crossapp.go
+index b370399dd..ae63bcc46 100644
+--- a/tests/integration/suite/daprd/sandbox/crossapp.go
++++ b/tests/integration/suite/daprd/sandbox/crossapp.go
+@@ -80,6 +80,8 @@ spec:
+     value: none
+   - name: warmPoolSize
+     value: "2"
++  - name: allowNoIsolation
++    value: "true"
+ `),
+ 	)
+ 	c.caller = daprd.New(t,
+diff --git a/tests/integration/suite/daprd/sandbox/process.go b/tests/integration/suite/daprd/sandbox/process.go
+index 17d682458..4dfcf6f0b 100644
+--- a/tests/integration/suite/daprd/sandbox/process.go
++++ b/tests/integration/suite/daprd/sandbox/process.go
+@@ -70,6 +70,8 @@ spec:
+     value: none
+   - name: warmPoolSize
+     value: "2"
++  - name: allowNoIsolation
++    value: "true"
+ `),
+ 	)
+ 
+-- 
+2.47.0
+

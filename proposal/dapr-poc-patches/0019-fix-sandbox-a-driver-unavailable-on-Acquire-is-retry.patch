@@ -1,0 +1,101 @@
+From cea93a9c81603f4e8205bece9391fbbbeee05c2e Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Thu, 29 Oct 2026 16:49:29 +0100
+Subject: [PATCH 19/27] fix(sandbox): a driver unavailable on Acquire is retry
+ later
+
+A driver Acquire that failed with Unavailable (a pluggable driver that
+is restarting, or not initialised yet) surfaced as 500
+ERR_SANDBOX_EXEC; across apps the caller's router also retried the
+Unavailable code a few times first. Nothing was acquired, so the target
+now answers ResourceExhausted, which the API maps to 429
+ERR_SANDBOX_HOST_FULL. Unavailable on a call to an acquired VM is still
+"sandbox lost" (ruling R12).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/actors/targets/sandbox/sandbox.go      |  9 +++++---
+ pkg/actors/targets/sandbox/sandbox_test.go |  7 +++---
+ pkg/api/universal/sandbox_test.go          | 27 ++++++++++++++++++++++
+ 3 files changed, 37 insertions(+), 6 deletions(-)
+
+diff --git a/pkg/actors/targets/sandbox/sandbox.go b/pkg/actors/targets/sandbox/sandbox.go
+index 24f19189e..c33670c8c 100644
+--- a/pkg/actors/targets/sandbox/sandbox.go
++++ b/pkg/actors/targets/sandbox/sandbox.go
+@@ -440,13 +440,16 @@ func (t *target) acquire(ctx context.Context, method string, timing *runtimev1pb
+ 	return t.instanceID, nil
+ }
+ 
+-// acquireErr maps a failed driver Acquire. When the acquire bound passed, no
+-// VM is available now, so it becomes ResourceExhausted: retry later. Nothing
+-// was acquired, so nothing was lost.
++// acquireErr maps a failed driver Acquire. No VM is available now, so the
++// acquire bound passing and a driver that is unavailable (restarting, or not
++// initialised yet) both become ResourceExhausted: retry later. Nothing was
++// acquired, so nothing was lost.
+ func (t *target) acquireErr(err error, timedOut bool) error {
+ 	switch {
+ 	case timedOut:
+ 		return status.Errorf(codes.ResourceExhausted, "sandbox driver did not provide a sandbox within %s", t.factory.acquireTimeout)
++	case status.Code(err) == codes.Unavailable:
++		return status.Errorf(codes.ResourceExhausted, "sandbox driver is unavailable: %s", status.Convert(err).Message())
+ 	default:
+ 		return driverErr("acquire", err)
+ 	}
+diff --git a/pkg/actors/targets/sandbox/sandbox_test.go b/pkg/actors/targets/sandbox/sandbox_test.go
+index e7ca1d6c9..f52d91f3a 100644
+--- a/pkg/actors/targets/sandbox/sandbox_test.go
++++ b/pkg/actors/targets/sandbox/sandbox_test.go
+@@ -494,9 +494,10 @@ func TestAcquireUnavailableIsNotLost(t *testing.T) {
+ 			}
+ 			_, err := invoke(t, f, "sb1", method, in)
+ 			require.Error(t, err)
+-			// Nothing was acquired, so nothing was lost: the driver error
+-			// keeps its code.
+-			assert.Equal(t, codes.Unavailable, status.Code(err))
++			// Nothing was acquired, so nothing was lost: a driver that is
++			// restarting or not initialised yet means retry later.
++			assert.Equal(t, codes.ResourceExhausted, status.Code(err))
++			assert.Contains(t, status.Convert(err).Message(), "sandbox driver is unavailable: connection refused")
+ 			assert.False(t, IsSandboxLost(err))
+ 			assert.False(t, f.Exists("sb1"))
+ 			assert.Equal(t, 0, f.Len())
+diff --git a/pkg/api/universal/sandbox_test.go b/pkg/api/universal/sandbox_test.go
+index 2576df765..e0febc02d 100644
+--- a/pkg/api/universal/sandbox_test.go
++++ b/pkg/api/universal/sandbox_test.go
+@@ -435,3 +435,30 @@ func TestSandboxAcquireTimeoutIsHostFull(t *testing.T) {
+ 		assert.Equal(t, int32(maxCreateAttempts), calls.Load())
+ 	})
+ }
++
++// acquireUnavailableDriver is a sandbox driver that is restarting: Acquire
++// fails with Unavailable. No other method is called.
++type acquireUnavailableDriver struct{ sandbox.Sandbox }
++
++func (acquireUnavailableDriver) Acquire(context.Context, *compv1pb.SandboxAcquireRequest) (*compv1pb.SandboxAcquireResponse, error) {
++	return nil, status.Error(codes.Unavailable, "connection refused")
++}
++
++func TestSandboxAcquireDriverUnavailableIsHostFull(t *testing.T) {
++	f, err := sandboxtarget.New(sandboxtarget.Options{
++		ActorType: "dapr.internal.default.me.sandbox.py",
++		Component: "py",
++		Driver:    acquireUnavailableDriver{},
++	})
++	require.NoError(t, err)
++	t.Cleanup(func() { require.NoError(t, f.HaltAll(context.Background())) })
++	u, calls := newSandboxUniversalWithTargets(t, f)
++
++	_, err = u.SandboxExecAlpha1(t.Context(), &runtimev1pb.SandboxExecRequestAlpha1{Component: "py", SandboxId: "sb", Command: "x"})
++	require.ErrorIs(t, err, messages.ErrSandboxHostFull)
++	var apiErr messages.APIError
++	require.ErrorAs(t, err, &apiErr)
++	assert.Equal(t, http.StatusTooManyRequests, apiErr.HTTPCode())
++	assert.Equal(t, int32(1), calls.Load())
++	assert.Equal(t, 0, f.Len())
++}
+-- 
+2.47.0
+

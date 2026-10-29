@@ -1,0 +1,141 @@
+From de2928aef979f2a9bc52c9f0efa5258d9d481eb8 Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Thu, 29 Oct 2026 16:56:12 +0100
+Subject: [PATCH 26/27] fix(sandbox): process driver Reconcile spares fresh
+ instances
+
+Ruling R9 closes the race between daprd's reconcile loop and an Acquire
+that starts after its in-flight check on the driver side: Reconcile
+never releases an instance handed out less than 60 s ago, because daprd
+may not have recorded it in the live set yet. The Rust driver does this;
+the built-in process driver now does too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/components/sandbox/process/process.go     | 23 ++++++++++++++----
+ .../sandbox/process/process_test.go           | 24 +++++++++++++++++++
+ 2 files changed, 43 insertions(+), 4 deletions(-)
+
+diff --git a/pkg/components/sandbox/process/process.go b/pkg/components/sandbox/process/process.go
+index ce264292f..1eb0e69cb 100644
+--- a/pkg/components/sandbox/process/process.go
++++ b/pkg/components/sandbox/process/process.go
+@@ -69,6 +69,10 @@ const (
+ 	// timeout_ms is given.
+ 	defaultSendTimeout = 30 * time.Second
+ 	waitDelay          = time.Second
++	// reconcileGrace is how long after Acquire an instance is safe from
++	// Reconcile (ruling R9): daprd may not have recorded it yet, so it may
++	// be missing from the live set.
++	reconcileGrace = 60 * time.Second
+ )
+ 
+ // Process is the host-process sandbox driver.
+@@ -78,6 +82,8 @@ type Process struct {
+ 
+ 	// refillDelay delays background refills triggered by Acquire (tests only).
+ 	refillDelay time.Duration
++	// reconcileGrace is the package constant, shorter in tests.
++	reconcileGrace time.Duration
+ 
+ 	ctx    context.Context
+ 	cancel context.CancelFunc
+@@ -95,6 +101,9 @@ type instance struct {
+ 	dir    string
+ 	ctx    context.Context
+ 	cancel context.CancelFunc
++	// acquiredAt is when Acquire handed the instance out. Guarded by
++	// Process.lock.
++	acquiredAt time.Time
+ 
+ 	lock     sync.Mutex
+ 	sessions map[string]*session
+@@ -103,7 +112,7 @@ type instance struct {
+ 
+ // New returns a new process driver.
+ func New(l logger.Logger) sandbox.Sandbox {
+-	return &Process{log: l, live: make(map[string]*instance)}
++	return &Process{log: l, live: make(map[string]*instance), reconcileGrace: reconcileGrace}
+ }
+ 
+ func (p *Process) Init(_ context.Context, md metadata.Base) error {
+@@ -210,6 +219,7 @@ func (p *Process) Acquire(_ context.Context, _ *proto.SandboxAcquireRequest) (*p
+ 		}
+ 		path = proto.SandboxAcquirePath_BOOT
+ 	}
++	inst.acquiredAt = time.Now()
+ 	p.live[inst.id] = inst
+ 	p.lock.Unlock()
+ 
+@@ -270,18 +280,23 @@ func (p *Process) Release(_ context.Context, req *proto.SandboxReleaseRequest) (
+ 	return &proto.SandboxReleaseResponse{}, nil
+ }
+ 
++// Reconcile releases the live instances that are not in the request's live
++// set, except those acquired less than reconcileGrace ago: daprd may not
++// have recorded such an instance yet when it took the live set (ruling R9).
+ func (p *Process) Reconcile(_ context.Context, req *proto.SandboxReconcileRequest) (*proto.SandboxReconcileResponse, error) {
+ 	keep := make(map[string]struct{}, len(req.GetLiveInstanceIds()))
+ 	for _, id := range req.GetLiveInstanceIds() {
+ 		keep[id] = struct{}{}
+ 	}
+ 	var drop []*instance
++	now := time.Now()
+ 	p.lock.Lock()
+ 	for id, inst := range p.live {
+-		if _, ok := keep[id]; !ok {
+-			delete(p.live, id)
+-			drop = append(drop, inst)
++		if _, ok := keep[id]; ok || now.Sub(inst.acquiredAt) < p.reconcileGrace {
++			continue
+ 		}
++		delete(p.live, id)
++		drop = append(drop, inst)
+ 	}
+ 	p.lock.Unlock()
+ 	for _, inst := range drop {
+diff --git a/pkg/components/sandbox/process/process_test.go b/pkg/components/sandbox/process/process_test.go
+index b3240b832..e4e8ba590 100644
+--- a/pkg/components/sandbox/process/process_test.go
++++ b/pkg/components/sandbox/process/process_test.go
+@@ -215,6 +215,7 @@ func TestReleaseFreesSlot(t *testing.T) {
+ 
+ func TestReconcile(t *testing.T) {
+ 	d := newDriver(t, map[string]string{"warmPoolSize": "0"})
++	d.reconcileGrace = 0
+ 	a := acquire(t, d)
+ 	released := []string{acquire(t, d).GetInstanceId(), acquire(t, d).GetInstanceId()}
+ 	r, err := d.Reconcile(t.Context(), &proto.SandboxReconcileRequest{LiveInstanceIds: []string{a.GetInstanceId()}})
+@@ -230,6 +231,29 @@ func TestReconcile(t *testing.T) {
+ 	}
+ }
+ 
++func TestReconcileGrace(t *testing.T) {
++	d := newDriver(t, map[string]string{"warmPoolSize": "0"})
++	assert.Equal(t, 60*time.Second, d.reconcileGrace)
++
++	// Acquired just now and not in the live set yet: kept.
++	fresh := acquire(t, d)
++	r, err := d.Reconcile(t.Context(), &proto.SandboxReconcileRequest{LiveInstanceIds: []string{}})
++	require.NoError(t, err)
++	assert.Equal(t, uint32(0), r.GetReleased())
++	run(t, d, fresh.GetInstanceId(), &proto.SandboxExecSpec{Command: "true"})
++
++	// Once the grace has passed, an instance missing from the live set is
++	// released.
++	d.lock.Lock()
++	d.live[fresh.GetInstanceId()].acquiredAt = time.Now().Add(-61 * time.Second)
++	d.lock.Unlock()
++	r, err = d.Reconcile(t.Context(), &proto.SandboxReconcileRequest{LiveInstanceIds: []string{}})
++	require.NoError(t, err)
++	assert.Equal(t, uint32(1), r.GetReleased())
++	_, err = d.Exec(t.Context(), &proto.SandboxExecRequest{InstanceId: fresh.GetInstanceId(), Spec: &proto.SandboxExecSpec{Command: "true"}})
++	assert.Equal(t, codes.NotFound, status.Code(err))
++}
++
+ func TestReadyFalseBeforePoolFull(t *testing.T) {
+ 	d := New(logger.NewLogger("test")).(*Process)
+ 	// Hold the initial fill back so the pool is observably not full.
+-- 
+2.47.0
+

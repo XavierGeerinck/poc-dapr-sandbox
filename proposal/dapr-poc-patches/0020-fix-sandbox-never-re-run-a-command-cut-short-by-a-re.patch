@@ -1,0 +1,456 @@
+From a983969d0e4169c5bbdbea43f27e6cd37b361f33 Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Thu, 29 Oct 2026 16:52:27 +0100
+Subject: [PATCH 20/27] fix(sandbox): never re-run a command cut short by a
+ rebalance
+
+On a rebalance the disseminator cancels the in-flight placement claims
+of the moved actor types once the drain timeout passes (2 s when the
+app sets none). That cancelled the sandbox driver call, the driver
+killed the command, and the actor router, which retries a failed call
+whose claim context ended, ran the exec or session send again: on the
+same VM, or on a fresh one on the actor's new host.
+
+A driver call that runs a command (exec, session start, session send)
+now never comes back to the router as retryable:
+
+- If its context ended while it ran, the target answers a new
+  "interrupted" error: Aborted with ErrorInfo reason
+  DAPR_SANDBOX_INTERRUPTED. Aborted is not a code that a caller's
+  router retries across sidecars either.
+- Every error after such a driver call is wrapped in
+  backoff.Permanent, which the router's retry loop already honours, so
+  no change to the shared router or lock code is needed.
+
+The API maps the interrupted error to ERR_SANDBOX_EXEC (500) with the
+message "sandbox call interrupted by actor rebalancing: the command may
+have partly run". When the caller's own context ended instead, it gets
+that context's error, as before. A call interrupted before it reached
+the driver (waiting for its turn, or acquiring) is still retried: no
+command ran.
+
+The test drives the real router with a fake placement and cancels the
+claim mid-exec: one lookup, one driver call, the interrupted error.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/actors/targets/sandbox/router_test.go | 183 ++++++++++++++++++++++
+ pkg/actors/targets/sandbox/sandbox.go     |  72 +++++++--
+ pkg/api/universal/sandbox.go              |  11 ++
+ pkg/api/universal/sandbox_test.go         |  28 ++++
+ pkg/messages/predefined.go                |   3 +
+ 5 files changed, 286 insertions(+), 11 deletions(-)
+ create mode 100644 pkg/actors/targets/sandbox/router_test.go
+
+diff --git a/pkg/actors/targets/sandbox/router_test.go b/pkg/actors/targets/sandbox/router_test.go
+new file mode 100644
+index 000000000..25df5ad2c
+--- /dev/null
++++ b/pkg/actors/targets/sandbox/router_test.go
+@@ -0,0 +1,183 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"context"
++	"errors"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++	"google.golang.org/protobuf/proto"
++
++	"github.com/dapr/dapr/pkg/actors/api"
++	placementfake "github.com/dapr/dapr/pkg/actors/internal/placement/fake"
++	"github.com/dapr/dapr/pkg/actors/internal/reentrancystore"
++	"github.com/dapr/dapr/pkg/actors/router"
++	"github.com/dapr/dapr/pkg/actors/table"
++	internalv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
++	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
++	"github.com/dapr/dapr/pkg/resiliency"
++	"github.com/dapr/kit/logger"
++)
++
++// routed is the real actor router in front of a sandbox Factory, with a fake
++// placement that hosts the type locally and hands every claim to the test.
++type routed struct {
++	router.Interface
++	lookups atomic.Int32
++	// claims receives the cancel function of every placement claim, in
++	// order. Cancelling one is what the disseminator does to in-flight calls
++	// on a rebalance, after the drain timeout.
++	claims chan context.CancelCauseFunc
++}
++
++func newRouted(t *testing.T, f *Factory) *routed {
++	t.Helper()
++	r := &routed{claims: make(chan context.CancelCauseFunc, 16)}
++	plc := placementfake.New().WithLookupActor(func(ctx context.Context, req *api.LookupActorRequest) (*api.LookupActorResponse, context.Context, context.CancelCauseFunc, error) {
++		r.lookups.Add(1)
++		cctx, cancel := context.WithCancelCause(ctx)
++		r.claims <- cancel
++		return &api.LookupActorResponse{Local: true}, cctx, cancel, nil
++	})
++	tbl := table.New(table.Options{ReentrancyStore: reentrancystore.New()})
++	t.Cleanup(func() { require.NoError(t, tbl.Close()) })
++	tbl.RegisterActorTypes(table.RegisterActorTypeOptions{
++		Factories: []table.ActorTypeFactory{{Type: testActorType, Factory: f}},
++	})
++	r.Interface = router.New(router.Options{
++		Placement:  plc,
++		Table:      tbl,
++		Resiliency: resiliency.FromConfigurations(logger.NewLogger("test")),
++	})
++	return r
++}
++
++// goCall routes one sandbox actor call on a new goroutine.
++func (r *routed) goCall(ctx context.Context, id, method string, in proto.Message) <-chan call {
++	ch := make(chan call, 1)
++	go func() {
++		data, err := proto.Marshal(in)
++		if err != nil {
++			ch <- call{err: err}
++			return
++		}
++		req := internalv1pb.NewInternalInvokeRequest(method).
++			WithActor(testActorType, id).
++			WithData(data).
++			WithContentType(internalv1pb.ProtobufContentType)
++		res, err := r.Call(ctx, req)
++		ch <- call{res: res, err: err}
++	}()
++	return ch
++}
++
++// TestRebalanceInterruptedCommandIsNotRetried checks that an exec or session
++// send whose driver call is cancelled by a placement claim cancellation (a
++// rebalance) fails with the interrupted error and is not run again: the
++// router does not retry it, here or on another host.
++func TestRebalanceInterruptedCommandIsNotRetried(t *testing.T) {
++	rebalance := errors.New("placement table updated")
++
++	for name, tc := range map[string]struct {
++		method  string
++		in      proto.Message
++		started func(*fakeDriver) chan struct{}
++		calls   func(*fakeDriver) int
++	}{
++		"exec": {
++			method:  MethodExec,
++			in:      &runtimev1pb.SandboxExecRequestAlpha1{Command: "sleep"},
++			started: func(d *fakeDriver) chan struct{} { return d.execStarted },
++			calls:   func(d *fakeDriver) int { return int(d.execCount.Load()) },
++		},
++		"session send": {
++			method:  MethodSessionSend,
++			in:      &runtimev1pb.SandboxSessionSendRequestAlpha1{SessionId: "sess-1", Input: []byte("x\n")},
++			started: func(d *fakeDriver) chan struct{} { return d.sendStarted },
++			calls:   func(d *fakeDriver) int { return d.sendCount() },
++		},
++	} {
++		t.Run(name, func(t *testing.T) {
++			d := &fakeDriver{}
++			f := newFactory(t, d)
++			r := newRouted(t, f)
++
++			// Acquire the VM and start a session through the router first.
++			c := await(t, r.goCall(t.Context(), "sb1", MethodSessionStart, &runtimev1pb.SandboxSessionStartRequestAlpha1{Command: "sh"}))
++			require.NoError(t, c.err)
++			<-r.claims
++			lookups := r.lookups.Load()
++
++			d.execStarted = make(chan struct{}, 1)
++			d.sendStarted = make(chan struct{}, 1)
++			d.untilDone = true
++			running := r.goCall(t.Context(), "sb1", tc.method, tc.in)
++			await(t, tc.started(d))
++			claim := await(t, r.claims)
++			claim(rebalance)
++
++			c = await(t, running)
++			require.Error(t, c.err)
++			assert.True(t, IsInterrupted(c.err), "expected the interrupted error, got %v", c.err)
++			assert.Equal(t, codes.Aborted, status.Code(c.err))
++			assert.Contains(t, status.Convert(c.err).Message(), "interrupted by actor rebalancing")
++			assert.False(t, IsSandboxLost(c.err))
++
++			// The driver ran the command once and the router looked the actor
++			// up once: no retry, so nothing ran it again.
++			assert.Equal(t, 1, tc.calls(d))
++			assert.Equal(t, lookups+1, r.lookups.Load())
++			// A caller on another host would not retry it either.
++			assert.False(t, router.IsRetryableRemoteError(c.err))
++
++			// The sandbox itself is kept, and the next call runs normally.
++			assert.True(t, f.Exists("sb1"))
++			d.untilDone = false
++			c = await(t, r.goCall(t.Context(), "sb1", tc.method, tc.in))
++			require.NoError(t, c.err)
++			assert.Equal(t, 2, tc.calls(d))
++		})
++	}
++
++	t.Run("a call cancelled before the driver is retried", func(t *testing.T) {
++		// While the call waits for its turn its claim is cancelled: no
++		// command ran, so the router may retry it, and the retry runs once.
++		d := &fakeDriver{execStarted: make(chan struct{}, 1), execBlock: make(chan struct{})}
++		f := newFactory(t, d)
++		r := newRouted(t, f)
++
++		first := r.goCall(t.Context(), "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "first"})
++		await(t, d.execStarted)
++		<-r.claims
++
++		queued := r.goCall(t.Context(), "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "queued"})
++		claim := await(t, r.claims)
++		assert.Eventually(t, func() bool { return f.GetOrCreate("sb1").(*target).inflight.Load() == 2 }, 5*time.Second, time.Millisecond)
++		claim(rebalance)
++
++		// The retry looks the actor up again, then waits for the turn.
++		<-r.claims
++		close(d.execBlock)
++		require.NoError(t, await(t, first).err)
++		require.NoError(t, await(t, queued).err)
++		assert.Equal(t, int32(2), d.execCount.Load())
++	})
++}
+diff --git a/pkg/actors/targets/sandbox/sandbox.go b/pkg/actors/targets/sandbox/sandbox.go
+index c33670c8c..dfe0833ac 100644
+--- a/pkg/actors/targets/sandbox/sandbox.go
++++ b/pkg/actors/targets/sandbox/sandbox.go
+@@ -22,6 +22,7 @@ import (
+ 	"sync/atomic"
+ 	"time"
+ 
++	"github.com/cenkalti/backoff/v4"
+ 	"google.golang.org/genproto/googleapis/rpc/errdetails"
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/status"
+@@ -68,6 +69,11 @@ const (
+ 	// the caller's expected activation token no longer matches, or the
+ 	// driver no longer knows the sandbox's VM.
+ 	ReasonSandboxLost = "DAPR_SANDBOX_LOST"
++	// ReasonInterrupted is the ErrorInfo reason of the "interrupted" error:
++	// the context of a driver call that runs a command ended while the call
++	// ran, because the actor's placement claim was cancelled (a rebalance)
++	// or the caller gave up.
++	ReasonInterrupted = "DAPR_SANDBOX_INTERRUPTED"
+ 	// ErrorDomain is the ErrorInfo domain of the errors of this package.
+ 	ErrorDomain = "dapr.io"
+ )
+@@ -84,6 +90,20 @@ var errSandboxLost = func() error {
+ 	return st.Err()
+ }()
+ 
++// errInterrupted is built once so that it always carries its ErrorInfo. Its
++// code, Aborted, is not one that a caller's router retries
++// (router.IsRetryableRemoteError).
++var errInterrupted = func() error {
++	st, err := status.New(codes.Aborted, "sandbox call interrupted by actor rebalancing: the command may have partly run").WithDetails(&errdetails.ErrorInfo{
++		Reason: ReasonInterrupted,
++		Domain: ErrorDomain,
++	})
++	if err != nil {
++		panic("sandbox: building the interrupted error: " + err.Error())
++	}
++	return st.Err()
++}()
++
+ // ErrSandboxLost returns the "sandbox lost" error: FailedPrecondition with an
+ // ErrorInfo detail whose reason is ReasonSandboxLost.
+ func ErrSandboxLost() error {
+@@ -92,12 +112,27 @@ func ErrSandboxLost() error {
+ 
+ // IsSandboxLost reports whether err is the "sandbox lost" error.
+ func IsSandboxLost(err error) bool {
++	return hasReason(err, codes.FailedPrecondition, ReasonSandboxLost)
++}
++
++// ErrInterrupted returns the "interrupted" error: Aborted with an ErrorInfo
++// detail whose reason is ReasonInterrupted.
++func ErrInterrupted() error {
++	return errInterrupted
++}
++
++// IsInterrupted reports whether err is the "interrupted" error.
++func IsInterrupted(err error) bool {
++	return hasReason(err, codes.Aborted, ReasonInterrupted)
++}
++
++func hasReason(err error, code codes.Code, reason string) bool {
+ 	st, ok := status.FromError(err)
+-	if !ok || st.Code() != codes.FailedPrecondition {
++	if !ok || st.Code() != code {
+ 		return false
+ 	}
+ 	for _, d := range st.Details() {
+-		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetReason() == ReasonSandboxLost {
++		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetReason() == reason {
+ 			return true
+ 		}
+ 	}
+@@ -254,7 +289,7 @@ func (t *target) exec(ctx context.Context, data []byte, start time.Time) (proto.
+ 	})
+ 	cancel()
+ 	timing.ExecUs = t.factory.sinceUs(execStart)
+-	if err = t.commandErr("exec", err, t.instanceErr); err != nil {
++	if err = t.commandErr(ctx, "exec", err, t.instanceErr); err != nil {
+ 		return nil, err
+ 	}
+ 
+@@ -297,7 +332,7 @@ func (t *target) sessionStart(ctx context.Context, data []byte) (proto.Message,
+ 		},
+ 	})
+ 	cancel()
+-	if err = t.commandErr("session start", err, t.instanceErr); err != nil {
++	if err = t.commandErr(ctx, "session start", err, t.instanceErr); err != nil {
+ 		return nil, err
+ 	}
+ 
+@@ -335,7 +370,7 @@ func (t *target) sessionSend(ctx context.Context, data []byte, start time.Time)
+ 	timing.ExecUs = t.factory.sinceUs(execStart)
+ 	// NotFound here can mean an unknown session, so a driver error is not
+ 	// treated as a lost sandbox.
+-	if err = t.commandErr("session send", err, func(op string, err error) error { return driverErr(op, err) }); err != nil {
++	if err = t.commandErr(ctx, "session send", err, func(op string, err error) error { return driverErr(op, err) }); err != nil {
+ 		return nil, err
+ 	}
+ 
+@@ -471,19 +506,34 @@ func (t *target) callContext(ctx context.Context) (context.Context, context.Canc
+ }
+ 
+ // commandErr maps the outcome of a driver call that runs a command (exec,
+-// session start, session send); err is the driver's error, or nil. A target
+-// removed during the call lost its VM, so the outcome is the "sandbox lost"
+-// error even if the driver answered. Other driver errors go through mapErr.
+-func (t *target) commandErr(op string, err error, mapErr func(string, error) error) error {
++// session start, session send); ctx is the call's context and err the
++// driver's error, or nil.
++//
++//   - A target removed during the call lost its VM, so the outcome is the
++//     "sandbox lost" error even if the driver answered.
++//   - A driver error after ctx ended is the "interrupted" error: the command
++//     was cut short (a driver kills it when its call is cancelled) and may
++//     have partly run. The actor router cancels ctx when it cancels the
++//     actor's placement claim, on a rebalance after the drain timeout.
++//   - Other driver errors go through mapErr.
++//
++// Every error is permanent. The router retries a failed call whose context
++// ended, on this or the actor's new host, unless the error is permanent; a
++// retry would run the command again.
++func (t *target) commandErr(ctx context.Context, op string, err error, mapErr func(string, error) error) error {
+ 	switch {
+ 	case t.isRemoved():
+ 		log.Debugf("Sandbox actor '%s' was removed during %s", t.Key(), op)
+-		return ErrSandboxLost()
++		err = ErrSandboxLost()
+ 	case err == nil:
+ 		return nil
++	case ctx.Err() != nil:
++		log.Debugf("Sandbox actor '%s': %s interrupted: %v (cause: %v)", t.Key(), op, err, context.Cause(ctx))
++		err = ErrInterrupted()
+ 	default:
+-		return mapErr(op, err)
++		err = mapErr(op, err)
+ 	}
++	return backoff.Permanent(err)
+ }
+ 
+ // instanceErr maps a driver error for a call on the instance itself: NotFound
+diff --git a/pkg/api/universal/sandbox.go b/pkg/api/universal/sandbox.go
+index 6189c45e7..19a3e18c0 100644
+--- a/pkg/api/universal/sandbox.go
++++ b/pkg/api/universal/sandbox.go
+@@ -101,6 +101,11 @@ func (a *Universal) sandboxCall(ctx context.Context, component, appID, sandboxID
+ 
+ 	res, err := router.Call(ctx, ireq)
+ 	if err != nil {
++		// A command cut short because this caller's own context ended (it
++		// gave up, or its deadline passed) gets that context's error.
++		if sandboxtarget.IsInterrupted(err) && ctx.Err() != nil {
++			return nil, status.FromContextError(ctx.Err()).Err()
++		}
+ 		return nil, a.mapSandboxError(err)
+ 	}
+ 	return res.GetMessage().GetData().GetValue(), nil
+@@ -132,6 +137,12 @@ func (a *Universal) mapSandboxError(err error) error {
+ 		a.logger.Debugf("sandbox call failed: %v", err)
+ 		return messages.ErrSandboxExec
+ 	}
++	if sandboxtarget.IsInterrupted(err) {
++		// The sandbox actor's driver call was cancelled by a rebalance. The
++		// router did not retry it, so the command ran at most once.
++		a.logger.Debugf("sandbox call interrupted: %s", st.Message())
++		return messages.ErrSandboxInterrupted
++	}
+ 	switch st.Code() {
+ 	case codes.FailedPrecondition:
+ 		// Only the sandbox actor's own error means the sandbox was lost. Any
+diff --git a/pkg/api/universal/sandbox_test.go b/pkg/api/universal/sandbox_test.go
+index e0febc02d..fd51d2a21 100644
+--- a/pkg/api/universal/sandbox_test.go
++++ b/pkg/api/universal/sandbox_test.go
+@@ -462,3 +462,31 @@ func TestSandboxAcquireDriverUnavailableIsHostFull(t *testing.T) {
+ 	assert.Equal(t, int32(1), calls.Load())
+ 	assert.Equal(t, 0, f.Len())
+ }
++
++func TestSandboxInterruptedIsExecError(t *testing.T) {
++	t.Run("interrupted by a rebalance", func(t *testing.T) {
++		u, rec := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
++			return nil, sandboxtarget.ErrInterrupted()
++		})
++		_, err := u.SandboxSessionSendAlpha1(t.Context(), &runtimev1pb.SandboxSessionSendRequestAlpha1{Component: "py", SandboxId: "sb", SessionId: "s"})
++		require.ErrorIs(t, err, messages.ErrSandboxExec)
++		var apiErr messages.APIError
++		require.ErrorAs(t, err, &apiErr)
++		assert.Equal(t, http.StatusInternalServerError, apiErr.HTTPCode())
++		assert.Equal(t, "ERR_SANDBOX_EXEC", apiErr.Tag())
++		assert.Equal(t, "sandbox call interrupted by actor rebalancing: the command may have partly run", apiErr.Message())
++		assert.Equal(t, 1, rec.len(), "an interrupted call must not be retried")
++	})
++
++	t.Run("the caller's own context ended", func(t *testing.T) {
++		ctx, cancel := context.WithCancel(t.Context())
++		defer cancel()
++		u, _ := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
++			cancel()
++			return nil, sandboxtarget.ErrInterrupted()
++		})
++		_, err := u.SandboxExecAlpha1(ctx, &runtimev1pb.SandboxExecRequestAlpha1{Component: "py", SandboxId: "sb", Command: "x"})
++		assert.Equal(t, codes.Canceled, status.Code(err))
++		assert.NotErrorIs(t, err, messages.ErrSandboxExec)
++	})
++}
+diff --git a/pkg/messages/predefined.go b/pkg/messages/predefined.go
+index 7c17ac073..3858faf0d 100644
+--- a/pkg/messages/predefined.go
++++ b/pkg/messages/predefined.go
+@@ -167,4 +167,7 @@ var (
+ 	ErrSandboxLost           = APIError{"sandbox was lost", errorcodes.SandboxLost, http.StatusGone, grpcCodes.FailedPrecondition}
+ 	ErrSandboxInvalidRequest = APIError{"invalid sandbox request", errorcodes.SandboxInvalidRequest, http.StatusBadRequest, grpcCodes.InvalidArgument}
+ 	ErrSandboxExec           = APIError{"sandbox execution failed", errorcodes.SandboxExec, http.StatusInternalServerError, grpcCodes.Internal}
++	// ErrSandboxInterrupted is an ErrSandboxExec (same code) for a command
++	// cut short by actor rebalancing. It is not retried, so it never runs twice.
++	ErrSandboxInterrupted = APIError{"sandbox call interrupted by actor rebalancing: the command may have partly run", errorcodes.SandboxExec, http.StatusInternalServerError, grpcCodes.Internal}
+ )
+-- 
+2.47.0
+

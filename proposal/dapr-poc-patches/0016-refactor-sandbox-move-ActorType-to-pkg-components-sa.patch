@@ -1,0 +1,172 @@
+From a982620d299e7332c69e16fd061919959d03b767 Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Thu, 29 Oct 2026 16:41:28 +0100
+Subject: [PATCH 16/27] refactor(sandbox): move ActorType to
+ pkg/components/sandbox
+
+The sandbox actor type name is needed by the API layer (routing in
+universal, the CallActor ACL in pkg/api/grpc) and by the runtime host.
+It lived in pkg/runtime/sandboxhost, so workflow_acl.go imported a
+runtime package for a string helper. It now lives in the leaf component
+package that every user already imports.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/api/grpc/workflow_acl.go             |  6 +++---
+ pkg/api/universal/sandbox.go             |  4 ++--
+ pkg/components/sandbox/actortype.go      | 22 ++++++++++++++++++++++
+ pkg/components/sandbox/actortype_test.go | 24 ++++++++++++++++++++++++
+ pkg/runtime/sandboxhost/host.go          |  7 +------
+ pkg/runtime/sandboxhost/host_test.go     |  4 ----
+ 6 files changed, 52 insertions(+), 15 deletions(-)
+ create mode 100644 pkg/components/sandbox/actortype.go
+ create mode 100644 pkg/components/sandbox/actortype_test.go
+
+diff --git a/pkg/api/grpc/workflow_acl.go b/pkg/api/grpc/workflow_acl.go
+index d038f2878..5f10bee17 100644
+--- a/pkg/api/grpc/workflow_acl.go
++++ b/pkg/api/grpc/workflow_acl.go
+@@ -21,9 +21,9 @@ import (
+ 	"google.golang.org/grpc/status"
+ 
+ 	workflowacl "github.com/dapr/dapr/pkg/acl/workflow"
++	"github.com/dapr/dapr/pkg/components/sandbox"
+ 	diag "github.com/dapr/dapr/pkg/diagnostics"
+ 	internalv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
+-	"github.com/dapr/dapr/pkg/runtime/sandboxhost"
+ 	"github.com/dapr/dapr/pkg/security/spiffe"
+ )
+ 
+@@ -148,10 +148,10 @@ func (a *api) validateSameAppInternalActor(ctx context.Context, actorType, opera
+ }
+ 
+ // isHostedSandboxActorType reports whether actorType is a sandbox actor type
+-// of this app (sandboxhost.ActorType). An app hosts sandboxes for the other
++// of this app (sandbox.ActorType). An app hosts sandboxes for the other
+ // apps of its namespace, which invoke them with the host's app ID.
+ func (a *api) isHostedSandboxActorType(actorType string) bool {
+-	prefix := sandboxhost.ActorType(a.Namespace(), a.AppID(), "")
++	prefix := sandbox.ActorType(a.Namespace(), a.AppID(), "")
+ 	return len(actorType) > len(prefix) && strings.HasPrefix(actorType, prefix)
+ }
+ 
+diff --git a/pkg/api/universal/sandbox.go b/pkg/api/universal/sandbox.go
+index 8baed677d..6189c45e7 100644
+--- a/pkg/api/universal/sandbox.go
++++ b/pkg/api/universal/sandbox.go
+@@ -27,10 +27,10 @@ import (
+ 	"google.golang.org/protobuf/types/known/emptypb"
+ 
+ 	sandboxtarget "github.com/dapr/dapr/pkg/actors/targets/sandbox"
++	"github.com/dapr/dapr/pkg/components/sandbox"
+ 	"github.com/dapr/dapr/pkg/messages"
+ 	internalsv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
+ 	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
+-	"github.com/dapr/dapr/pkg/runtime/sandboxhost"
+ )
+ 
+ const (
+@@ -60,7 +60,7 @@ func (a *Universal) sandboxCall(ctx context.Context, component, appID, sandboxID
+ 	if target == "" {
+ 		target = a.appID
+ 	}
+-	actorType := sandboxhost.ActorType(a.namespace, target, component)
++	actorType := sandbox.ActorType(a.namespace, target, component)
+ 	if target == a.appID {
+ 		if _, ok := a.compStore.GetSandbox(component); !ok {
+ 			err := messages.ErrSandboxNotFound.WithFormat(component)
+diff --git a/pkg/components/sandbox/actortype.go b/pkg/components/sandbox/actortype.go
+new file mode 100644
+index 000000000..444ac4a31
+--- /dev/null
++++ b/pkg/components/sandbox/actortype.go
+@@ -0,0 +1,22 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++// ActorType returns the internal actor type of a sandbox component hosted by
++// an app: dapr.internal.<namespace>.<appID>.sandbox.<component>. It lives in
++// this leaf package so that the API layer and its ACLs do not depend on the
++// runtime.
++func ActorType(namespace, appID, component string) string {
++	return "dapr.internal." + namespace + "." + appID + ".sandbox." + component
++}
+diff --git a/pkg/components/sandbox/actortype_test.go b/pkg/components/sandbox/actortype_test.go
+new file mode 100644
+index 000000000..9fec701ab
+--- /dev/null
++++ b/pkg/components/sandbox/actortype_test.go
+@@ -0,0 +1,24 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func TestActorType(t *testing.T) {
++	assert.Equal(t, "dapr.internal.default.app1.sandbox.py", ActorType("default", "app1", "py"))
++}
+diff --git a/pkg/runtime/sandboxhost/host.go b/pkg/runtime/sandboxhost/host.go
+index 955ed81d4..2f46c21ab 100644
+--- a/pkg/runtime/sandboxhost/host.go
++++ b/pkg/runtime/sandboxhost/host.go
+@@ -105,7 +105,7 @@ func (h *Host) Add(_ context.Context, component string, d sandbox.Sandbox, cfg s
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	e := &entry{
+ 		component: component,
+-		actorType: ActorType(h.opts.Namespace, h.opts.AppID, component),
++		actorType: sandbox.ActorType(h.opts.Namespace, h.opts.AppID, component),
+ 		driver:    d,
+ 		cancel:    cancel,
+ 		done:      make(chan struct{}),
+@@ -278,8 +278,3 @@ func (h *Host) reconcileLoop(ctx context.Context, e *entry, factory *sandboxtarg
+ 		}
+ 	}
+ }
+-
+-// ActorType returns the internal actor type name for a sandbox component.
+-func ActorType(namespace, appID, component string) string {
+-	return "dapr.internal." + namespace + "." + appID + ".sandbox." + component
+-}
+diff --git a/pkg/runtime/sandboxhost/host_test.go b/pkg/runtime/sandboxhost/host_test.go
+index 8a403b806..b98e7ee8f 100644
+--- a/pkg/runtime/sandboxhost/host_test.go
++++ b/pkg/runtime/sandboxhost/host_test.go
+@@ -255,7 +255,3 @@ func TestAddDoesNotBlockOnTable(t *testing.T) {
+ 	// Remove cancels the goroutine stuck in Table.
+ 	require.NoError(t, h.Remove(context.Background(), "py"))
+ }
+-
+-func TestActorType(t *testing.T) {
+-	assert.Equal(t, wantType, ActorType("default", "app1", "py"))
+-}
+-- 
+2.47.0
+

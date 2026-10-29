@@ -1,0 +1,110 @@
+From a3284ee93ad73b10328533b3a9bc693bc4754fb5 Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Thu, 29 Oct 2026 16:55:43 +0100
+Subject: [PATCH 25/27] fix(sandbox): close a driver that failed to initialise
+
+The processor deliberately skipped Close when a sandbox component's
+Init failed, because the pluggable client's Close panicked without a
+connection (the previous commit's message wrongly says the processor
+already closed it). Now that Close is safe, a driver that is not added
+is closed, both after a configuration error and after a failed driver
+Init, so a pluggable driver whose Init RPC failed no longer leaks its
+connection.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/runtime/processor/sandbox/sandbox.go      | 19 ++++++++++++++++---
+ pkg/runtime/processor/sandbox/sandbox_test.go |  8 ++++----
+ 2 files changed, 20 insertions(+), 7 deletions(-)
+
+diff --git a/pkg/runtime/processor/sandbox/sandbox.go b/pkg/runtime/processor/sandbox/sandbox.go
+index 4fd9c0b6b..d4635ec89 100644
+--- a/pkg/runtime/processor/sandbox/sandbox.go
++++ b/pkg/runtime/processor/sandbox/sandbox.go
+@@ -25,8 +25,11 @@ import (
+ 	"github.com/dapr/dapr/pkg/runtime/compstore"
+ 	rterrors "github.com/dapr/dapr/pkg/runtime/errors"
+ 	"github.com/dapr/dapr/pkg/runtime/meta"
++	"github.com/dapr/kit/logger"
+ )
+ 
++var log = logger.NewLogger("dapr.runtime.processor.sandbox")
++
+ // SandboxHost is the subset of the sandbox host used by the processor.
+ type SandboxHost interface {
+ 	Add(ctx context.Context, component string, d compsandbox.Sandbox, cfg compsandbox.Config)
+@@ -77,16 +80,18 @@ func (s *sandboxMgr) Init(ctx context.Context, comp compapi.Component) error {
+ 		return rterrors.NewInit(rterrors.InitComponentFailure, fName, err)
+ 	}
+ 
+-	// Parse before driver Init: a failure here must not touch the driver, since
+-	// pluggable drivers' Close dereferences a connection that Init dials.
++	// Parse before driver Init, so that a bad configuration never reaches the
++	// driver. A driver that is not added is closed: a pluggable driver whose
++	// Init RPC failed holds a connection.
+ 	cfg, err := compsandbox.ParseConfig(base.Properties)
+ 	if err != nil {
++		closeDriver(driver, fName)
+ 		diag.DefaultMonitoring.ComponentInitFailed(comp.Spec.Type, "init", comp.Name)
+ 		return rterrors.NewInit(rterrors.InitComponentFailure, fName, err)
+ 	}
+ 
+-	// On Init failure the driver is deliberately not closed (see above).
+ 	if err = driver.Init(ctx, base); err != nil {
++		closeDriver(driver, fName)
+ 		diag.DefaultMonitoring.ComponentInitFailed(comp.Spec.Type, "init", comp.Name)
+ 		return rterrors.NewInit(rterrors.InitComponentFailure, fName, err)
+ 	}
+@@ -99,6 +104,14 @@ func (s *sandboxMgr) Init(ctx context.Context, comp compapi.Component) error {
+ 	return nil
+ }
+ 
++// closeDriver closes a driver that failed to initialise. Drivers' Close is
++// safe before or after a failed Init.
++func closeDriver(driver compsandbox.Sandbox, fName string) {
++	if err := driver.Close(); err != nil {
++		log.Warnf("Failed to close sandbox component %s after a failed init: %v", fName, err)
++	}
++}
++
+ func (s *sandboxMgr) Close(comp compapi.Component) error {
+ 	driver, ok := s.store.GetSandbox(comp.Name)
+ 	if !ok {
+diff --git a/pkg/runtime/processor/sandbox/sandbox_test.go b/pkg/runtime/processor/sandbox/sandbox_test.go
+index 5605b4f5e..42aa3fbf8 100644
+--- a/pkg/runtime/processor/sandbox/sandbox_test.go
++++ b/pkg/runtime/processor/sandbox/sandbox_test.go
+@@ -116,26 +116,26 @@ func TestSandboxProcessor_InitClose(t *testing.T) {
+ 		assert.True(t, fake.closeCalled)
+ 	})
+ 
+-	t.Run("missing image errors, nothing added", func(t *testing.T) {
++	t.Run("missing image errors, nothing added, driver closed", func(t *testing.T) {
+ 		t.Parallel()
+ 		fake := &fakeDriver{}
+ 		p, store, host := setup(fake)
+ 
+ 		require.Error(t, p.Init(t.Context(), newComp(nil)))
+ 		assert.False(t, fake.initCalled)
+-		assert.False(t, fake.closeCalled)
++		assert.True(t, fake.closeCalled)
+ 		_, ok := store.GetSandbox("box")
+ 		assert.False(t, ok)
+ 		assert.Empty(t, host.added)
+ 	})
+ 
+-	t.Run("driver init error, nothing added or closed", func(t *testing.T) {
++	t.Run("driver init error, nothing added, driver closed", func(t *testing.T) {
+ 		t.Parallel()
+ 		fake := &fakeDriver{initErr: assert.AnError}
+ 		p, store, host := setup(fake)
+ 
+ 		require.Error(t, p.Init(t.Context(), newComp(map[string]string{"image": "x"})))
+-		assert.False(t, fake.closeCalled)
++		assert.True(t, fake.closeCalled)
+ 		_, ok := store.GetSandbox("box")
+ 		assert.False(t, ok)
+ 		assert.Empty(t, host.added)
+-- 
+2.47.0
+

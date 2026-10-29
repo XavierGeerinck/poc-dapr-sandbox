@@ -1,0 +1,573 @@
+From 5cf36bc9d9b1da807faff0c18dcbbd1fd5a64f39 Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Thu, 29 Oct 2026 16:48:58 +0100
+Subject: [PATCH 18/27] fix(sandbox): release stops a running command; bound
+ Acquire to 60 s
+
+DELETE waited for the sandbox's turn, so it blocked behind a running
+exec for as long as that command ran (forever without timeoutMs), and a
+driver Acquire that never returned held the turn and the caller forever.
+
+- release is handled before the turn wait, as Deactivate is. It removes
+  the target at once and releases the VM in the background.
+- The driver calls that run a command (exec, session start, session
+  send) use a context that is also cancelled when the target is
+  removed. A call whose target was removed while it ran answers with
+  the "sandbox lost" error (410 ERR_SANDBOX_LOST), even if the driver
+  answered, because its VM is going away.
+- Each driver Acquire is bounded by Options.AcquireTimeout, 60 s by
+  default. When the bound passes (and not the caller's own deadline)
+  the call fails with ResourceExhausted, which the API maps to 429
+  ERR_SANDBOX_HOST_FULL: no sandbox now, retry later.
+
+Exec with timeoutMs 0 is unchanged: no daprd-side deadline on the
+command itself. The lock order is unchanged; release takes the factory
+lock without the turn, as Deactivate does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/actors/targets/sandbox/factory.go      |  41 ++++--
+ pkg/actors/targets/sandbox/sandbox.go      |  97 +++++++++++---
+ pkg/actors/targets/sandbox/sandbox_test.go | 142 +++++++++++++++++++++
+ pkg/api/universal/sandbox_test.go          |  55 ++++++++
+ 4 files changed, 304 insertions(+), 31 deletions(-)
+
+diff --git a/pkg/actors/targets/sandbox/factory.go b/pkg/actors/targets/sandbox/factory.go
+index 44898ea24..1dbcf9370 100644
+--- a/pkg/actors/targets/sandbox/factory.go
++++ b/pkg/actors/targets/sandbox/factory.go
+@@ -37,6 +37,10 @@ const (
+ 	// DefaultIdleTimeout is used when Options.IdleTimeout is not positive.
+ 	DefaultIdleTimeout = 5 * time.Minute
+ 
++	// DefaultAcquireTimeout is used when Options.AcquireTimeout is not
++	// positive.
++	DefaultAcquireTimeout = 60 * time.Second
++
+ 	// releaseTimeout bounds each background driver Release call.
+ 	releaseTimeout = 10 * time.Second
+ 
+@@ -57,6 +61,10 @@ type Options struct {
+ 	// IdleTimeout is how long a sandbox may go without calls before its VM is
+ 	// released. Defaults to DefaultIdleTimeout.
+ 	IdleTimeout time.Duration
++	// AcquireTimeout bounds each driver Acquire. When it passes, the call
++	// fails with ResourceExhausted: no VM now, retry later. Defaults to
++	// DefaultAcquireTimeout.
++	AcquireTimeout time.Duration
+ 	// Clock defaults to the real clock.
+ 	Clock clock.Clock
+ }
+@@ -65,15 +73,16 @@ type Options struct {
+ // component. It implements targets.Factory.
+ //
+ // Lock order: a target's turn, then Factory.lock, then the idler queue's
+-// lock; never the other way round. Factory.lock is never held while calling
+-// the driver.
++// lock; never the other way round. Release and Deactivate take Factory.lock
++// without the turn. Factory.lock is never held while calling the driver.
+ type Factory struct {
+-	actorType   string
+-	component   string
+-	driver      sandbox.Sandbox
+-	idleTimeout time.Duration
+-	clock       clock.Clock
+-	idlerQueue  *queue.Processor[string, *target]
++	actorType      string
++	component      string
++	driver         sandbox.Sandbox
++	idleTimeout    time.Duration
++	acquireTimeout time.Duration
++	clock          clock.Clock
++	idlerQueue     *queue.Processor[string, *target]
+ 
+ 	// lock guards table and each target's instanceID and removed fields. A
+ 	// target is in table exactly while its removed field is false.
+@@ -98,14 +107,18 @@ func New(opts Options) (*Factory, error) {
+ 	if opts.IdleTimeout <= 0 {
+ 		opts.IdleTimeout = DefaultIdleTimeout
+ 	}
++	if opts.AcquireTimeout <= 0 {
++		opts.AcquireTimeout = DefaultAcquireTimeout
++	}
+ 
+ 	f := &Factory{
+-		actorType:   opts.ActorType,
+-		component:   opts.Component,
+-		driver:      opts.Driver,
+-		idleTimeout: opts.IdleTimeout,
+-		clock:       opts.Clock,
+-		table:       make(map[string]*target),
++		actorType:      opts.ActorType,
++		component:      opts.Component,
++		driver:         opts.Driver,
++		idleTimeout:    opts.IdleTimeout,
++		acquireTimeout: opts.AcquireTimeout,
++		clock:          opts.Clock,
++		table:          make(map[string]*target),
+ 	}
+ 
+ 	f.idlerQueue = queue.NewProcessor[string, *target](queue.Options[string, *target]{
+diff --git a/pkg/actors/targets/sandbox/sandbox.go b/pkg/actors/targets/sandbox/sandbox.go
+index a7c081324..24f19189e 100644
+--- a/pkg/actors/targets/sandbox/sandbox.go
++++ b/pkg/actors/targets/sandbox/sandbox.go
+@@ -48,7 +48,8 @@ const (
+ 	// MethodExec runs a one-shot command.
+ 	// SandboxExecRequestAlpha1 -> SandboxExecResponseAlpha1.
+ 	MethodExec = "exec"
+-	// MethodRelease releases the VM and removes the sandbox.
++	// MethodRelease releases the VM and removes the sandbox. It does not wait
++	// for a running call: that call ends with the "sandbox lost" error.
+ 	// SandboxDeleteRequestAlpha1 -> empty data.
+ 	MethodRelease = "release"
+ 	// MethodSessionStart starts a long-lived process.
+@@ -121,7 +122,8 @@ type target struct {
+ 	// turn makes calls turn-based: a call holds its single slot for the whole
+ 	// call. Waiting for it honours the caller's context and closed.
+ 	turn chan struct{}
+-	// closed is closed when the target is removed, waking waiting calls.
++	// closed is closed when the target is removed, waking waiting calls and
++	// cancelling the driver call of a running one (see callContext).
+ 	closed chan struct{}
+ 
+ 	// instanceID is the driver instance, or "" before it was acquired. It is
+@@ -144,6 +146,16 @@ func (t *target) InvokeMethod(ctx context.Context, req *internalv1pb.InternalInv
+ 	}
+ 	defer t.exit()
+ 
++	// Release does not take the turn, as Deactivate does not: it removes the
++	// target now, which ends a running command (whose caller then gets the
++	// "sandbox lost" error) and releases the VM in the background.
++	if method == MethodRelease {
++		if err := t.release(req.GetMessage().GetData().GetValue()); err != nil {
++			return nil, err
++		}
++		return newResponse(nil)
++	}
++
+ 	// A caller that gives up, or a target removed while the call waits,
+ 	// leaves the target as it is. Closed makes the router retry on a new
+ 	// target.
+@@ -176,8 +188,6 @@ func (t *target) InvokeMethod(ctx context.Context, req *internalv1pb.InternalInv
+ 		res, err = t.activate(ctx, data, start)
+ 	case MethodExec:
+ 		res, err = t.exec(ctx, data, start)
+-	case MethodRelease:
+-		err = t.release(data)
+ 	case MethodSessionStart:
+ 		res, err = t.sessionStart(ctx, data)
+ 	case MethodSessionSend:
+@@ -230,7 +240,8 @@ func (t *target) exec(ctx context.Context, data []byte, start time.Time) (proto.
+ 	}
+ 
+ 	execStart := t.factory.clock.Now()
+-	res, err := t.factory.driver.Exec(ctx, &compv1pb.SandboxExecRequest{
++	callCtx, cancel := t.callContext(ctx)
++	res, err := t.factory.driver.Exec(callCtx, &compv1pb.SandboxExecRequest{
+ 		InstanceId: instanceID,
+ 		Spec: &compv1pb.SandboxExecSpec{
+ 			Command:   req.GetCommand(),
+@@ -241,9 +252,10 @@ func (t *target) exec(ctx context.Context, data []byte, start time.Time) (proto.
+ 			TimeoutMs: req.GetTimeoutMs(),
+ 		},
+ 	})
++	cancel()
+ 	timing.ExecUs = t.factory.sinceUs(execStart)
+-	if err != nil {
+-		return nil, t.instanceErr("exec", err)
++	if err = t.commandErr("exec", err, t.instanceErr); err != nil {
++		return nil, err
+ 	}
+ 
+ 	return t.execResponse(res, timing, start), nil
+@@ -274,7 +286,8 @@ func (t *target) sessionStart(ctx context.Context, data []byte) (proto.Message,
+ 		return nil, err
+ 	}
+ 
+-	res, err := t.factory.driver.SessionStart(ctx, &compv1pb.SandboxSessionStartRequest{
++	callCtx, cancel := t.callContext(ctx)
++	res, err := t.factory.driver.SessionStart(callCtx, &compv1pb.SandboxSessionStartRequest{
+ 		InstanceId: instanceID,
+ 		Spec: &compv1pb.SandboxExecSpec{
+ 			Command: req.GetCommand(),
+@@ -283,8 +296,9 @@ func (t *target) sessionStart(ctx context.Context, data []byte) (proto.Message,
+ 			Cwd:     req.GetCwd(),
+ 		},
+ 	})
+-	if err != nil {
+-		return nil, t.instanceErr("session start", err)
++	cancel()
++	if err = t.commandErr("session start", err, t.instanceErr); err != nil {
++		return nil, err
+ 	}
+ 
+ 	return &runtimev1pb.SandboxSessionStartResponseAlpha1{
+@@ -309,18 +323,20 @@ func (t *target) sessionSend(ctx context.Context, data []byte, start time.Time)
+ 
+ 	timing := new(runtimev1pb.SandboxTimingAlpha1)
+ 	execStart := t.factory.clock.Now()
+-	res, err := t.factory.driver.SessionSend(ctx, &compv1pb.SandboxSessionSendRequest{
++	callCtx, cancel := t.callContext(ctx)
++	res, err := t.factory.driver.SessionSend(callCtx, &compv1pb.SandboxSessionSendRequest{
+ 		InstanceId: t.instanceID,
+ 		SessionId:  req.GetSessionId(),
+ 		Input:      req.GetInput(),
+ 		Until:      req.GetUntil(),
+ 		TimeoutMs:  req.GetTimeoutMs(),
+ 	})
++	cancel()
+ 	timing.ExecUs = t.factory.sinceUs(execStart)
+-	if err != nil {
+-		// NotFound here can mean an unknown session, so it is not treated as
+-		// a lost sandbox.
+-		return nil, driverErr("session send", err)
++	// NotFound here can mean an unknown session, so a driver error is not
++	// treated as a lost sandbox.
++	if err = t.commandErr("session send", err, func(op string, err error) error { return driverErr(op, err) }); err != nil {
++		return nil, err
+ 	}
+ 
+ 	return t.execResponse(res, timing, start), nil
+@@ -389,17 +405,21 @@ func (t *target) acquire(ctx context.Context, method string, timing *runtimev1pb
+ 	defer f.acquiring.Add(-1)
+ 
+ 	start := f.clock.Now()
+-	res, err := f.driver.Acquire(ctx, &compv1pb.SandboxAcquireRequest{
++	actx, cancel := context.WithTimeout(ctx, f.acquireTimeout)
++	res, err := f.driver.Acquire(actx, &compv1pb.SandboxAcquireRequest{
+ 		SandboxId:    t.actorID,
+ 		ActivationId: t.activation,
+ 	})
++	// The bound passed, not the caller's own context.
++	timedOut := errors.Is(actx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
++	cancel()
+ 	activateUs := f.sinceUs(start)
+ 	if err == nil && res.GetInstanceId() == "" {
+ 		err = status.Error(codes.Internal, "sandbox driver returned no instance ID")
+ 	}
+ 	if err != nil {
+ 		f.remove(t)
+-		return "", driverErr("acquire", err)
++		return "", t.acquireErr(err, timedOut)
+ 	}
+ 
+ 	f.lock.Lock()
+@@ -420,6 +440,49 @@ func (t *target) acquire(ctx context.Context, method string, timing *runtimev1pb
+ 	return t.instanceID, nil
+ }
+ 
++// acquireErr maps a failed driver Acquire. When the acquire bound passed, no
++// VM is available now, so it becomes ResourceExhausted: retry later. Nothing
++// was acquired, so nothing was lost.
++func (t *target) acquireErr(err error, timedOut bool) error {
++	switch {
++	case timedOut:
++		return status.Errorf(codes.ResourceExhausted, "sandbox driver did not provide a sandbox within %s", t.factory.acquireTimeout)
++	default:
++		return driverErr("acquire", err)
++	}
++}
++
++// callContext returns the context for a driver call that runs a command in
++// the VM. It is also cancelled when the target is removed, so a release,
++// deactivation or halt stops the command instead of waiting for it.
++func (t *target) callContext(ctx context.Context) (context.Context, context.CancelFunc) {
++	ctx, cancel := context.WithCancel(ctx)
++	go func() {
++		select {
++		case <-t.closed:
++			cancel()
++		case <-ctx.Done():
++		}
++	}()
++	return ctx, cancel
++}
++
++// commandErr maps the outcome of a driver call that runs a command (exec,
++// session start, session send); err is the driver's error, or nil. A target
++// removed during the call lost its VM, so the outcome is the "sandbox lost"
++// error even if the driver answered. Other driver errors go through mapErr.
++func (t *target) commandErr(op string, err error, mapErr func(string, error) error) error {
++	switch {
++	case t.isRemoved():
++		log.Debugf("Sandbox actor '%s' was removed during %s", t.Key(), op)
++		return ErrSandboxLost()
++	case err == nil:
++		return nil
++	default:
++		return mapErr(op, err)
++	}
++}
++
+ // instanceErr maps a driver error for a call on the instance itself: NotFound
+ // means the VM is gone and Unavailable means the driver itself is gone (for
+ // example a crashed pluggable driver), taking the VM with it. Either way the
+diff --git a/pkg/actors/targets/sandbox/sandbox_test.go b/pkg/actors/targets/sandbox/sandbox_test.go
+index ac548b7dc..e7ca1d6c9 100644
+--- a/pkg/actors/targets/sandbox/sandbox_test.go
++++ b/pkg/actors/targets/sandbox/sandbox_test.go
+@@ -73,6 +73,12 @@ type fakeDriver struct {
+ 	// and wait until execBlock is closed.
+ 	execStarted chan struct{}
+ 	execBlock   chan struct{}
++	// untilDone makes Acquire, Exec and SessionSend block until their
++	// context is done and return its error, as a driver call whose command
++	// or boot is cut short does. Their started channels still signal.
++	untilDone bool
++	// sendStarted, when set, makes SessionSend signal that it started.
++	sendStarted chan struct{}
+ 
+ 	nextID atomic.Int32
+ 
+@@ -101,6 +107,10 @@ func (d *fakeDriver) Acquire(ctx context.Context, req *compv1pb.SandboxAcquireRe
+ 	if d.acquireBlock != nil {
+ 		<-d.acquireBlock
+ 	}
++	if d.untilDone {
++		<-ctx.Done()
++		return nil, status.FromContextError(ctx.Err()).Err()
++	}
+ 	if d.acquireDelay > 0 {
+ 		time.Sleep(d.acquireDelay)
+ 	}
+@@ -124,6 +134,10 @@ func (d *fakeDriver) Exec(ctx context.Context, req *compv1pb.SandboxExecRequest)
+ 	if d.execBlock != nil {
+ 		<-d.execBlock
+ 	}
++	if d.untilDone {
++		<-ctx.Done()
++		return nil, status.FromContextError(ctx.Err()).Err()
++	}
+ 	if d.execDelay > 0 {
+ 		time.Sleep(d.execDelay)
+ 	}
+@@ -151,6 +165,13 @@ func (d *fakeDriver) SessionSend(ctx context.Context, req *compv1pb.SandboxSessi
+ 	d.lock.Lock()
+ 	d.sends = append(d.sends, req)
+ 	d.lock.Unlock()
++	if d.sendStarted != nil {
++		d.sendStarted <- struct{}{}
++	}
++	if d.untilDone {
++		<-ctx.Done()
++		return nil, status.FromContextError(ctx.Err()).Err()
++	}
+ 	if d.execDelay > 0 {
+ 		time.Sleep(d.execDelay)
+ 	}
+@@ -189,6 +210,12 @@ func (d *fakeDriver) Reconcile(context.Context, *compv1pb.SandboxReconcileReques
+ 	return &compv1pb.SandboxReconcileResponse{}, nil
+ }
+ 
++func (d *fakeDriver) sendCount() int {
++	d.lock.Lock()
++	defer d.lock.Unlock()
++	return len(d.sends)
++}
++
+ func (d *fakeDriver) releasedIDs() []string {
+ 	d.lock.Lock()
+ 	defer d.lock.Unlock()
+@@ -788,6 +815,121 @@ func TestRelease(t *testing.T) {
+ 	assert.Never(t, func() bool { return d.releaseCount.Load() > 1 }, 100*time.Millisecond, 10*time.Millisecond)
+ }
+ 
++func TestReleaseDuringRunningCall(t *testing.T) {
++	for name, tc := range map[string]struct {
++		started func(*fakeDriver) chan struct{}
++		run     func(context.Context, *Factory) <-chan call
++	}{
++		"exec": {
++			started: func(d *fakeDriver) chan struct{} { return d.execStarted },
++			run: func(ctx context.Context, f *Factory) <-chan call {
++				// No timeoutMs: without the release, the command would run
++				// until it exits.
++				return goInvoke(ctx, f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "sleep"})
++			},
++		},
++		"session send": {
++			started: func(d *fakeDriver) chan struct{} { return d.sendStarted },
++			run: func(ctx context.Context, f *Factory) <-chan call {
++				return goInvoke(ctx, f, "sb1", MethodSessionSend, &runtimev1pb.SandboxSessionSendRequestAlpha1{
++					SessionId: "sess-1", Input: []byte("x\n"), Until: []byte(">>> "),
++				})
++			},
++		},
++	} {
++		t.Run(name, func(t *testing.T) {
++			d := &fakeDriver{}
++			f := newFactory(t, d)
++
++			// Acquire the VM and start a session first.
++			_, err := invoke(t, f, "sb1", MethodSessionStart, &runtimev1pb.SandboxSessionStartRequestAlpha1{Command: "sh"})
++			require.NoError(t, err)
++
++			d.execStarted = make(chan struct{}, 1)
++			d.sendStarted = make(chan struct{}, 1)
++			d.untilDone = true
++			running := tc.run(t.Context(), f)
++			await(t, tc.started(d))
++
++			// The release does not wait for the running call's turn.
++			start := time.Now()
++			_, err = invoke(t, f, "sb1", MethodRelease, &runtimev1pb.SandboxDeleteRequestAlpha1{SandboxId: "sb1"})
++			require.NoError(t, err)
++			assert.Less(t, time.Since(start), time.Second)
++			assert.False(t, f.Exists("sb1"))
++
++			// The running call ends: its driver call was cancelled and the
++			// sandbox is gone.
++			c := await(t, running)
++			requireLost(t, c.err)
++			assert.Eventually(t, func() bool { return d.releaseCount.Load() == 1 }, 5*time.Second, 10*time.Millisecond)
++			assert.Equal(t, []string{"inst-1"}, d.releasedIDs())
++		})
++	}
++}
++
++func TestReleaseDuringAcquire(t *testing.T) {
++	d := &fakeDriver{acquireStarted: make(chan struct{}, 1), acquireBlock: make(chan struct{})}
++	f := newFactory(t, d)
++
++	running := goInvoke(t.Context(), f, "sb1", MethodExec, &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"})
++	await(t, d.acquireStarted)
++
++	start := time.Now()
++	_, err := invoke(t, f, "sb1", MethodRelease, &runtimev1pb.SandboxDeleteRequestAlpha1{SandboxId: "sb1"})
++	require.NoError(t, err)
++	assert.Less(t, time.Since(start), time.Second)
++
++	// The acquire finishes and hands its VM straight back. No command ran,
++	// so the exec is Closed and the router may run it on a new target.
++	close(d.acquireBlock)
++	c := await(t, running)
++	assert.True(t, targetserrors.IsClosed(c.err), "expected Closed, got %v", c.err)
++	assert.Equal(t, int32(0), d.execCount.Load())
++	assert.Eventually(t, func() bool { return d.releaseCount.Load() == 1 }, 5*time.Second, 10*time.Millisecond)
++}
++
++func TestAcquireTimeout(t *testing.T) {
++	for _, method := range []string{MethodActivate, MethodExec} {
++		t.Run(method, func(t *testing.T) {
++			d := &fakeDriver{untilDone: true}
++			f := newFactory(t, d, func(o *Options) { o.AcquireTimeout = 100 * time.Millisecond })
++
++			var in proto.Message = &runtimev1pb.SandboxCreateRequestAlpha1{}
++			if method == MethodExec {
++				in = &runtimev1pb.SandboxExecRequestAlpha1{Command: "ls"}
++			}
++			start := time.Now()
++			_, err := invoke(t, f, "sb1", method, in)
++			require.Error(t, err)
++			assert.GreaterOrEqual(t, time.Since(start), 100*time.Millisecond)
++			assert.Less(t, time.Since(start), 5*time.Second)
++			// Retry later, like a full host.
++			assert.Equal(t, codes.ResourceExhausted, status.Code(err))
++			assert.Contains(t, status.Convert(err).Message(), "did not provide a sandbox within 100ms")
++			assert.False(t, IsSandboxLost(err))
++			assert.False(t, f.Exists("sb1"))
++			assert.Equal(t, int32(0), d.execCount.Load())
++		})
++	}
++
++	t.Run("the caller's deadline is not the bound", func(t *testing.T) {
++		d := &fakeDriver{untilDone: true}
++		f := newFactory(t, d)
++
++		ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
++		defer cancel()
++		c := invokeCtx(ctx, f, "sb1", MethodActivate, &runtimev1pb.SandboxCreateRequestAlpha1{})
++		assert.Equal(t, codes.DeadlineExceeded, status.Code(c.err))
++	})
++
++	t.Run("default", func(t *testing.T) {
++		f, err := New(Options{ActorType: testActorType, Component: "mysandbox", Driver: &fakeDriver{}})
++		require.NoError(t, err)
++		assert.Equal(t, 60*time.Second, f.acquireTimeout)
++	})
++}
++
+ func TestCallOnRemovedTargetIsClosed(t *testing.T) {
+ 	d := &fakeDriver{}
+ 	f := newFactory(t, d)
+diff --git a/pkg/api/universal/sandbox_test.go b/pkg/api/universal/sandbox_test.go
+index 307b17e28..2576df765 100644
+--- a/pkg/api/universal/sandbox_test.go
++++ b/pkg/api/universal/sandbox_test.go
+@@ -20,6 +20,7 @@ package universal
+ import (
+ 	"context"
+ 	"fmt"
++	"net/http"
+ 	"sync"
+ 	"sync/atomic"
+ 	"testing"
+@@ -41,6 +42,7 @@ import (
+ 	"github.com/dapr/dapr/pkg/components/sandbox"
+ 	"github.com/dapr/dapr/pkg/messages"
+ 	commonv1 "github.com/dapr/dapr/pkg/proto/common/v1"
++	compv1pb "github.com/dapr/dapr/pkg/proto/components/v1"
+ 	internalsv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
+ 	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
+ 	"github.com/dapr/dapr/pkg/resiliency"
+@@ -380,3 +382,56 @@ func TestSandboxSelfNotHostedYetFailsFast(t *testing.T) {
+ 		assert.Equal(t, 1, rec.len())
+ 	})
+ }
++
++// acquireNeverDriver is a sandbox driver whose Acquire never hands out a VM:
++// it waits until its context is done. No other method is called.
++type acquireNeverDriver struct{ sandbox.Sandbox }
++
++func (acquireNeverDriver) Acquire(ctx context.Context, _ *compv1pb.SandboxAcquireRequest) (*compv1pb.SandboxAcquireResponse, error) {
++	<-ctx.Done()
++	return nil, status.FromContextError(ctx.Err()).Err()
++}
++
++// newSandboxUniversalWithTargets returns a Universal whose router calls the
++// real sandbox actor targets of f.
++func newSandboxUniversalWithTargets(t *testing.T, f *sandboxtarget.Factory) (*Universal, *atomic.Int32) {
++	t.Helper()
++	calls := new(atomic.Int32)
++	u, _ := newSandboxUniversal(t, true, nil)
++	rt := routerfake.New().WithCallFn(func(ctx context.Context, req *internalsv1pb.InternalInvokeRequest) (*internalsv1pb.InternalInvokeResponse, error) {
++		calls.Add(1)
++		return f.GetOrCreate(req.GetActor().GetActorId()).InvokeMethod(ctx, req)
++	})
++	u.actors = actorsfake.New().WithRouter(func(context.Context) (router.Interface, error) {
++		return rt, nil
++	})
++	return u, calls
++}
++
++func TestSandboxAcquireTimeoutIsHostFull(t *testing.T) {
++	f, err := sandboxtarget.New(sandboxtarget.Options{
++		ActorType:      "dapr.internal.default.me.sandbox.py",
++		Component:      "py",
++		Driver:         acquireNeverDriver{},
++		AcquireTimeout: 50 * time.Millisecond,
++	})
++	require.NoError(t, err)
++	t.Cleanup(func() { require.NoError(t, f.HaltAll(context.Background())) })
++	u, calls := newSandboxUniversalWithTargets(t, f)
++
++	t.Run("exec", func(t *testing.T) {
++		_, err := u.SandboxExecAlpha1(t.Context(), &runtimev1pb.SandboxExecRequestAlpha1{Component: "py", SandboxId: "sb", Command: "x"})
++		require.ErrorIs(t, err, messages.ErrSandboxHostFull)
++		var apiErr messages.APIError
++		require.ErrorAs(t, err, &apiErr)
++		assert.Equal(t, http.StatusTooManyRequests, apiErr.HTTPCode())
++		assert.Equal(t, int32(1), calls.Load())
++	})
++
++	t.Run("create tries other IDs, then gives up", func(t *testing.T) {
++		calls.Store(0)
++		_, err := u.SandboxCreateAlpha1(t.Context(), &runtimev1pb.SandboxCreateRequestAlpha1{Component: "py"})
++		require.ErrorIs(t, err, messages.ErrSandboxHostFull)
++		assert.Equal(t, int32(maxCreateAttempts), calls.Load())
++	})
++}
+-- 
+2.47.0
+

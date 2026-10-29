@@ -1,0 +1,171 @@
+From 0c5acb6cac3415f741b3a5ae6efb8348ed6a17a4 Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Thu, 29 Oct 2026 16:54:00 +0100
+Subject: [PATCH 22/27] fix(sandbox): ERR_SANDBOX_EXEC carries the failure's
+ message
+
+A failed sandbox call that maps to ERR_SANDBOX_EXEC said only "sandbox
+execution failed", so a client could not tell a driver failure from,
+say, an ACL denial. The error now carries the status message of the
+failure, usually the driver's: "sandbox execution failed: <message>".
+Only its first line is kept, so a stack trace or a multi-line error
+chain does not leak, and it is cut to 512 bytes on a UTF-8 boundary,
+keeping the whole message under 1 KiB. Errors that are not gRPC
+statuses (router internals) keep the plain message.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/api/universal/sandbox.go      | 27 ++++++++++++++
+ pkg/api/universal/sandbox_test.go | 59 +++++++++++++++++++++++++++++++
+ pkg/messages/predefined.go        |  2 ++
+ 3 files changed, 88 insertions(+)
+
+diff --git a/pkg/api/universal/sandbox.go b/pkg/api/universal/sandbox.go
+index 19a3e18c0..eb3261c50 100644
+--- a/pkg/api/universal/sandbox.go
++++ b/pkg/api/universal/sandbox.go
+@@ -18,7 +18,9 @@ package universal
+ import (
+ 	"context"
+ 	"errors"
++	"strings"
+ 	"time"
++	"unicode/utf8"
+ 
+ 	"github.com/google/uuid"
+ 	"google.golang.org/grpc/codes"
+@@ -40,6 +42,9 @@ const (
+ 	// sandboxTimeoutGrace is added to the caller's timeoutMs when calling the
+ 	// router, so the driver's own timeout fires first.
+ 	sandboxTimeoutGrace = 30 * time.Second
++	// maxSandboxErrDetail bounds the failure message that ERR_SANDBOX_EXEC
++	// carries, so that the whole message stays well under 1 KiB.
++	maxSandboxErrDetail = 512
+ )
+ 
+ // doneCtx is an already cancelled context, for calls that must not block.
+@@ -163,8 +168,30 @@ func (a *Universal) mapSandboxError(err error) error {
+ 		return err
+ 	default:
+ 		a.logger.Debugf("sandbox call failed: %s", st.Message())
++		return sandboxExecErr(st.Message())
++	}
++}
++
++// sandboxExecErr returns ERR_SANDBOX_EXEC carrying msg, the failure's status
++// message (usually the driver's). Only its first line is kept, so a
++// multi-line message such as a stack trace or an error chain does not leak,
++// and it is cut to maxSandboxErrDetail bytes.
++func sandboxExecErr(msg string) error {
++	if i := strings.IndexAny(msg, "\r\n"); i >= 0 {
++		msg = msg[:i]
++	}
++	msg = strings.TrimSpace(strings.ToValidUTF8(msg, "\uFFFD"))
++	if msg == "" {
+ 		return messages.ErrSandboxExec
+ 	}
++	if len(msg) > maxSandboxErrDetail {
++		cut := maxSandboxErrDetail
++		for cut > 0 && !utf8.RuneStart(msg[cut]) {
++			cut--
++		}
++		msg = msg[:cut] + "..."
++	}
++	return messages.ErrSandboxExecDetail.WithFormat(msg)
+ }
+ 
+ // unmarshalSandboxResponse decodes actor response data into a new T.
+diff --git a/pkg/api/universal/sandbox_test.go b/pkg/api/universal/sandbox_test.go
+index 76d5966bb..e467990b3 100644
+--- a/pkg/api/universal/sandbox_test.go
++++ b/pkg/api/universal/sandbox_test.go
+@@ -21,10 +21,12 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"net/http"
++	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"testing"
+ 	"time"
++	"unicode/utf8"
+ 
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+@@ -509,3 +511,60 @@ func TestSandboxInterruptedIsExecError(t *testing.T) {
+ 		assert.NotErrorIs(t, err, messages.ErrSandboxExec)
+ 	})
+ }
++
++func TestSandboxExecErrorCarriesMessage(t *testing.T) {
++	long := strings.Repeat("é", 2000) // 4000 bytes
++	for name, tc := range map[string]struct {
++		err  error
++		want string
++	}{
++		"driver message": {
++			err:  status.Error(codes.Internal, "spawning the guest process failed: no such file"),
++			want: "sandbox execution failed: spawning the guest process failed: no such file",
++		},
++		"first line only": {
++			err:  status.Error(codes.Unknown, "exec failed: boom\ngoroutine 1 [running]:\nmain.main()\n\t/src/main.go:12"),
++			want: "sandbox execution failed: exec failed: boom",
++		},
++		"percent signs are not verbs": {
++			err:  status.Error(codes.Internal, "100% %s %d"),
++			want: "sandbox execution failed: 100% %s %d",
++		},
++		"empty message": {
++			err:  status.Error(codes.Internal, ""),
++			want: "sandbox execution failed",
++		},
++		"not a status": {
++			err:  fmt.Errorf("failed to lookup actor: boom"),
++			want: "sandbox execution failed",
++		},
++	} {
++		t.Run(name, func(t *testing.T) {
++			u, _ := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
++				return nil, tc.err
++			})
++			_, err := u.SandboxExecAlpha1(t.Context(), &runtimev1pb.SandboxExecRequestAlpha1{Component: "py", SandboxId: "sb", Command: "x"})
++			require.ErrorIs(t, err, messages.ErrSandboxExec)
++			var apiErr messages.APIError
++			require.ErrorAs(t, err, &apiErr)
++			assert.Equal(t, "ERR_SANDBOX_EXEC", apiErr.Tag())
++			assert.Equal(t, http.StatusInternalServerError, apiErr.HTTPCode())
++			assert.Equal(t, tc.want, apiErr.Message())
++		})
++	}
++
++	t.Run("a long message is cut under 1 KiB on a rune boundary", func(t *testing.T) {
++		u, _ := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
++			return nil, status.Error(codes.Internal, long)
++		})
++		_, err := u.SandboxExecAlpha1(t.Context(), &runtimev1pb.SandboxExecRequestAlpha1{Component: "py", SandboxId: "sb", Command: "x"})
++		var apiErr messages.APIError
++		require.ErrorAs(t, err, &apiErr)
++		msg := apiErr.Message()
++		assert.Less(t, len(msg), 1024)
++		assert.True(t, utf8.ValidString(msg))
++		assert.True(t, strings.HasPrefix(msg, "sandbox execution failed: éé"), msg)
++		assert.True(t, strings.HasSuffix(msg, "é..."), msg)
++		assert.Less(t, len(apiErr.JSONErrorValue()), 1024)
++	})
++}
+diff --git a/pkg/messages/predefined.go b/pkg/messages/predefined.go
+index 54400c540..20dc27419 100644
+--- a/pkg/messages/predefined.go
++++ b/pkg/messages/predefined.go
+@@ -167,6 +167,8 @@ var (
+ 	ErrSandboxLost           = APIError{"sandbox was lost", errorcodes.SandboxLost, http.StatusGone, grpcCodes.FailedPrecondition}
+ 	ErrSandboxInvalidRequest = APIError{"invalid sandbox request", errorcodes.SandboxInvalidRequest, http.StatusBadRequest, grpcCodes.InvalidArgument}
+ 	ErrSandboxExec           = APIError{"sandbox execution failed", errorcodes.SandboxExec, http.StatusInternalServerError, grpcCodes.Internal}
++	// ErrSandboxExecDetail is ErrSandboxExec with the failure's message.
++	ErrSandboxExecDetail = APIError{"sandbox execution failed: %s", errorcodes.SandboxExec, http.StatusInternalServerError, grpcCodes.Internal}
+ 	// ErrSandboxInterrupted is an ErrSandboxExec (same code) for a command
+ 	// cut short by actor rebalancing. It is not retried, so it never runs twice.
+ 	ErrSandboxInterrupted = APIError{"sandbox call interrupted by actor rebalancing: the command may have partly run", errorcodes.SandboxExec, http.StatusInternalServerError, grpcCodes.Internal}
+-- 
+2.47.0
+

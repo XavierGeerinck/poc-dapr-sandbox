@@ -1,0 +1,76 @@
+From 2f05a9310c9b7e8ed63b627573c777eddd47eb5d Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Thu, 29 Oct 2026 16:53:11 +0100
+Subject: [PATCH 21/27] fix(sandbox): name the causes in the 429 message
+
+ERR_SANDBOX_HOST_FULL said "sandbox host is at capacity", but the same
+429 also answers a sandbox type that no host is ready to serve yet and
+a host app ID that does not exist (placement cannot tell them apart).
+The message now names all three and says to retry later. Only the text
+changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/api/universal/sandbox_test.go             | 19 +++++++++++++++++++
+ pkg/messages/predefined.go                    |  2 +-
+ .../suite/daprd/sandbox/crossapp.go           |  1 +
+ 3 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/api/universal/sandbox_test.go b/pkg/api/universal/sandbox_test.go
+index fd51d2a21..76d5966bb 100644
+--- a/pkg/api/universal/sandbox_test.go
++++ b/pkg/api/universal/sandbox_test.go
+@@ -166,6 +166,25 @@ func TestSandboxCreateRetriesOnFull(t *testing.T) {
+ 	assert.EqualValues(t, 3, res.GetTiming().GetHostUs())
+ }
+ 
++func TestSandboxHostFullMessage(t *testing.T) {
++	// One 429 covers every "no sandbox here now" cause, so its message names
++	// them all.
++	u, _ := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
++		return nil, status.Error(codes.ResourceExhausted, "host is full: 32 sandboxes")
++	})
++	_, err := u.SandboxExecAlpha1(t.Context(), &runtimev1pb.SandboxExecRequestAlpha1{Component: "py", SandboxId: "sb", Command: "x"})
++	require.ErrorIs(t, err, messages.ErrSandboxHostFull)
++	var apiErr messages.APIError
++	require.ErrorAs(t, err, &apiErr)
++	assert.Equal(t, http.StatusTooManyRequests, apiErr.HTTPCode())
++	assert.Equal(t, "ERR_SANDBOX_HOST_FULL", apiErr.Tag())
++	assert.Equal(t, "no sandbox host can take the request now: no host is ready for this sandbox type, "+
++		"the host app ID is unknown, or the host is at capacity; retry later", apiErr.Message())
++	for _, cause := range []string{"no host is ready for this sandbox type", "the host app ID is unknown", "the host is at capacity", "retry later"} {
++		assert.Contains(t, apiErr.Message(), cause)
++	}
++}
++
+ func TestSandboxCreateGivesUp(t *testing.T) {
+ 	u, rec := newSandboxUniversal(t, true, func(int, *internalsv1pb.InternalInvokeRequest) (proto.Message, error) {
+ 		return nil, status.Error(codes.ResourceExhausted, "full")
+diff --git a/pkg/messages/predefined.go b/pkg/messages/predefined.go
+index 3858faf0d..54400c540 100644
+--- a/pkg/messages/predefined.go
++++ b/pkg/messages/predefined.go
+@@ -163,7 +163,7 @@ var (
+ 
+ 	// Sandbox
+ 	ErrSandboxNotFound       = APIError{"failed finding sandbox component %s", errorcodes.SandboxNotFound, http.StatusBadRequest, grpcCodes.InvalidArgument}
+-	ErrSandboxHostFull       = APIError{"sandbox host is at capacity", errorcodes.SandboxHostFull, http.StatusTooManyRequests, grpcCodes.ResourceExhausted}
++	ErrSandboxHostFull       = APIError{"no sandbox host can take the request now: no host is ready for this sandbox type, the host app ID is unknown, or the host is at capacity; retry later", errorcodes.SandboxHostFull, http.StatusTooManyRequests, grpcCodes.ResourceExhausted}
+ 	ErrSandboxLost           = APIError{"sandbox was lost", errorcodes.SandboxLost, http.StatusGone, grpcCodes.FailedPrecondition}
+ 	ErrSandboxInvalidRequest = APIError{"invalid sandbox request", errorcodes.SandboxInvalidRequest, http.StatusBadRequest, grpcCodes.InvalidArgument}
+ 	ErrSandboxExec           = APIError{"sandbox execution failed", errorcodes.SandboxExec, http.StatusInternalServerError, grpcCodes.Internal}
+diff --git a/tests/integration/suite/daprd/sandbox/crossapp.go b/tests/integration/suite/daprd/sandbox/crossapp.go
+index ae63bcc46..a3f08e6fb 100644
+--- a/tests/integration/suite/daprd/sandbox/crossapp.go
++++ b/tests/integration/suite/daprd/sandbox/crossapp.go
+@@ -177,6 +177,7 @@ func (c *crossapp) Run(t *testing.T, ctx context.Context) {
+ 		assert.Less(t, elapsed, 10*time.Second)
+ 		assert.Equal(t, http.StatusTooManyRequests, r.status, r.String())
+ 		assert.Equal(t, "ERR_SANDBOX_HOST_FULL", r.errorCode())
++		assert.Contains(t, string(r.body), "no host is ready for this sandbox type, the host app ID is unknown, or the host is at capacity")
+ 	})
+ 
+ 	t.Run("caller has no sandbox component of its own", func(t *testing.T) {
+-- 
+2.47.0
+

@@ -1,0 +1,83 @@
+From a32ae54dd6be43f7f741d58fbe3ca5e2e3c163ab Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Thu, 29 Oct 2026 16:54:31 +0100
+Subject: [PATCH 23/27] fix(sandbox): reject a zero idleTimeout, cpus or
+ memoryMiB
+
+ParseConfig accepted idleTimeout 0 or a negative duration (which the
+actor factory then silently replaced with its 5 m default), and cpus 0
+or memoryMiB 0 (a VM that cannot boot). It now rejects them with an
+error naming the key.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/components/sandbox/config.go      | 12 ++++++++++++
+ pkg/components/sandbox/config_test.go | 16 ++++++++++++++++
+ 2 files changed, 28 insertions(+)
+
+diff --git a/pkg/components/sandbox/config.go b/pkg/components/sandbox/config.go
+index 71125cb6a..6ac8cfade 100644
+--- a/pkg/components/sandbox/config.go
++++ b/pkg/components/sandbox/config.go
+@@ -70,12 +70,24 @@ func ParseConfig(props map[string]string) (Config, error) {
+ 		}
+ 		*f.dst = uint32(n)
+ 	}
++	// A VM needs at least one CPU and some memory.
++	if c.CPUs == 0 {
++		return Config{}, errors.New("sandbox: invalid metadata 'cpus' \"0\": must be at least 1")
++	}
++	if c.MemoryMiB == 0 {
++		return Config{}, errors.New("sandbox: invalid metadata 'memoryMiB' \"0\": must be at least 1")
++	}
+ 
+ 	if v := props["idleTimeout"]; v != "" {
+ 		d, err := time.ParseDuration(v)
+ 		if err != nil {
+ 			return Config{}, fmt.Errorf("sandbox: invalid metadata 'idleTimeout' %q: %w", v, err)
+ 		}
++		// The actor factory would silently replace a non-positive value
++		// with its default.
++		if d <= 0 {
++			return Config{}, fmt.Errorf("sandbox: invalid metadata 'idleTimeout' %q: must be positive", v)
++		}
+ 		c.IdleTimeout = d
+ 	}
+ 
+diff --git a/pkg/components/sandbox/config_test.go b/pkg/components/sandbox/config_test.go
+index 1e5acbf2a..d569468ab 100644
+--- a/pkg/components/sandbox/config_test.go
++++ b/pkg/components/sandbox/config_test.go
+@@ -49,6 +49,13 @@ func TestParseConfig(t *testing.T) {
+ 
+ 		_, err = ParseConfig(map[string]string{"image": "x", "idleTimeout": "soon"})
+ 		require.Error(t, err)
++
++		for _, v := range []string{"0", "0s", "-1m"} {
++			_, err = ParseConfig(map[string]string{"image": "x", "idleTimeout": v})
++			require.Error(t, err, v)
++			assert.Contains(t, err.Error(), "'idleTimeout'")
++			assert.Contains(t, err.Error(), "must be positive")
++		}
+ 	})
+ 
+ 	t.Run("template", func(t *testing.T) {
+@@ -73,6 +80,15 @@ func TestParseConfig(t *testing.T) {
+ 		assert.Equal(t, uint32(8), c.MaxSandboxesPerHost)
+ 		assert.Equal(t, uint32(3), c.RefillConcurrency)
+ 
++		// A VM needs at least one CPU and some memory; the other fields may
++		// be 0.
++		for _, k := range []string{"cpus", "memoryMiB"} {
++			_, err := ParseConfig(map[string]string{"image": "x", k: "0"})
++			require.Error(t, err, k)
++			assert.Contains(t, err.Error(), "'"+k+"'")
++			assert.Contains(t, err.Error(), "must be at least 1")
++		}
++
+ 		for _, k := range []string{"cpus", "memoryMiB", "warmPoolSize", "maxSandboxesPerHost", "refillConcurrency"} {
+ 			for _, v := range []string{"-1", "abc"} {
+ 				_, err := ParseConfig(map[string]string{"image": "x", k: v})
+-- 
+2.47.0
+

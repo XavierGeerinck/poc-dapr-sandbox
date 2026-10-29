@@ -1,7 +1,7 @@
 From b0ce41dac47045507512edf173ece5f1e8722091 Mon Sep 17 00:00:00 2001
 From: Xavier Geerinck <xavier.geerinck@gmail.com>
 Date: Thu, 29 Oct 2026 11:47:15 +0100
-Subject: [PATCH 15/15] fix(sandbox): classify hosted sandbox types before
+Subject: [PATCH 15/27] fix(sandbox): classify hosted sandbox types before
  workflow suffixes
 
 A component name may contain dots, so a hosted sandbox type such as

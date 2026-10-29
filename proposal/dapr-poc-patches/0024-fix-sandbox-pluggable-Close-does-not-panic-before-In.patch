@@ -1,0 +1,65 @@
+From 6874e25ac86e6e5d53045b0f14eb0d25e3e78436 Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Thu, 29 Oct 2026 16:54:52 +0100
+Subject: [PATCH 24/27] fix(sandbox): pluggable Close does not panic before
+ Init
+
+The processor closes a component whose Init failed. When Dial never ran,
+GRPCConnector.Close called Close on a nil *grpc.ClientConn and panicked.
+The sandbox client now only cancels its context in that case.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/components/sandbox/pluggable.go      | 11 +++++++++++
+ pkg/components/sandbox/pluggable_test.go | 16 ++++++++++++++++
+ 2 files changed, 27 insertions(+)
+
+diff --git a/pkg/components/sandbox/pluggable.go b/pkg/components/sandbox/pluggable.go
+index 482a5b9f0..6d6d6a578 100644
+--- a/pkg/components/sandbox/pluggable.go
++++ b/pkg/components/sandbox/pluggable.go
+@@ -38,6 +38,17 @@ func (g *grpcSandbox) Init(ctx context.Context, md metadata.Base) error {
+ 	return err
+ }
+ 
++// Close cancels in-flight calls and closes the connection. It is safe when
++// Init never dialled one (GRPCConnector.Close would dereference a nil
++// connection).
++func (g *grpcSandbox) Close() error {
++	if g.Client == nil {
++		g.Cancel()
++		return nil
++	}
++	return g.GRPCConnector.Close()
++}
++
+ func (g *grpcSandbox) Ready(ctx context.Context, req *proto.SandboxReadyRequest) (*proto.SandboxReadyResponse, error) {
+ 	return g.Client.Ready(ctx, req)
+ }
+diff --git a/pkg/components/sandbox/pluggable_test.go b/pkg/components/sandbox/pluggable_test.go
+index 1cdfcb6cc..d09076520 100644
+--- a/pkg/components/sandbox/pluggable_test.go
++++ b/pkg/components/sandbox/pluggable_test.go
+@@ -92,3 +92,19 @@ func TestGRPCSandbox_RoundTrip(t *testing.T) {
+ 	require.Error(t, err)
+ 	assert.Equal(t, codes.ResourceExhausted, status.Code(err))
+ }
++
++func TestGRPCSandbox_CloseWithoutInit(t *testing.T) {
++	t.Run("never initialised", func(t *testing.T) {
++		sb := NewGRPCSandbox(logger.NewLogger("test"), "/nonexistent/sandbox.sock")
++		assert.NotPanics(t, func() { require.NoError(t, sb.Close()) })
++	})
++
++	t.Run("through the registry's discovery constructor", func(t *testing.T) {
++		sb := newGRPCSandbox(func(context.Context, string, ...grpc.DialOption) (*grpc.ClientConn, error) {
++			return nil, assert.AnError
++		})(logger.NewLogger("test"))
++		// Init fails at Dial, so no connection exists.
++		require.Error(t, sb.Init(t.Context(), cmetadata.Base{Name: "mysb"}))
++		assert.NotPanics(t, func() { require.NoError(t, sb.Close()) })
++	})
++}
+-- 
+2.47.0
+

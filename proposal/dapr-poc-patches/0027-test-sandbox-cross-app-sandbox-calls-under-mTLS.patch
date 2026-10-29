@@ -1,0 +1,209 @@
+From 62e16213e41ea0d4fec00da927aa9a951c9aa707 Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Thu, 29 Oct 2026 17:06:28 +0100
+Subject: [PATCH 27/27] test(sandbox): cross-app sandbox calls under mTLS
+
+crossapp runs without Sentry, so the same-app rule for reserved internal
+actor types never applied there and the ACL change for hosted sandbox types
+had only unit tests. crossappmtls runs the same pool and caller apps with
+Sentry identities and checks, against the pool app's internal API:
+- a caller app of the same namespace execs through its sidecar, and with a
+  forged same-namespace identity directly: allowed;
+- callers from another namespace (as "caller" and as "pool"): denied;
+- a call to another app's sandbox actor type: denied.
+
+With workflow_acl.go as before the ACL change, both allowed cases fail
+with PermissionDenied.
+
+The pool daprd gets PATH explicitly: WithSentry leaves daprd an
+environment with only the trust anchors, and the process driver looks
+commands up in daprd's PATH.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../suite/daprd/sandbox/crossappmtls.go       | 173 ++++++++++++++++++
+ 1 file changed, 173 insertions(+)
+ create mode 100644 tests/integration/suite/daprd/sandbox/crossappmtls.go
+
+diff --git a/tests/integration/suite/daprd/sandbox/crossappmtls.go b/tests/integration/suite/daprd/sandbox/crossappmtls.go
+new file mode 100644
+index 000000000..0616ebde8
+--- /dev/null
++++ b/tests/integration/suite/daprd/sandbox/crossappmtls.go
+@@ -0,0 +1,173 @@
++/*
++Copyright 2026 The Dapr Authors
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++    http://www.apache.org/licenses/LICENSE-2.0
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sandbox
++
++import (
++	"context"
++	"net/http"
++	"os"
++	"runtime"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++	"google.golang.org/protobuf/proto"
++
++	internalv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
++	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
++	"github.com/dapr/dapr/tests/integration/framework"
++	"github.com/dapr/dapr/tests/integration/framework/client"
++	"github.com/dapr/dapr/tests/integration/framework/process/daprd"
++	"github.com/dapr/dapr/tests/integration/framework/process/exec"
++	"github.com/dapr/dapr/tests/integration/framework/process/placement"
++	"github.com/dapr/dapr/tests/integration/framework/process/scheduler"
++	"github.com/dapr/dapr/tests/integration/framework/process/sentry"
++	"github.com/dapr/dapr/tests/integration/suite"
++)
++
++func init() {
++	suite.Register(new(crossappmtls))
++}
++
++// crossappmtls is crossapp with mTLS: Sentry gives every sidecar an
++// identity, so the pool app's daprd applies its same-app rule for reserved
++// internal actor types to the sandbox actor type. Another app of the
++// namespace may invoke the sandbox actors the pool app hosts; a caller from
++// another namespace, and a call to a sandbox actor type of another app, are
++// denied.
++type crossappmtls struct {
++	sentry *sentry.Sentry
++	place  *placement.Placement
++	sched  *scheduler.Scheduler
++	pool   *daprd.Daprd
++	caller *daprd.Daprd
++}
++
++func (c *crossappmtls) Setup(t *testing.T) []framework.Option {
++	if runtime.GOOS == "windows" {
++		t.Skip("the process sandbox driver is not available on windows")
++	}
++
++	c.sentry = sentry.New(t)
++	c.place = placement.New(t, placement.WithSentry(t, c.sentry))
++	c.sched = scheduler.New(t, scheduler.WithSentry(c.sentry), scheduler.WithID("dapr-scheduler-server-0"))
++
++	shared := []daprd.Option{
++		daprd.WithNamespace("default"),
++		daprd.WithPlacementAddresses(c.place.Address()),
++		daprd.WithSchedulerAddresses(c.sched.Address()),
++		daprd.WithInMemoryActorStateStore("mystore"),
++		daprd.WithSentry(t, c.sentry),
++	}
++	c.pool = daprd.New(t, append([]daprd.Option{
++		daprd.WithAppID("pool"),
++		// WithSentry gives daprd an environment with only the trust
++		// anchors; the process driver looks commands up in daprd's PATH.
++		daprd.WithExecOptions(exec.WithEnvVars(t, "PATH", os.Getenv("PATH"))),
++		daprd.WithResourceFiles(`
++apiVersion: dapr.io/v1alpha1
++kind: Component
++metadata:
++  name: py
++spec:
++  type: sandbox.process
++  version: v1
++  metadata:
++  - name: image
++    value: local
++  - name: template
++    value: none
++  - name: warmPoolSize
++    value: "2"
++  - name: allowNoIsolation
++    value: "true"
++`),
++	}, shared...)...)
++	c.caller = daprd.New(t, append([]daprd.Option{daprd.WithAppID("caller")}, shared...)...)
++
++	return []framework.Option{
++		framework.WithProcesses(c.sentry, c.place, c.sched, c.pool, c.caller),
++	}
++}
++
++func (c *crossappmtls) Run(t *testing.T, ctx context.Context) {
++	c.place.WaitUntilRunning(t, ctx)
++	c.sched.WaitUntilRunning(t, ctx)
++	c.pool.WaitUntilRunning(t, ctx)
++	c.caller.WaitUntilRunning(t, ctx)
++	poolType := actorType(c.pool, "py")
++	c.pool.WaitUntilActorTypeHosted(t, ctx, poolType)
++
++	httpClient := client.HTTP(t)
++	viaPool := []string{"dapr-app-id", "pool"}
++
++	t.Run("another app of the namespace execs through its sidecar", func(t *testing.T) {
++		// Retry until placement has told the caller where the type lives.
++		var res runtimev1pb.SandboxExecResponseAlpha1
++		require.EventuallyWithT(t, func(col *assert.CollectT) {
++			r := call(col, ctx, httpClient, http.MethodPost, sandboxURL(c.caller, "py", "sb-m", "exec"),
++				execBody{Command: "echo", Args: []string{"hi"}, TimeoutMs: 5000}, viaPool...)
++			if assert.Equal(col, http.StatusOK, r.status, r.String()) {
++				decode(col, r, &res)
++			}
++		}, 20*time.Second, 100*time.Millisecond)
++		assert.Equal(t, "hi\n", string(res.GetStdout()))
++	})
++
++	// The same calls the caller's sidecar makes, sent straight to the pool
++	// app's internal API with an identity of our choosing.
++	execReq := func(t *testing.T, actorType, actorID string) *internalv1pb.InternalInvokeRequest {
++		t.Helper()
++		data, err := proto.Marshal(&runtimev1pb.SandboxExecRequestAlpha1{
++			Component: "py", SandboxId: actorID, Command: "echo", Args: []string{"direct"}, TimeoutMs: 5000,
++		})
++		require.NoError(t, err)
++		return internalv1pb.NewInternalInvokeRequest("exec").
++			WithActor(actorType, actorID).
++			WithData(data).
++			WithContentType(internalv1pb.ProtobufContentType)
++	}
++	denied := func(t *testing.T, err error, msg string) {
++		t.Helper()
++		require.Equal(t, codes.PermissionDenied, status.Code(err), "err: %v", err)
++		assert.ErrorContains(t, err, msg)
++	}
++
++	t.Run("allowed: an app of the same namespace", func(t *testing.T) {
++		sameNS := c.pool.InternalGRPCClient(t, ctx, c.sentry, "caller", "default")
++		res, err := sameNS.CallActor(ctx, execReq(t, poolType, "sb-direct"))
++		require.NoError(t, err)
++		var out runtimev1pb.SandboxExecResponseAlpha1
++		require.NoError(t, proto.Unmarshal(res.GetMessage().GetData().GetValue(), &out))
++		assert.Equal(t, "direct\n", string(out.GetStdout()))
++	})
++
++	t.Run("denied: a caller from another namespace", func(t *testing.T) {
++		for _, appID := range []string{"caller", "pool"} {
++			otherNS := c.pool.InternalGRPCClient(t, ctx, c.sentry, appID, "other-ns")
++			_, err := otherNS.CallActor(ctx, execReq(t, poolType, "sb-direct"))
++			denied(t, err, "access denied by workflow access policy")
++		}
++	})
++
++	t.Run("denied: another app's sandbox actor type", func(t *testing.T) {
++		otherType := "dapr.internal.default.other-app.sandbox.py"
++		sameNS := c.pool.InternalGRPCClient(t, ctx, c.sentry, "caller", "default")
++		_, err := sameNS.CallActor(ctx, execReq(t, otherType, "sb-direct"))
++		denied(t, err, "reserved internal actor type '"+otherType+"' can only be called by a sidecar with the same app ID and namespace")
++	})
++}
+-- 
+2.47.0
+

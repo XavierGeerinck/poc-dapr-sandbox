@@ -1,7 +1,7 @@
 From f220cbd5dc6d25ecc0ea9382467b6c7245e39e28 Mon Sep 17 00:00:00 2001
 From: Xavier Geerinck <xavier.geerinck@gmail.com>
 Date: Thu, 29 Oct 2026 10:53:25 +0100
-Subject: [PATCH 14/15] fix(sandbox): let other apps invoke hosted sandbox
+Subject: [PATCH 14/27] fix(sandbox): let other apps invoke hosted sandbox
  actors under mTLS
 
 The sandbox hosting model has callers reach another app's sandboxes

@@ -1,7 +1,7 @@
 From b83c44a329705bf24f15368e03ca60ea18823d0c Mon Sep 17 00:00:00 2001
 From: Xavier Geerinck <xavier.geerinck@gmail.com>
 Date: Wed, 28 Oct 2026 21:10:27 +0100
-Subject: [PATCH 13/15] fix(sandbox): lost only on DAPR_SANDBOX_LOST; review
+Subject: [PATCH 13/27] fix(sandbox): lost only on DAPR_SANDBOX_LOST; review
  minors
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
