@@ -1,0 +1,91 @@
+# The sandbox components and the actor state store, loaded only by the
+# sandbox host deployment (scopes: sandbox-pool). Callers need neither: a
+# sidecar without an actor state store can still invoke actors.
+#
+# py-fast: path (a), a warm pool restored from a snapshot of python:3.12-slim
+# (acquirePath POOL).
+#
+# Sizing (ruling R21), measured on this cluster (Lima VM: 8 vCPUs, 11.6 GiB
+# RAM, no swap; one sandbox-pool pod per worker), host side, per VM process:
+#   - idle warm VM: Rss ~95 MiB, of which ~88 MiB is the template snapshot's
+#     clean pages, shared by every VM restored from it; Pss ~18 MiB,
+#     anonymous ~7 MiB; ~4% of one CPU (nested virtualization).
+#   - in use, anonymous: ~18 MiB after `python3 -c 'print(1)'`, ~42 MiB
+#     after importing json, sqlite3, hashlib and urllib.request. A VM keeps
+#     its guest's high-water mark (a 200 MiB allocation left ~240 MiB after
+#     the process exited), so memoryMiB bounds a VM, not its current use.
+#   - per pod, 8 warm py-fast VMs idle: the VMs' Pss ~145 MiB, the driver's
+#     ~105 MiB, the container's memory.current 490-545 MiB (~125 MiB
+#     anonymous, the rest reclaimable page cache), daprd Rss ~145 MiB; the
+#     emptyDir ~330-390 MiB. With the whole stack up, 2.2 GiB of the VM's
+#     RAM is in use.
+# Choice: py-fast keeps 8 warm VMs per pod (~145 MiB idle) with 4 refills in
+# parallel, so 16 activations across both pods take a running VM; at most 32
+# acquired VMs per pod at the default 1 vCPU / 512 MiB each. That is ~1.3
+# GiB per pod at the in-use sizes above but 16 GiB if every guest filled its
+# memory, so the microvm container's 4 GiB memory limit (sandbox-pool.yaml)
+# is the backstop that keeps a runaway guest off the node. py-restore has no
+# warm pool and at most 8 VMs per pod (path (c) is sequential).
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: py-fast
+spec:
+  type: sandbox.microvm
+  version: v1
+  metadata:
+  - name: image
+    value: python:3.12-slim
+  # The cgroup migration lock waits an RCU grace period after idle;
+  # favordynmods avoids it. Restored VMs inherit the remount (snapshot).
+  - name: setup
+    value: mount -o remount,favordynmods /sys/fs/cgroup
+  - name: warmPoolSize
+    value: "8"
+  - name: refillConcurrency
+    value: "4"
+  - name: maxSandboxesPerHost
+    value: "32"
+  - name: memoryMiB
+    value: "512"
+scopes:
+- sandbox-pool
+---
+# py-restore: path (c), no warm pool; each activation restores a VM from the
+# template snapshot on demand (acquirePath RESTORE).
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: py-restore
+spec:
+  type: sandbox.microvm
+  version: v1
+  metadata:
+  - name: image
+    value: python:3.12-slim
+  # As for py-fast: the cgroup migration lock waits an RCU grace period
+  # after idle; favordynmods avoids it.
+  - name: setup
+    value: mount -o remount,favordynmods /sys/fs/cgroup
+  - name: warmPoolSize
+    value: "0"
+  - name: maxSandboxesPerHost
+    value: "8"
+  - name: memoryMiB
+    value: "512"
+scopes:
+- sandbox-pool
+---
+# Sandboxes are Dapr actors; hosting them needs an actor state store.
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: actorstore
+spec:
+  type: state.in-memory
+  version: v1
+  metadata:
+  - name: actorStateStore
+    value: "true"
+scopes:
+- sandbox-pool

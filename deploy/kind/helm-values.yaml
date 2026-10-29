@@ -1,0 +1,21 @@
+# Helm values for Dapr's control plane on the kind cluster "sandbox", from the
+# PoC branch's own chart and images (deploy/kind/build-images.sh builds the
+# images and loads them into the nodes):
+#
+#   KUBECONFIG=<repo>/.kube/kind-sandbox.yaml helm install dapr upstream/dapr/charts/dapr \
+#     -n dapr-system --create-namespace --kube-context kind-sandbox \
+#     -f deploy/kind/helm-values.yaml --wait
+#
+# Everything else is the chart's default, which fits the 8 CPU / 12 GiB VM:
+# placement 1 replica (non-HA), scheduler 3 replicas (fixed in the chart)
+# with a 16Gi PVC each on kind's local-path provisioner (sparse, on the VM's
+# disk), operator, sentry and injector 1 replica each.
+global:
+  registry: localhost/dapr
+  tag: dev-linux-arm64
+  # The images exist only in the nodes (kind load); never pull.
+  imagePullPolicy: Never
+
+dapr_sidecar_injector:
+  # The injected daprd (localhost/dapr/daprd:dev-linux-arm64) is in the nodes too.
+  sidecarImagePullPolicy: Never

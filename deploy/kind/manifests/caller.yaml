@@ -1,0 +1,58 @@
+# The caller (app ID sandbox-caller): a separate deployment that uses the
+# pool's sandboxes through its own sidecar, as any app would, by naming the
+# host app (header dapr-app-id: sandbox-pool, or "appId" in the body). It
+# loads no component and runs nothing privileged; its container only holds
+# the tools, so deploy/kind/smoke.sh and the bench exec into it:
+#
+#   kubectl --context kind-sandbox exec deploy/sandbox-caller -c bench -- \
+#     sandbox-bench run --app-id sandbox-pool --host-pods 2 ... --out /work/x.csv
+#
+# daprd's HTTP API is on localhost:3500 in the pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-caller
+  labels:
+    app: sandbox-caller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sandbox-caller
+  template:
+    metadata:
+      labels:
+        app: sandbox-caller
+      annotations:
+        dapr.io/enabled: "true"
+        dapr.io/app-id: sandbox-caller
+        # Ruling R15, as for sandbox-pool: a capped exec's response (2 x 4
+        # MiB of output) passes through this sidecar too.
+        dapr.io/max-body-size: 16Mi
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+      - name: bench
+        image: sandbox-bench:dev
+        imagePullPolicy: Never
+        command: ["sleep", "infinity"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        # The bench's CSVs (copy them out with kubectl cp) and scratch files.
+        - name: work
+          mountPath: /work
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: work
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}

@@ -1,0 +1,137 @@
+# The sandbox host deployment (app ID sandbox-pool): 2 pods, one per kind
+# worker. Each pod runs the microVM driver (container `microvm`) as a Dapr
+# pluggable component next to its injected daprd, which loads the sandbox
+# components scoped to sandbox-pool (components.yaml) and hosts their actor
+# types, dapr.internal.default.sandbox-pool.sandbox.<component>. Other apps
+# reach these sandboxes through their own sidecar with the target app ID
+# (header dapr-app-id: sandbox-pool); see caller.yaml.
+#
+#   KUBECONFIG=<repo>/.kube/kind-sandbox.yaml kubectl --context kind-sandbox \
+#     apply -f deploy/kind/manifests/
+#
+# Privileges: only the `microvm` container is privileged (see its comment);
+# daprd keeps the injector's defaults (non-root, read-only root filesystem,
+# no privilege escalation).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-pool
+  labels:
+    app: sandbox-pool
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sandbox-pool
+  # One pod per worker (anti-affinity below) and only 2 workers: a surge pod
+  # could never be scheduled, so a rollout replaces one pod at a time.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: sandbox-pool
+      annotations:
+        dapr.io/enabled: "true"
+        dapr.io/app-id: sandbox-pool
+        # The injector mounts a shared emptyDir at
+        # /tmp/dapr-components-sockets into daprd and into this container,
+        # where daprd discovers the driver's socket, microvm.sock, as the
+        # component type sandbox.microvm.
+        dapr.io/pluggable-components: microvm
+        # Ruling R15: the driver caps each exec output stream at 4 MiB and a
+        # response carries two, so a capped exec needs more than daprd's
+        # default 4 MiB limit, which also applies to the pluggable
+        # component's gRPC connection.
+        dapr.io/max-body-size: 16Mi
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: sandbox-pool
+            topologyKey: kubernetes.io/hostname
+      securityContext:
+        # The socket's group. The driver runs as root and daprd as uid 65532
+        # (gid 65532, the daprd image's user), and connecting to a Unix
+        # socket needs write permission on it. With fsGroup, the injector's
+        # socket emptyDir is group 65532 and setgid, so the socket the driver
+        # creates there is group 65532 too; the driver's umask 0002 (below)
+        # makes it group-writable. Nothing is world-writable.
+        fsGroup: 65532
+      containers:
+      # Listed first: the kubelet starts a pod's containers in order and
+      # runs each postStart hook before starting the next container, and
+      # the injector appends daprd last. daprd discovers pluggable
+      # components only when it starts, so the hook holds daprd back until
+      # the driver's socket exists.
+      - name: microvm
+        image: dapr-sandbox-microvm:dev
+        imagePullPolicy: Never
+        command: ["/bin/sh", "-c"]
+        args:
+        - >-
+          umask 0002 &&
+          exec dapr-sandbox-microvm
+          --socket /tmp/dapr-components-sockets/microvm.sock
+          --msb-home /var/lib/dsb/msb
+          --state-dir /var/lib/dsb/state
+        env:
+        # `acquired` (with the sandbox and VM) per activation, for
+        # deploy/kind/smoke.sh; microsandbox itself stays at warn, since it
+        # logs every exec connection at info.
+        - name: RUST_LOG
+          value: warn,dapr_sandbox_microvm=info,dapr_sandbox_microvm::service=debug
+        - name: NO_COLOR
+          value: "1"
+        securityContext:
+          # Opening /dev/kvm needs it: an unprivileged container's device
+          # cgroup denies the device even when it is mounted (EPERM), and
+          # kind has no KVM device plugin. No other device is needed:
+          # microsandbox's VM networking is an in-process userspace stack.
+          privileged: true
+        lifecycle:
+          postStart:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - |
+                i=0
+                until [ -S /tmp/dapr-components-sockets/microvm.sock ]; do
+                  i=$((i + 1)); [ $i -le 300 ] || exit 1
+                  sleep 0.1
+                done
+        # The VMs run inside this container's cgroup, so these cover them
+        # too (sizing and measurements: components.yaml). Requests: 8 idle
+        # warm VMs plus the driver use ~0.5 GiB and ~0.4 CPU. Limit: a
+        # backstop for guests that fill their memory; at 4 GiB per pod both
+        # pods fit in the Lima VM next to the control plane and Dapr. When
+        # it is hit, the OOM killer picks the container's largest process,
+        # normally the guest that grew.
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            memory: 4Gi
+        volumeMounts:
+        - name: kvm
+          mountPath: /dev/kvm
+        # The microsandbox home (images, VM disks, snapshots, sockets; at
+        # most 55 bytes on Linux) and the driver's state dir (each
+        # component's Init properties, restored when the container restarts).
+        # Both are pod-scoped (ruling R16a): a new pod starts clean.
+        - name: dsb
+          mountPath: /var/lib/dsb
+      volumes:
+      - name: kvm
+        hostPath:
+          path: /dev/kvm
+          type: CharDevice
+      - name: dsb
+        emptyDir: {}

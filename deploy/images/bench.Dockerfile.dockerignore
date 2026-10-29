@@ -1,0 +1,4 @@
+# The bench image needs only the bench's sources (context: the repo root).
+*
+!bench/
+bench/target/
