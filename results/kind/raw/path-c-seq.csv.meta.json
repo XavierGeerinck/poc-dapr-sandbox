@@ -1,0 +1,14 @@
+{
+  "mode": "sequential",
+  "rate": 0,
+  "host_pods": 0,
+  "duration_s": 0,
+  "expected": 100,
+  "fired": 100,
+  "late": 0,
+  "max_late_ms": 0,
+  "request_timeout_ms": 30000,
+  "aborted_requests": 0,
+  "aborted_cleanups": 0,
+  "malformed_timing": 0
+}

@@ -83,6 +83,34 @@ spec:
 scopes:
 - sandbox-pool
 ---
+# py-boot: path (d), no warm pool and no template; each activation cold-boots
+# a VM from the image (acquirePath BOOT). Path (d) is sequential, so a small
+# maxSandboxesPerHost is enough.
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: py-boot
+spec:
+  type: sandbox.microvm
+  version: v1
+  metadata:
+  - name: image
+    value: python:3.12-slim
+  # As for py-fast: the cgroup migration lock waits an RCU grace period
+  # after idle; favordynmods avoids it.
+  - name: setup
+    value: mount -o remount,favordynmods /sys/fs/cgroup
+  - name: warmPoolSize
+    value: "0"
+  - name: template
+    value: none
+  - name: maxSandboxesPerHost
+    value: "8"
+  - name: memoryMiB
+    value: "512"
+scopes:
+- sandbox-pool
+---
 # Sandboxes are Dapr actors; hosting them needs an actor state store.
 apiVersion: dapr.io/v1alpha1
 kind: Component
