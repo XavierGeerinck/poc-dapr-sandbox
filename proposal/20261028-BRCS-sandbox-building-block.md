@@ -26,8 +26,8 @@ environment, here a microVM, in which an app runs commands it does not trust.
   - a new internal actor target;
   - a new component category, `sandbox`.
 - **Components:** a new pluggable component contract, `dapr.proto.components.v1.Sandbox`. There
-  is also a built-in `sandbox.process` driver, used for tests and as the reference
-  implementation.
+  is also a built-in `sandbox.process` driver without isolation, used for tests and as the
+  reference implementation; it is opt-in (see [Inside daprd](#inside-daprd)).
 - **SDKs:** new alpha client methods.
 - **Docs:** a new building block page and component reference.
 
@@ -97,18 +97,13 @@ None filed. This proposal builds on two things that exist:
 
 ### In scope
 
-**The fast profile, built and measured in the PoC.** It is meant for functions and AI agents:
-- a fixed environment per component;
-- a template snapshot and a warm pool;
-- the VM is thrown away when the sandbox deactivates.
-
-**The rest of the scope:**
+- **The fast profile** (functions, AI agents), built and measured in the PoC.
+- **The flexible profile** (notebooks), described only.
 - **One API for both profiles.** It covers one-shot exec, long-lived sessions, create with a
   sidecar-chosen ID, and delete.
 - **The driver contract.** It does not depend on a VMM, so other drivers can implement it.
-- **The flexible profile, described only.** It is meant for notebooks: a per-sandbox image and
-  resources, runtime package installs, and a full VM save and restore. Save and restore are
-  phase 2.
+
+[Two profiles](#two-profiles) describes both.
 
 ### Not in scope (future work)
 
@@ -169,12 +164,12 @@ None filed. This proposal builds on two things that exist:
 **Trade-offs made**
 - **Speed for durability.** The fast profile keeps no state outside the VM, so the hot path has
   no state-store write. The cost: a sandbox is lost when placement moves it (see
-  [Known limitations](#known-limitations)).
+  [Lost sandboxes](#lost-sandboxes)).
 - **Generality for simplicity.** The template guarantees a warm disk and page cache only, not a
   running interpreter with libraries already imported (see
   [Known limitations](#known-limitations)).
-- **Privileges.** On Kubernetes, the driver container runs privileged so it can open
-  `/dev/kvm`. Only the host deployment's driver container needs this.
+- **Privileges.** On Kubernetes, the host deployment's driver container runs privileged until a
+  KVM device plugin exists (see [Operational requirements](#operational-requirements)).
 
 **Advantages**
 - One API on a laptop (self-hosted) and on Kubernetes.
@@ -184,7 +179,6 @@ None filed. This proposal builds on two things that exist:
 **Disadvantages**
 - New surface in daprd.
 - A pluggable driver per isolation technology.
-- On Kubernetes, a privileged container until a KVM device plugin exists.
 
 ## Implementation Details
 
@@ -233,6 +227,9 @@ Component metadata parsed by daprd (`pkg/components/sandbox/config.go`):
 | `maxSandboxesPerHost` | `32` | admission limit per host; activation beyond it fails fast |
 | `idleTimeout` | `5m` | a sandbox with no calls for this long is released |
 
+daprd rejects a component with `cpus` or `memoryMiB` of 0, or an `idleTimeout` that is not
+positive.
+
 The PoC's microVM driver adds one key of its own: `warmupCommand`. It is off by default (see
 [Findings](#what-the-measurements-showed)).
 
@@ -250,17 +247,19 @@ HTTP routes, all under `/v1.0-alpha1/sandboxes`:
 |---|---|---|
 | `POST /{component}` | `SandboxCreateAlpha1` | Creates a sandbox with an ID chosen by the sidecar and returns the ID. If the host is full, it retries with a fresh ID, up to 5 attempts. |
 | `POST /{component}/{sandboxId}/exec` | `SandboxExecAlpha1` | Runs a one-shot command. The first call for an unknown ID activates it. |
-| `DELETE /{component}/{sandboxId}` | `SandboxDeleteAlpha1` | Releases the sandbox. Idempotent. |
+| `DELETE /{component}/{sandboxId}` | `SandboxDeleteAlpha1` | Releases the sandbox. Idempotent. It does not wait for a running command: that command ends, and its caller gets 410 `ERR_SANDBOX_LOST`. |
 | `POST /{component}/{sandboxId}/sessions` | `SandboxSessionStartAlpha1` | Starts a long-lived process and returns a session ID. |
 | `POST /{component}/{sandboxId}/sessions/{sessionId}` | `SandboxSessionSendAlpha1` | Writes input to the session, then reads output until a marker (`until`), the process exits, or `timeoutMs` passes. |
 | `DELETE /{component}/{sandboxId}/sessions/{sessionId}` | `SandboxSessionCloseAlpha1` | Closes the session. |
 
 **Requests**
 - **Exec fields:** `command`, `args`, `env`, `cwd`, `stdin` and `timeoutMs`.
-- **Target app ID:** every request takes one, either as `appId` in the body or in a
-  `dapr-app-id` header. It defaults to the caller's own app ID.
-- **`expectedActivation`:** exec and session calls take it optionally (see
-  [Lost sandboxes](#lost-sandboxes)).
+- **Target app ID:** it defaults to the caller's own app ID.
+  - **HTTP:** the `dapr-app-id` header or `appId` in the body; the header wins when both are
+    set.
+  - **gRPC:** the `app_id` field. The header is HTTP-only.
+- **`expectedActivation`:** exec, session start and session send take it optionally (see
+  [Lost sandboxes](#lost-sandboxes)). Session close and delete do not.
 
 **Responses**
 - **Fields:** `stdout`, `stderr`, `exitCode`, `truncated` and `timedOut`.
@@ -274,9 +273,9 @@ Errors:
 |---|---|---|---|
 | 400 | InvalidArgument | `ERR_SANDBOX_NOT_FOUND` | no such sandbox component |
 | 400 | InvalidArgument | `ERR_SANDBOX_INVALID_REQUEST` | bad request, for example an unknown session |
-| 410 | FailedPrecondition | `ERR_SANDBOX_LOST` | the sandbox was lost, or `expectedActivation` is stale |
-| 429 | ResourceExhausted | `ERR_SANDBOX_HOST_FULL` | the host is at capacity, or the component is not ready yet: retry later |
-| 500 | Internal | `ERR_SANDBOX_EXEC` | the driver failed |
+| 410 | FailedPrecondition | `ERR_SANDBOX_LOST` | the sandbox was lost or deleted, or `expectedActivation` is stale |
+| 429 | ResourceExhausted | `ERR_SANDBOX_HOST_FULL` | no host can take it now: no host is ready for this sandbox type, the host app ID is unknown, the host is at capacity, or its driver is unavailable or gave no sandbox in time. Retry later. |
+| 500 | Internal | `ERR_SANDBOX_EXEC` | the driver failed (the message carries the first line of the driver's error, shortened), or the call was interrupted by actor rebalancing and the command may have partly run |
 
 #### Hosting model
 
@@ -287,7 +286,7 @@ So each sandbox component becomes the actor type
 - **Kubernetes:** sandboxes run in a dedicated host deployment, for example app ID
   `sandbox-pool`.
   - Only those pods load the sandbox component (component `scopes`).
-  - Only those pods get `/dev/kvm` and a privileged driver container.
+  - Only those pods get `/dev/kvm` and the driver container.
   - Any other app in the namespace calls them through its own sidecar, passing the target app
     ID. This works like calling actors that another app hosts.
 - **Self-hosted (local development):** one daprd both hosts and calls, and the target app ID
@@ -313,22 +312,39 @@ So each sandbox component becomes the actor type
    | `Reconcile` | the live instance IDs, so the driver can reap VMs daprd no longer owns |
 
    No VMM type appears in the contract.
+
+   **Open items in the contract** (future work; the spec asks for the first and third):
+   - **Streaming exec output.** `Exec` is unary, so the PoC measures time to completion, not
+     time to the first byte of output. The benchmark runs `echo ok`, so the response follows
+     its output directly.
+   - **A component close or remove RPC**, so that a driver learns that a component went away.
+     Today the PoC's driver keeps a removed component's warm pool, across driver restarts,
+     until its state file is deleted.
+   - **A capacity and stats RPC.**
 3. **Internal actor target** (`pkg/actors/targets/sandbox`), one actor type per sandbox
    component:
-   - **Activation:** `Acquire` from the driver.
-   - **`InvokeMethod`:** exec and session operations.
+   - **Activation:** `Acquire` from the driver, bounded at 60 s. Past that bound, or when the
+     driver is unavailable, the call answers 429 (retry later).
+   - **`InvokeMethod`:** exec and session operations. A release does not wait for the running
+     call's turn: it ends the running command at once (see the API table).
    - **Deactivation:** `Release`, asynchronously. Deactivation holds the per-type lock on the
      host, so a slow release would otherwise block new activations of that type.
 4. **Readiness before placement** (`pkg/runtime/sandboxhost`). daprd registers the sandbox actor
    type with placement only after the driver's `Ready` reports that the template and the warm
-   pool are ready. No sandbox lands on a pod that is still building its pool. Until then, calls
-   for that component answer 429 (retry later), whether they come from the host app itself or
-   from another app.
+   pool are ready. Until then, calls for that component answer 429 (retry later), whether they
+   come from the host app itself or from another app.
+   - **At first start,** no sandbox lands on a pod that is still building its pool.
+   - **After a driver restart,** daprd does not check `Ready` again and the type stays
+     registered. Until the restarted driver serves, a new sandbox ID routed to that pod answers
+     429 (retry later), and the sandboxes of the old driver process are lost (410).
 5. **Admission.** At `maxSandboxesPerHost`, `Acquire` fails fast with `RESOURCE_EXHAUSTED`, and
    the API answers 429. Callers rely on Dapr resiliency policies. Placement does not change.
 6. **The built-in `sandbox.process` driver** (`pkg/components/sandbox/process`) runs commands as
    host processes, without isolation. It is for unit tests, integration tests and CI, and it is
-   the reference implementation of the contract.
+   the reference implementation of the contract. It is opt-in twice:
+   - it is not in stable builds, only in builds with the `allcomponents` or `sandbox_process`
+     tag (not on Windows);
+   - its Init fails unless the component sets the metadata `allowNoIsolation: "true"`.
 
 #### Acquire paths, the warm pool and the template
 
@@ -357,6 +373,7 @@ So each sandbox component becomes the actor type
 - **Per-sandbox spec.** An explicit create, `PUT /v1.0-alpha1/sandboxes/{component}/{id}` with a
   spec, for a custom image or resources. The spec is stored in actor state, so any pod can
   reactivate the sandbox.
+- **Runtime package installs** that survive deactivation, through the save and restore below.
 - **Save and restore.** On deactivation, a full VM save (disk and memory) to the binary store;
   on activation, a restore from it.
 - **Caveats:**
@@ -383,6 +400,21 @@ Dapr halts actors whenever placement changes for them:
   `ERR_SANDBOX_LOST` and does not run in a fresh VM.
 - Callers that do not send it get the usual virtual-actor behaviour.
 
+**Calls during a rebalance**
+- While placement moves a sandbox type's hash ring, new calls for that type stall: the type is
+  locked until the new table is in place.
+- In-flight calls of that type get the drain timeout to finish: 2 s when the host app sets
+  none. Then their placement claim is cancelled, which cancels the driver call, and the driver
+  kills the command.
+- Such a command never runs again. Its caller gets 500 `ERR_SANDBOX_EXEC` with "sandbox call
+  interrupted by actor rebalancing: the command may have partly run", or 410
+  `ERR_SANDBOX_LOST` if the sandbox was halted first.
+- A call that was still waiting for its turn has not run, and Dapr retries it on the new host
+  as usual.
+- One edge case remains at-least-once: a remote host that ran the command but whose
+  connection drops before the response arrives. See
+  [`docs/poc-known-gaps.md`](../docs/poc-known-gaps.md).
+
 #### Full hosts
 
 **Caller-chosen IDs.** Hashing pins an ID to one host. If that host is at
@@ -401,12 +433,17 @@ Dapr halts actors whenever placement changes for them:
 - **Backend.** libkrun through microsandbox 0.7.11: KVM on Linux, Hypervisor.framework on macOS
   (Apple silicon). microsandbox is one driver behind the contract, not part of the design.
 - **Pool VMs.** Copy-on-write restores of the template snapshot, with no network access.
+- **One driver process per daprd.** The driver's `Reconcile` releases every VM of a component
+  that the calling daprd does not list, so two daprds sharing one driver (one socket folder)
+  destroy each other's sandboxes.
 - **Other drivers.** Firecracker and Cloud Hypervisor drivers would implement the same contract.
 
 #### Upstream changes in the PoC branch
 
-**The branch.** `dapr/dapr` at `v1.19.0`, branch `feat/sandbox-building-block`, 15 patches in
-[`dapr-poc-patches/`](dapr-poc-patches/).
+**The branch.** `dapr/dapr` at `v1.19.0`, branch `feat/sandbox-building-block`, 27 patches in
+[`dapr-poc-patches/`](dapr-poc-patches/). Patches 1–15 are the PoC as measured; patches 16–27
+are the fix wave after the final review (see [Acceptance Criteria](#acceptance-criteria) for
+what that means for the results).
 
 | # | Patch |
 |---|---|
@@ -425,6 +462,18 @@ Dapr halts actors whenever placement changes for them:
 | 13 | lost only on `DAPR_SANDBOX_LOST`; review fixes |
 | 14 | let other apps invoke hosted sandbox actors under mTLS |
 | 15 | classify hosted sandbox types before workflow suffixes |
+| 16 | move the sandbox actor-type helper to `pkg/components/sandbox` |
+| 17 | make the no-isolation `sandbox.process` driver opt-in |
+| 18 | release stops a running command; bound Acquire to 60 s |
+| 19 | a driver unavailable on Acquire is retry later |
+| 20 | never re-run a command cut short by a rebalance |
+| 21 | name the causes in the 429 message |
+| 22 | `ERR_SANDBOX_EXEC` carries the failure's message |
+| 23 | reject a zero `idleTimeout`, `cpus` or `memoryMiB` |
+| 24 | pluggable `Close` does not panic before Init |
+| 25 | close a driver that failed to initialise |
+| 26 | process driver `Reconcile` spares fresh instances |
+| 27 | test cross-app sandbox calls under mTLS |
 
 **One existing behaviour had to change: the cross-app fix (patches 14 and 15, commits f220cbd5d
 and b0ce41dac).**
@@ -442,6 +491,10 @@ and b0ce41dac).**
   - workflow access policies still apply when loaded.
 - **Ordering.** Patch 15 checks sandbox types before the workflow and activity suffix check, so
   a component name ending in `.workflow` cannot take the workflow path.
+- **Tests.** Unit tests in `pkg/api/grpc/workflow_acl_test.go`, and an integration suite with
+  Sentry identities, `daprd/sandbox/crossappmtls` (patch 27): a caller of the same namespace is
+  allowed; callers from another namespace and calls to another app's sandbox type are denied.
+  Without patches 14 and 15, its allowed cases fail with PermissionDenied.
 
 #### Operational requirements
 
@@ -459,7 +512,8 @@ and b0ce41dac).**
   - daprd and the caller pods are not privileged.
 - **`singleProcessOOMKill: true` on the kubelet.** Without it, on cgroup v2 the kubelet sets
   `memory.oom.group=1` for the container. One OOM kill then takes the driver and every VM in
-  the pod.
+  the pod. The PoC sets it on the kind nodes, but no OOM kill was triggered live, so the
+  behaviour under OOM was not exercised.
 - **A postStart hook on the driver container.** It holds daprd back until the driver's socket
   exists, because daprd discovers pluggable components only when it starts.
   - This relies on daprd being a regular container.
@@ -472,8 +526,9 @@ and b0ce41dac).**
 
 #### Known limitations
 
-- **Sandboxes are lost on placement changes** (see [Lost sandboxes](#lost-sandboxes)). The
-  flexible profile's save and restore is the real answer for state that must survive.
+- **Sandboxes are lost on placement changes, and a command running during the change is cut
+  short** (see [Lost sandboxes](#lost-sandboxes)). The flexible profile's save and restore is
+  the real answer for state that must survive.
 - **A full host blocks caller-chosen IDs.** The same ID keeps getting 429 until that host has
   capacity (see [Full hosts](#full-hosts)).
 - **The template holds a warm disk and page cache only.**
@@ -493,11 +548,14 @@ and b0ce41dac).**
   - Dapr's `accessControl` policies do not cover actor calls.
 - **Admission counts VMs, not memory.** `maxSandboxesPerHost` × `memoryMiB` can exceed the
   container's memory limit, and the limit is what bounds a pod.
-  - With `singleProcessOOMKill`, an OOM kill normally takes the VM that grew, and that sandbox
+  - With `singleProcessOOMKill`, an OOM kill should take the VM that grew, and that sandbox
     is lost.
   - If the driver is the largest process, it is killed instead, and every sandbox in the pod is
     lost.
+  - Neither case was exercised live.
 - **Network.** Pool VMs have no network access, and there is no egress policy beyond that.
+- **Smaller gaps** found in the PoC's reviews and not fixed are listed in
+  [`docs/poc-known-gaps.md`](../docs/poc-known-gaps.md).
 
 ### Feature lifecycle outline
 
@@ -512,10 +570,15 @@ and b0ce41dac).**
   - a decision on where drivers live.
 
 **Compatibility guarantees**
-- **Apps that load no `sandbox` component:** nothing changes.
+- **Apps that load no `sandbox` component:** no sandbox actor type is registered and no driver
+  runs. The alpha routes and gRPC methods still exist in every daprd: a call for the daprd's
+  own app answers 400 `ERR_SANDBOX_NOT_FOUND`, and a call with another app ID is routed to that
+  app's sandbox actor type.
 - **User-defined actors:** their behaviour does not change.
-- **The ACL change:** it only admits other apps of the same namespace to this daprd's own
-  sandbox actor types. Reminders stay same-app.
+- **The ACL change:** it is a prefix check. Under mTLS it admits callers from the same namespace
+  to any actor type that starts with `dapr.internal.<ns>.<thisAppID>.sandbox.` followed by a
+  non-empty component, whether or not this daprd loads that component. Reminders on those types
+  stay same-app.
 
 **Deprecation and co-existence.** Nothing is deprecated. Sandbox actors use the same internal
 actor mechanism as workflows and co-exist with them.
@@ -525,6 +588,14 @@ component is loaded. If maintainers want a preview feature flag, it can gate the
 `sandbox` components.
 
 ### Acceptance Criteria
+
+#### Versions measured
+
+- **Every result below was measured at upstream b0ce41dac** (patches 1–15).
+- **The fix wave** (patches 16–27, up to 62e16213e) changes error paths only: release of a
+  running command, the Acquire bound, error mapping, and the opt-in of the process driver. It
+  does not change the measured fast path (POOL activation and exec), and it was not
+  re-measured.
 
 #### The metric and the gate
 
@@ -651,7 +722,9 @@ Total and exec time, p50 / p99, in ms (from `results/kind-linux/notes.md`).
 - **"path a rate20"** is the single 60 s run:
   - Mac: one host, 20 requests/s in total;
   - kind: two host pods, 40 requests/s in total.
-- **Nested kind** ran paths (c) and (d) with 100 requests each instead of 500.
+- **Nested kind** ran paths (c) and (d) with 100 requests each instead of 500. Its
+  "path a rate20" cells come from the 21 successful rows of 2400: 99.1% of that run's requests
+  failed.
 
 **Caveat: kind on macOS under nested virtualization (`results/kind`) failed the gate.**
 
@@ -662,8 +735,9 @@ Total and exec time, p50 / p99, in ms (from `results/kind-linux/notes.md`).
 - **Evidence:**
   - Activation was 0.4 ms p50 there too, but the first exec in a freshly restored VM took
     242.7 ms p50.
-  - At rate 20 per pod, 99.1% of requests failed: 429 once the pool drained, restore timeouts,
-    and client timeouts.
+  - At rate 20 per pod, 99.1% of requests failed: 429 from the host's admission limit
+    ("host is full: 32 sandboxes") while restores lagged, restore timeouts, and client
+    timeouts.
   - The same deployment on bare metal passes.
 - **The favordynmods fix on the nested cluster.** It cut path (a) from p50 780.9 ms to
   218.2–222.1 ms in live previews (`results/kind/notes.md`; not gate results). The rest is the
@@ -683,8 +757,10 @@ Total and exec time, p50 / p99, in ms (from `results/kind-linux/notes.md`).
 
 *The fix*
 - Remount cgroup2 with `favordynmods` in the template's `setup`; restored VMs inherit it.
-- Measured on the driver's backend without Dapr, exec p50 after ≥ 20 ms of idle went from
-  28.1–31.6 ms to 2.2–3.5 ms.
+- Measured on the driver's backend without Dapr, on the Mac (Apple M4 Pro, Hypervisor.framework),
+  exec p50 after ≥ 20 ms of idle went from 28.1–31.6 ms to 2.2–3.5 ms.
+- Under KVM, the nested-kind gap table (`results/kind/notes.md`, live previews) shows the same
+  plateau and the same fix.
 - In Dapr on the Mac (`results/mac` against `results/mac-favordynmods`):
   - path (a) exec p50 went from 33.8 ms to 4.2 ms;
   - the rate-20 p99 went from 42.9 ms to 9.4 ms.
@@ -728,7 +804,7 @@ for microsandbox is in [`microsandbox-issue.md`](microsandbox-issue.md).
 |---|---|
 | 10 and 20/s | every request was POOL; p99 7.90 and 11.36 ms |
 | 40/s | 19.7% fell back to RESTORE; p99 208.6 ms |
-| 80 and 160/s | the pool was exhausted; 48.6% and 75.5% of requests got 429 |
+| 80 and 160/s | the pool was exhausted and restores lagged, so the hosts reached their admission limit (`maxSandboxesPerHost`); 48.6% and 75.5% of requests got 429 |
 
 *Sequential back-to-back requests on bare metal* hit RESTORE 18 times in 500.
 - A sequential client takes about 8 ms per request across two pods.
@@ -745,8 +821,9 @@ for microsandbox is in [`microsandbox-issue.md`](microsandbox-issue.md).
 - [x] Internal actor target `pkg/actors/targets/sandbox`, and `pkg/runtime/sandboxhost` for readiness, registration and reconcile (PoC).
 - [x] Alpha runtime API: HTTP routes and gRPC methods, error codes (PoC).
 - [x] Built-in `sandbox.process` reference driver (PoC).
-- [x] Cross-app access to hosted sandbox actor types under mTLS (PoC, patches 14 and 15; needs security review).
-- [x] Unit tests (`pkg/actors/targets/sandbox`, `pkg/api/{grpc,http,universal}`, `pkg/components/sandbox/...`, `pkg/runtime/sandboxhost`, `pkg/runtime/processor/sandbox`) and integration tests (`tests/integration/suite/daprd/sandbox`) (PoC).
+- [x] Cross-app access to hosted sandbox actor types under mTLS (PoC, patches 14, 15 and 27; needs security review).
+- [x] Unit tests (`pkg/actors/targets/sandbox`, `pkg/api/{grpc,http,universal}`, `pkg/components/sandbox/...`, `pkg/runtime/sandboxhost`, `pkg/runtime/processor/sandbox`) and integration tests (`tests/integration/suite/daprd/sandbox`, including `crossappmtls` with Sentry) (PoC).
+- [ ] The smaller gaps from the PoC's reviews, listed in [`docs/poc-known-gaps.md`](../docs/poc-known-gaps.md), including sign-offs and a history cleanup before a dapr/dapr PR.
 - [ ] Per-sandbox owner binding, or access control for sandbox actor calls.
 - [ ] Report an oversized response as an output error, not 429.
 - [ ] Optional preview feature flag.

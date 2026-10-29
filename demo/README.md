@@ -48,7 +48,9 @@ raised limit. Over the limit, a client would get a 429 instead of `truncated: tr
 **Socket folder.** daprd connects to every socket in `DAPR_COMPONENTS_SOCKETS_FOLDER`.
 - **Component type mapping:** it maps the component type `sandbox.microvm` to `microvm.sock`.
 - **Why a demo-only folder:** macOS limits a Unix socket path to 104 bytes. So the demo uses a short folder of its own, `/tmp/dsb-demo/sockets`, rather than the shared default `/tmp/dapr-components-sockets`.
-- **One driver per daprd:** a second daprd on the same socket would share the driver's pools.
+- **One driver per daprd:** a second daprd on the same socket folder would share the driver.
+  Each daprd's reconcile tells the driver which VMs it owns, and the driver releases the rest,
+  so the two daprds would destroy each other's sandboxes.
 
 **Components** (`demo/components/`). All three use the `python:3.12-slim` image.
 
@@ -138,13 +140,14 @@ curl -s -X POST "$API/py-fast/demo-1/exec" \
 curl -s -X DELETE "$API/py-fast/demo-1"                       # {}
 ```
 
-Every route also takes `"appId"` in the body, or a `dapr-app-id` header, to reach a sandbox
-hosted by another app. A sandbox left idle for 5 minutes is released.
+Every route also takes `"appId"` in the body, or a `dapr-app-id` header (which wins when both
+are set), to reach a sandbox hosted by another app. Over gRPC the field is `app_id`. A sandbox
+left idle for 5 minutes is released.
 
 | HTTP | `errorCode` | Meaning |
 |---|---|---|
 | 400 | `ERR_SANDBOX_NOT_FOUND` | no such sandbox component |
 | 400 | `ERR_SANDBOX_INVALID_REQUEST` | bad request, e.g. a missing command or an unknown session |
-| 410 | `ERR_SANDBOX_LOST` | the sandbox was lost, or `expectedActivation` is stale |
-| 429 | `ERR_SANDBOX_HOST_FULL` | at capacity, or the component is not ready yet: retry later |
-| 500 | `ERR_SANDBOX_EXEC` | the driver failed |
+| 410 | `ERR_SANDBOX_LOST` | the sandbox was lost or deleted (a delete ends a running command), or `expectedActivation` is stale |
+| 429 | `ERR_SANDBOX_HOST_FULL` | no host can take it now (not ready yet, unknown host app ID, at capacity, driver unavailable, or no sandbox within 60 s): retry later |
+| 500 | `ERR_SANDBOX_EXEC` | the driver failed (the message carries its error), or a rebalance cut the command short |

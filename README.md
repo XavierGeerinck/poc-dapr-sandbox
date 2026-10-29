@@ -2,11 +2,12 @@
 
 A proof of concept for a Dapr-native alpha Sandbox building block: sandbox IDs are internal Dapr actors backed by pluggable microVM drivers (with a Rust microVM driver in this repo). The goal is that a new sandbox runs its first command in p99 < 100 ms on Kubernetes.
 
-Result: on kind on a bare-metal Linux host with KVM, a new sandbox ID served from the warm pool ran its first command at p99 16.44 ms sequentially and p99 11.36 ms at 20 new sandboxes per second per host pod, measured at the caller's sidecar ([`results/kind-linux/`](results/kind-linux/summary.md)).
+Result: on kind on a bare-metal Linux host with KVM, a new sandbox ID served from the warm pool ran its first command at p99 16.44 ms sequentially and p99 11.36 ms at 20 new sandboxes per second per host pod, measured at the caller's sidecar ([`results/kind-linux/`](results/kind-linux/summary.md)). Sequentially, 18 of the 500 requests found the pool empty and needed a restore; over all 500 rows the p99 was 103.9 ms. The results were measured at upstream b0ce41dac, before the final fix wave (error paths only, not re-measured).
 
 - [Design spec](docs/superpowers/specs/2026-10-28-dapr-sandbox-building-block-design.md)
 - [Implementation plan](docs/superpowers/plans/2026-10-28-dapr-sandbox-building-block.md)
 - Drafts for review, not posted: [proposal](proposal/20261028-BRCS-sandbox-building-block.md), [dapr/dapr issue](proposal/issue.md), [PR description](proposal/pr.md), [microsandbox issue](proposal/microsandbox-issue.md)
+- [Known gaps](docs/poc-known-gaps.md): what the PoC's reviews found and did not fix
 
 ## What is where
 
@@ -17,7 +18,7 @@ Result: on kind on a bare-metal Linux host with KVM, a new sandbox ID served fro
 | `demo/` | The self-hosted demo on macOS ([`demo/README.md`](demo/README.md)) |
 | `deploy/kind/` | kind on macOS (through Lima) or on Linux with KVM, and its manifests |
 | `proposal/` | The drafts above, and the Dapr changes as patches (`dapr-poc-patches/`) |
-| `results/` | Measured results, with raw CSVs (see [Results](#results)) |
+| `results/` | Measured results (see [Results](#results)) |
 | `upstream/dapr` | A `dapr/dapr` checkout on branch `feat/sandbox-building-block` (gitignored) |
 
 ## The Dapr branch
@@ -45,7 +46,7 @@ demo/run-selfhosted.sh down   # stop everything; prints "no leftover VMs"
 ## Quickstart: Kubernetes (kind)
 
 `deploy/kind/up.sh` picks the mode from the host:
-- **macOS (Apple silicon, M3 or later):** a Lima VM with nested virtualization runs Docker and kind. It works, but the latency is not representative: every guest exit traps through two hypervisors (see `results/kind/`).
+- **macOS (Apple silicon, M3 or later):** a Lima VM with nested virtualization runs Docker and kind. It works, but the latency is not representative: every guest exit traps through two hypervisors (see `results/kind/`). `up.sh` installs Lima and helm with Homebrew if they are missing; `kubectl` must be installed; building Dapr (`build-images.sh`) needs Go and `make`.
 - **Linux with `/dev/kvm`:** Docker and kind run directly on the host. Needs `docker`, `kind`, `kubectl`, `helm`, `make` and `git`; nothing is installed for you.
 
 The scripts never touch `~/.kube/config`. The cluster's kubeconfig is `<repo>/.kube/kind-sandbox.yaml`, context `kind-sandbox`:
@@ -77,6 +78,12 @@ Every daprd that hosts or calls sandboxes runs with `--max-body-size 16Mi`. On K
 - **Over the limit.** A client gets 429 instead of `truncated: true`.
 - **Where it is set.** `demo/run-selfhosted.sh` and the kind manifests set it already.
 
+## Drivers: what to know
+
+- **One driver process per daprd.** daprd's periodic `Reconcile` tells the driver which VMs it still owns, and the driver releases the others. Two daprds that share a driver (the same components socket folder) therefore destroy each other's sandboxes.
+- **A removed component keeps its warm pool.** The contract has no component close or remove call. When a component is removed from daprd, the microVM driver keeps its warm pool, also across driver restarts, until the component's state file is deleted (`<state dir>/<sha256(component)>.json`, see `driver/src/persist.rs`). On kind the state directory is a pod-scoped `emptyDir`, and the demo's `down` deletes its own.
+- **`sandbox.process` has no isolation.** daprd's built-in driver runs commands as host processes. It is for tests: it is not in stable builds (only with the `allcomponents` or `sandbox_process` build tag), and its Init fails unless the component sets `allowNoIsolation: "true"`.
+
 ## Results
 
 | Folder | What | Gate |
@@ -92,6 +99,8 @@ Each benchmark folder holds:
 - `notes.md`, with the setup, the commands and per-run breakdowns;
 - `raw/`, the CSVs;
 - `rate-sweep.svg`.
+
+`results/idle-cliff/` holds notes only, and the Task 16 live previews and warm-up experiment in `results/kind/notes.md` have no raw CSVs: their values were read from the API responses at the time.
 
 ## Windows
 

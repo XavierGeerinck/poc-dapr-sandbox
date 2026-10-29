@@ -2,7 +2,8 @@
 
 A local draft for review. It has not been posted anywhere.
 
-- **Evidence:** [`results/idle-cliff/notes.md`](../results/idle-cliff/notes.md), with the root cause and experiments E0–E4. They ran on an Apple M4 Pro with macOS 27.0.1 and Hypervisor.framework.
+- **Evidence:** [`results/idle-cliff/notes.md`](../results/idle-cliff/notes.md), with the root cause and experiments E0–E4. They ran on an Apple M4 Pro with macOS 27.0.1 and Hypervisor.framework (HVF), not under KVM.
+- **KVM evidence:** the gap table in [`results/kind/notes.md`](../results/kind/notes.md) ("Idle-cliff preview, before and after favordynmods") ran under KVM, nested in a Lima VM on the same Mac. Exec p50 after 20 and 30 ms of idle was 28.7 ms before the fix and 3.9 and 4.9 ms after it (run 2 of each). These are live previews without raw CSVs, and the nesting adds its own cost.
 - **Dapr runs with the workaround:** `results/mac-favordynmods/` and `results/kind-linux/`.
 
 ---
@@ -46,4 +47,4 @@ A local draft for review. It has not been posted anywhere.
 - The first exec after a restore went from 46.1 / 79.2 ms to 3.9 / 3.7 ms.
 - In a Dapr sandbox benchmark on the same Mac, the exec time of a new sandbox's first command (p50) went from 33.8 ms to 4.2 ms.
 
-**Scope:** the cause is in the guest kernel and agentd, so it is not specific to one hypervisor and applies to KVM as well as HVF. The x86_64 libkrunfw has `HZ=250`, so its cliff should be shorter. That is an estimate; it was not measured.
+**Scope:** the cause is in the guest kernel and agentd, so it is not specific to one hypervisor. The root cause was found under HVF; the nested-kind gap table shows the same plateau, and the same fix, under KVM. The x86_64 libkrunfw has `HZ=250`, so its cliff should be shorter. That is an estimate; it was not measured.

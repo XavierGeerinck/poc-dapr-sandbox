@@ -31,14 +31,15 @@ session. It must start fast and behave the same on a laptop and on Kubernetes.
 - `POST .../{id}/sessions`, `POST .../{id}/sessions/{sessionId}` and
   `DELETE .../{id}/sessions/{sessionId}` handle long-lived processes.
 - `DELETE /v1.0-alpha1/sandboxes/{component}/{id}` releases a sandbox.
-- A `dapr-app-id` header reaches the sandboxes of a dedicated host app. On Kubernetes, only that
-  app's pods run untrusted code.
+- A target app ID reaches the sandboxes of a dedicated host app: the `dapr-app-id` header or
+  `appId` over HTTP, `app_id` over gRPC. On Kubernetes, only that app's pods run untrusted code.
 - An activation token makes a lost sandbox visible (410) rather than silently recreated.
 
 ## Proof of concept
 
 **What was built**
-- `dapr/dapr` v1.19.0 plus 15 patches.
+- `dapr/dapr` v1.19.0 plus 27 patches: 15 as measured, then 12 from a fix wave after the
+  final review (error paths and tests, not re-measured).
 - A microVM driver in Rust as a pluggable component: microsandbox 0.7.11, on KVM or
   Hypervisor.framework.
 
@@ -57,7 +58,8 @@ Routing and activation took under 1 ms of the 7.18 ms median.
 
 ## Questions for maintainers
 
-1. **Placement.** Should this live in the runtime, like Workflows, or as an app on Dapr actors?
+1. **Where it lives.** Should this live in the runtime, like Workflows, or as an app on Dapr
+   actors?
 2. **The ACL change.** The PoC changes the internal-actor ACL so that other apps in a namespace
    can call a host's `dapr.internal.<ns>.<appID>.sandbox.*` types under mTLS. Is that
    acceptable, and what owner binding should come with it?
