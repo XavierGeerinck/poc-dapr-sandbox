@@ -1,0 +1,98 @@
+From b0ce41dac47045507512edf173ece5f1e8722091 Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Thu, 29 Oct 2026 11:47:15 +0100
+Subject: [PATCH 15/15] fix(sandbox): classify hosted sandbox types before
+ workflow suffixes
+
+A component name may contain dots, so a hosted sandbox type such as
+dapr.internal.<ns>.<app>.sandbox.x.workflow ends in .workflow and was
+handled as a workflow actor type: without a policy, callers from another
+namespace were allowed, and so were other apps' reminders. The invoke and
+reminder ACLs now recognise this app's sandbox types first.
+
+Tests cover such component names (.workflow and .activity) and the
+namespace and app ID boundaries of the sandbox prefix.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/api/grpc/workflow_acl.go      | 16 +++++++++++++---
+ pkg/api/grpc/workflow_acl_test.go | 21 +++++++++++++++------
+ 2 files changed, 28 insertions(+), 9 deletions(-)
+
+diff --git a/pkg/api/grpc/workflow_acl.go b/pkg/api/grpc/workflow_acl.go
+index 64b8b2fe6..d038f2878 100644
+--- a/pkg/api/grpc/workflow_acl.go
++++ b/pkg/api/grpc/workflow_acl.go
+@@ -33,8 +33,13 @@ import (
+ // stamps identity for the in-actor check.
+ func (a *api) callActorValidateWorkflowACL(ctx context.Context, in *internalv1pb.InternalInvokeRequest) error {
+ 	actorType := in.GetActor().GetActorType()
++	// Sandbox types first: a component name may end in .workflow or
++	// .activity, which must not make its sandbox type a workflow one.
++	if a.isHostedSandboxActorType(actorType) {
++		return a.validateSameAppInternalActor(ctx, actorType, "invoke", true)
++	}
+ 	if _, isWorkflowOrActivityActor := workflowacl.ParseActorType(actorType); !isWorkflowOrActivityActor {
+-		return a.validateSameAppInternalActor(ctx, actorType, "invoke", a.isHostedSandboxActorType(actorType))
++		return a.validateSameAppInternalActor(ctx, actorType, "invoke", false)
+ 	}
+ 
+ 	policies := a.workflowAccessPolicies.Load()
+@@ -65,8 +70,13 @@ func (a *api) callActorValidateWorkflowACL(ctx context.Context, in *internalv1pb
+ // this endpoint; when policies are loaded, only the local daprd is
+ // permitted to invoke workflow/activity reminders.
+ func (a *api) callActorReminderValidateWorkflowACL(ctx context.Context, in *internalv1pb.Reminder) error {
+-	if _, isWorkflowOrActivityActor := workflowacl.ParseActorType(in.GetActorType()); !isWorkflowOrActivityActor {
+-		return a.validateSameAppInternalActor(ctx, in.GetActorType(), "reminder", false)
++	actorType := in.GetActorType()
++	// Sandbox types first, as for invocations; their reminders stay same-app.
++	if a.isHostedSandboxActorType(actorType) {
++		return a.validateSameAppInternalActor(ctx, actorType, "reminder", false)
++	}
++	if _, isWorkflowOrActivityActor := workflowacl.ParseActorType(actorType); !isWorkflowOrActivityActor {
++		return a.validateSameAppInternalActor(ctx, actorType, "reminder", false)
+ 	}
+ 
+ 	policies := a.workflowAccessPolicies.Load()
+diff --git a/pkg/api/grpc/workflow_acl_test.go b/pkg/api/grpc/workflow_acl_test.go
+index d3fa8bf55..b18fa3f2a 100644
+--- a/pkg/api/grpc/workflow_acl_test.go
++++ b/pkg/api/grpc/workflow_acl_test.go
+@@ -154,6 +154,13 @@ func TestCallActorSandboxActorTypeCrossApp(t *testing.T) {
+ 		"no identity is allowed":                      {ctx: t.Context(), actorType: hosted, expCode: codes.OK},
+ 		"another app's sandbox type is denied":        {ctx: otherApp, actorType: "dapr.internal.ns1.app2.sandbox.py", expCode: codes.PermissionDenied},
+ 		"a sandbox prefix without a component denied": {ctx: otherApp, actorType: "dapr.internal.ns1.app1.sandbox.", expCode: codes.PermissionDenied},
++		"a sandbox type of another namespace denied":  {ctx: otherApp, actorType: "dapr.internal.ns2.app1.sandbox.py", expCode: codes.PermissionDenied},
++		"a longer app ID's sandbox type is denied":    {ctx: otherApp, actorType: "dapr.internal.ns1.app10.sandbox.py", expCode: codes.PermissionDenied},
++		// Component names may contain dots: these are sandbox types, not
++		// workflow or activity actor types.
++		"component x.workflow, other app is allowed":   {ctx: otherApp, actorType: "dapr.internal.ns1.app1.sandbox.x.workflow", expCode: codes.OK},
++		"component x.workflow, other namespace denied": {ctx: otherNamespace, actorType: "dapr.internal.ns1.app1.sandbox.x.workflow", expCode: codes.PermissionDenied},
++		"component x.activity, other namespace denied": {ctx: otherNamespace, actorType: "dapr.internal.ns1.app1.sandbox.x.activity", expCode: codes.PermissionDenied},
+ 	}
+ 	for name, tc := range tests {
+ 		t.Run(name, func(t *testing.T) {
+@@ -165,12 +172,14 @@ func TestCallActorSandboxActorTypeCrossApp(t *testing.T) {
+ 	}
+ 
+ 	t.Run("reminders from another app are denied", func(t *testing.T) {
+-		err := a.callActorReminderValidateWorkflowACL(otherApp, &internalv1pb.Reminder{
+-			ActorType: hosted,
+-			ActorId:   "id",
+-			Name:      "reminder",
+-		})
+-		assert.Equal(t, codes.PermissionDenied, status.Code(err), "CallActorReminder: %v", err)
++		for _, actorType := range []string{hosted, "dapr.internal.ns1.app1.sandbox.x.workflow"} {
++			err := a.callActorReminderValidateWorkflowACL(otherApp, &internalv1pb.Reminder{
++				ActorType: actorType,
++				ActorId:   "id",
++				Name:      "reminder",
++			})
++			assert.Equal(t, codes.PermissionDenied, status.Code(err), "CallActorReminder %s: %v", actorType, err)
++		}
+ 	})
+ 
+ 	t.Run("no identity is denied when a policy is loaded", func(t *testing.T) {
+-- 
+2.47.0
+

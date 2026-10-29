@@ -1,7 +1,7 @@
 From fd72a2afe276a7c75a3ce0898deba73326c20b5b Mon Sep 17 00:00:00 2001
 From: Xavier Geerinck <xavier.geerinck@gmail.com>
 Date: Wed, 28 Oct 2026 20:34:23 +0100
-Subject: [PATCH 07/13] feat(sandbox): register sandbox actor types once
+Subject: [PATCH 07/15] feat(sandbox): register sandbox actor types once
  drivers are ready
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

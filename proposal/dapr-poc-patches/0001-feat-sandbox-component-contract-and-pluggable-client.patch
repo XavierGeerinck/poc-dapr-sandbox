@@ -1,7 +1,7 @@
 From 683d442668cbad86908ae7689ed367a0026b513e Mon Sep 17 00:00:00 2001
 From: Xavier Geerinck <xavier.geerinck@gmail.com>
 Date: Wed, 28 Oct 2026 19:45:39 +0100
-Subject: [PATCH 01/13] feat(sandbox): component contract and pluggable client
+Subject: [PATCH 01/15] feat(sandbox): component contract and pluggable client
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

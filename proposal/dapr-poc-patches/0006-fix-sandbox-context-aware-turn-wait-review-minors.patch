@@ -1,7 +1,7 @@
 From 66f60d503120c3578cc2503d7c2da477d68e4f6d Mon Sep 17 00:00:00 2001
 From: Xavier Geerinck <xavier.geerinck@gmail.com>
 Date: Wed, 28 Oct 2026 20:28:52 +0100
-Subject: [PATCH 06/13] fix(sandbox): context-aware turn wait; review minors
+Subject: [PATCH 06/15] fix(sandbox): context-aware turn wait; review minors
 
 Calls now wait for their turn on a 1-slot channel semaphore that also
 selects on the caller's context and on a per-target closed channel, so a

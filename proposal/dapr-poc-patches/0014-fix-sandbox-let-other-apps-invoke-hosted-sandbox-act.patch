@@ -1,0 +1,191 @@
+From f220cbd5dc6d25ecc0ea9382467b6c7245e39e28 Mon Sep 17 00:00:00 2001
+From: Xavier Geerinck <xavier.geerinck@gmail.com>
+Date: Thu, 29 Oct 2026 10:53:25 +0100
+Subject: [PATCH 14/15] fix(sandbox): let other apps invoke hosted sandbox
+ actors under mTLS
+
+The sandbox hosting model has callers reach another app's sandboxes
+through their own sidecar (dapr.internal.<ns>.<hostApp>.sandbox.<c>).
+v1.19's same-app rule for reserved internal actor types denies that as
+soon as mTLS gives the call an identity, so on Kubernetes every
+cross-app sandbox call failed with PermissionDenied (500
+ERR_SANDBOX_EXEC). The integration tests run without mTLS and missed it.
+
+CallActor now allows any app of the namespace to invoke the sandbox
+actor types this app hosts. Other namespaces, another app's sandbox
+types, reminders and the other reserved types keep the same-app rule.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/api/grpc/workflow_acl.go      | 28 +++++++++---
+ pkg/api/grpc/workflow_acl_test.go | 76 +++++++++++++++++++++++++++++++
+ 2 files changed, 97 insertions(+), 7 deletions(-)
+
+diff --git a/pkg/api/grpc/workflow_acl.go b/pkg/api/grpc/workflow_acl.go
+index 029cd1c13..64b8b2fe6 100644
+--- a/pkg/api/grpc/workflow_acl.go
++++ b/pkg/api/grpc/workflow_acl.go
+@@ -15,6 +15,7 @@ package grpc
+ 
+ import (
+ 	"context"
++	"strings"
+ 
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/status"
+@@ -22,6 +23,7 @@ import (
+ 	workflowacl "github.com/dapr/dapr/pkg/acl/workflow"
+ 	diag "github.com/dapr/dapr/pkg/diagnostics"
+ 	internalv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
++	"github.com/dapr/dapr/pkg/runtime/sandboxhost"
+ 	"github.com/dapr/dapr/pkg/security/spiffe"
+ )
+ 
+@@ -30,8 +32,9 @@ import (
+ // without a TOCTOU race. This handler only authenticates the caller and
+ // stamps identity for the in-actor check.
+ func (a *api) callActorValidateWorkflowACL(ctx context.Context, in *internalv1pb.InternalInvokeRequest) error {
+-	if _, isWorkflowOrActivityActor := workflowacl.ParseActorType(in.GetActor().GetActorType()); !isWorkflowOrActivityActor {
+-		return a.validateSameAppInternalActor(ctx, in.GetActor().GetActorType(), "invoke")
++	actorType := in.GetActor().GetActorType()
++	if _, isWorkflowOrActivityActor := workflowacl.ParseActorType(actorType); !isWorkflowOrActivityActor {
++		return a.validateSameAppInternalActor(ctx, actorType, "invoke", a.isHostedSandboxActorType(actorType))
+ 	}
+ 
+ 	policies := a.workflowAccessPolicies.Load()
+@@ -63,7 +66,7 @@ func (a *api) callActorValidateWorkflowACL(ctx context.Context, in *internalv1pb
+ // permitted to invoke workflow/activity reminders.
+ func (a *api) callActorReminderValidateWorkflowACL(ctx context.Context, in *internalv1pb.Reminder) error {
+ 	if _, isWorkflowOrActivityActor := workflowacl.ParseActorType(in.GetActorType()); !isWorkflowOrActivityActor {
+-		return a.validateSameAppInternalActor(ctx, in.GetActorType(), "reminder")
++		return a.validateSameAppInternalActor(ctx, in.GetActorType(), "reminder", false)
+ 	}
+ 
+ 	policies := a.workflowAccessPolicies.Load()
+@@ -93,9 +96,12 @@ func (a *api) callActorReminderValidateWorkflowACL(ctx context.Context, in *inte
+ // Reserved internal actor types other than workflow and activity (executor,
+ // retentioner) are only ever called by daprds of the same app, so callers
+ // from another app or namespace are denied whether or not policies are
+-// loaded. Without mTLS there is no caller identity, so these calls are
+-// denied when a policy is loaded and allowed otherwise.
+-func (a *api) validateSameAppInternalActor(ctx context.Context, actorType, operation string) error {
++// loaded. The exception is crossApp, for types that other apps of the
++// namespace call by design (sandbox actors, see isHostedSandboxActorType):
++// those allow any app of this namespace. Without mTLS there is no caller
++// identity, so these calls are denied when a policy is loaded and allowed
++// otherwise.
++func (a *api) validateSameAppInternalActor(ctx context.Context, actorType, operation string, crossApp bool) error {
+ 	if !workflowacl.IsInternalActorType(actorType) {
+ 		return nil
+ 	}
+@@ -117,7 +123,7 @@ func (a *api) validateSameAppInternalActor(ctx context.Context, actorType, opera
+ 		return nsErr
+ 	}
+ 
+-	if callerAppID != a.AppID() {
++	if callerAppID != a.AppID() && !crossApp {
+ 		a.logger.Warnf("Denied cross-app call to reserved internal actor type '%s' from app '%s'", actorType, callerAppID)
+ 		diag.DefaultMonitoring.WorkflowACLActionDenied(callerAppID, "internal", operation)
+ 		return status.Errorf(codes.PermissionDenied, workflowacl.DeniedInternalActorMessage, actorType)
+@@ -131,6 +137,14 @@ func (a *api) validateSameAppInternalActor(ctx context.Context, actorType, opera
+ 	return nil
+ }
+ 
++// isHostedSandboxActorType reports whether actorType is a sandbox actor type
++// of this app (sandboxhost.ActorType). An app hosts sandboxes for the other
++// apps of its namespace, which invoke them with the host's app ID.
++func (a *api) isHostedSandboxActorType(actorType string) bool {
++	prefix := sandboxhost.ActorType(a.Namespace(), a.AppID(), "")
++	return len(actorType) > len(prefix) && strings.HasPrefix(actorType, prefix)
++}
++
+ // extractCallerIdentity extracts the caller's app ID and namespace from the
+ // SPIFFE ID in the mTLS peer certificate.
+ func (a *api) extractCallerIdentity(ctx context.Context) (appID, namespace string, err error) {
+diff --git a/pkg/api/grpc/workflow_acl_test.go b/pkg/api/grpc/workflow_acl_test.go
+index 2809eab75..d3fa8bf55 100644
+--- a/pkg/api/grpc/workflow_acl_test.go
++++ b/pkg/api/grpc/workflow_acl_test.go
+@@ -115,3 +115,79 @@ func TestCallActorInternalActorTypeSameApp(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// Sandbox actor types are internal actor types that other apps of the
++// namespace invoke by design: an app hosts the sandboxes and its callers
++// reach them with the host's app ID. With mTLS, invocations from another app
++// of the same namespace are allowed; other namespaces, sandbox types of
++// another app and reminders keep the same-app rule.
++func TestCallActorSandboxActorTypeCrossApp(t *testing.T) {
++	serverID := spiffeid.RequireFromString("spiffe://example.org/ns/ns1/app1")
++	callerCtx := func(id string) context.Context {
++		return test.GenPKI(t, test.PKIOptions{
++			LeafID:   serverID,
++			ClientID: spiffeid.RequireFromString(id),
++		}).ClientGRPCCtx(t)
++	}
++
++	a := &api{
++		logger: logger.NewLogger("test.api.grpc.workflowacl"),
++		Universal: universal.New(universal.Options{
++			AppID:     "app1",
++			Namespace: "ns1",
++		}),
++	}
++
++	sameApp := callerCtx("spiffe://example.org/ns/ns1/app1")
++	otherApp := callerCtx("spiffe://example.org/ns/ns1/app2")
++	otherNamespace := callerCtx("spiffe://example.org/ns/ns2/app2")
++
++	const hosted = "dapr.internal.ns1.app1.sandbox.py"
++	tests := map[string]struct {
++		ctx       context.Context
++		actorType string
++		expCode   codes.Code
++	}{
++		"same app is allowed":                         {ctx: sameApp, actorType: hosted, expCode: codes.OK},
++		"other app of the namespace is allowed":       {ctx: otherApp, actorType: hosted, expCode: codes.OK},
++		"other namespace is denied":                   {ctx: otherNamespace, actorType: hosted, expCode: codes.PermissionDenied},
++		"no identity is allowed":                      {ctx: t.Context(), actorType: hosted, expCode: codes.OK},
++		"another app's sandbox type is denied":        {ctx: otherApp, actorType: "dapr.internal.ns1.app2.sandbox.py", expCode: codes.PermissionDenied},
++		"a sandbox prefix without a component denied": {ctx: otherApp, actorType: "dapr.internal.ns1.app1.sandbox.", expCode: codes.PermissionDenied},
++	}
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			err := a.callActorValidateWorkflowACL(tc.ctx,
++				internalv1pb.NewInternalInvokeRequest("exec").WithActor(tc.actorType, "id"),
++			)
++			assert.Equal(t, tc.expCode, status.Code(err), "CallActor: %v", err)
++		})
++	}
++
++	t.Run("reminders from another app are denied", func(t *testing.T) {
++		err := a.callActorReminderValidateWorkflowACL(otherApp, &internalv1pb.Reminder{
++			ActorType: hosted,
++			ActorId:   "id",
++			Name:      "reminder",
++		})
++		assert.Equal(t, codes.PermissionDenied, status.Code(err), "CallActorReminder: %v", err)
++	})
++
++	t.Run("no identity is denied when a policy is loaded", func(t *testing.T) {
++		withPolicy := &api{
++			logger:                 a.logger,
++			Universal:              a.Universal,
++			workflowAccessPolicies: workflowacl.NewHolder(),
++		}
++		withPolicy.workflowAccessPolicies.Store(workflowacl.Compile([]wfaclapi.WorkflowAccessPolicy{{}}))
++		err := withPolicy.callActorValidateWorkflowACL(t.Context(),
++			internalv1pb.NewInternalInvokeRequest("exec").WithActor(hosted, "id"),
++		)
++		assert.Equal(t, codes.PermissionDenied, status.Code(err), "CallActor: %v", err)
++
++		err = withPolicy.callActorValidateWorkflowACL(otherApp,
++			internalv1pb.NewInternalInvokeRequest("exec").WithActor(hosted, "id"),
++		)
++		assert.Equal(t, codes.OK, status.Code(err), "CallActor: %v", err)
++	})
++}
+-- 
+2.47.0
+
