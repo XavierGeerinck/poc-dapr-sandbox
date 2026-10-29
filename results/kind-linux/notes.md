@@ -34,7 +34,10 @@ The report merges files by (path, workload, mode, rate): "rate20" is `path-a-rat
 Needs docker, kind, helm, kubectl, make and git on the host, a user that can run docker, and `/dev/kvm`. Nothing is installed by the scripts.
 
 ```
-rsync -a --exclude target/ --exclude upstream/dapr/dist/ --exclude demo/.run/ --exclude .kube/ --exclude .superpowers/ --exclude /.git <repo>/ host:dsb/dapr-microvm/   # or git clone with submodules
+rsync -a --exclude target/ --exclude upstream/dapr/dist/ --exclude demo/.run/ --exclude .kube/ --exclude .superpowers/ --exclude /.git <repo>/ host:dsb/dapr-microvm/
+# or: git clone https://github.com/XavierGeerinck/poc-dapr-sandbox ~/dsb/dapr-microvm, then clone the dapr fork's
+# branch into it: git clone -b feat/sandbox-building-block https://github.com/XavierGeerinck/dapr ~/dsb/dapr-microvm/upstream/dapr
+# (upstream/dapr is a separate, gitignored checkout, not a submodule; this run used its commit b0ce41dac)
 cd ~/dsb/dapr-microvm
 deploy/kind/up.sh                                  # 35 s: kind cluster, kubeconfig in .kube/kind-sandbox.yaml
 deploy/kind/build-images.sh                        # dapr 147 s (Go build in a container, docker-build, kind load), driver 141 s, bench 12 s

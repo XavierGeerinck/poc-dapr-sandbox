@@ -220,7 +220,7 @@ An earlier version, with `warmPoolSize` 2 and n = 12, gave the same: warmed VMs,
 
 1. A no-op before the snapshot does not make restored VMs' first exec fast. It is not in `prepare_template`.
 2. The ~30 ms of path (a) is not a first-exec cost. Any exec on a VM that has been idle for more than about 25 ms pays ~28 ms, from the request to the guest's `ExecStarted`. The cause sits somewhere in microsandbox 0.7.11's per-VM exec path, not yet identified.
-3. A pooled VM always idles longer than that before its handout. The per-VM refill warm-up (R22, implemented, default `true`) therefore does not lower the first exec after a handout: 29.6–31.0 ms with it, 32.0–32.7 ms without (p50, 3 runs).
+3. A pooled VM always idles longer than that before its handout. The per-VM refill warm-up (R22; when this experiment ran, its default was `true`; R22a later made it off (an empty `warmupCommand`), see the end of this section) therefore does not lower the first exec after a handout: 29.6–31.0 ms with it, 32.0–32.7 ms without (p50, 3 runs).
    - What it costs: one exec, ~30–33 ms (mean), per refill. Refilling 8 VMs took 310–325 ms with it against 261–302 ms without (one sample per run).
    - What it buys: a VM that cannot run commands is replaced before its handout.
 4. Not verified: whether the nested-KVM numbers from Task 15 (first exec 260–425 ms, repeated execs ~9.5–16 ms) are the same idle effect. The Step 5 daemon's 25 ms mode may be this effect too; that is untested as well.
