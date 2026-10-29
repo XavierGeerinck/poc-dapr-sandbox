@@ -1,0 +1,92 @@
+caller pod/sandbox-caller-5f4ffb75f6-7gsjh
+--- host state (before) 14:26:13
+ 14:26:13 up  5:51,  2 users,  load average: 0.99, 4.37, 3.26
+Mem:           62156        4598       30254          74       27943       57558
+=== path-a-seq: --path a --component py-fast --count 500
+500 rows written to /work/raw/path-a-seq.csv (0 non-200)
+rc=0
+=== path-b-seq: --path b --component py-fast --count 500
+500 rows written to /work/raw/path-b-seq.csv (0 non-200)
+rc=0
+=== path-c-seq: --path c --component py-restore --count 500
+500 rows written to /work/raw/path-c-seq.csv (0 non-200)
+rc=0
+=== path-d-seq: --path d --component py-boot --count 500
+500 rows written to /work/raw/path-d-seq.csv (0 non-200)
+rc=0
+=== path-a-python-seq: --path a --component py-fast --workload python --count 200
+200 rows written to /work/raw/path-a-python-seq.csv (0 non-200)
+rc=0
+=== path-a-session-import-seq: --path a --component py-fast --workload session-import --count 200
+200 rows written to /work/raw/path-a-session-import-seq.csv (0 non-200)
+rc=0
+--- pool state before path-a-rate20
+sandbox-pool-5d96d5785b-6p4fc   2/2   Running   0     6m27s
+sandbox-pool-5d96d5785b-tnkqk   2/2   Running   0     6m27s
+pod/sandbox-pool-5d96d5785b-6p4fc: last pool line: 2026-10-29T13:25:21.306972Z  INFO dapr_sandbox_microvm::pool: filling warm pool component=py-fast warm_pool_size=8
+pod/sandbox-pool-5d96d5785b-6p4fc: pool-path acquires so far: 436
+pod/sandbox-pool-5d96d5785b-tnkqk: last pool line: 2026-10-29T13:25:22.149701Z  INFO dapr_sandbox_microvm::pool: filling warm pool component=py-restore warm_pool_size=0
+pod/sandbox-pool-5d96d5785b-tnkqk: pool-path acquires so far: 457
+=== path-a-rate20
+rate 20/s x 2 hosts: fired 2400 of 2400 requests, 0 late ticks (max lateness 0 ms)
+2400 rows written to /work/raw/path-a-rate20.csv (0 non-200)
+rc=0
+--- pool state before sweep-rate10
+sandbox-pool-5d96d5785b-6p4fc   2/2   Running   0     8m28s
+sandbox-pool-5d96d5785b-tnkqk   2/2   Running   0     8m28s
+pod/sandbox-pool-5d96d5785b-6p4fc: last pool line: 
+pod/sandbox-pool-5d96d5785b-6p4fc: pool-path acquires so far: 1627
+pod/sandbox-pool-5d96d5785b-tnkqk: last pool line: 
+pod/sandbox-pool-5d96d5785b-tnkqk: pool-path acquires so far: 1666
+=== sweep rate 10
+rate 10/s x 2 hosts: fired 600 of 600 requests, 0 late ticks (max lateness 0 ms)
+rate 10: 600 rows (0 non-200) -> /work/raw/sweep-rate10.csv
+rc=0
+--- pool state before sweep-rate20
+sandbox-pool-5d96d5785b-6p4fc   2/2   Running   0     9m58s
+sandbox-pool-5d96d5785b-tnkqk   2/2   Running   0     9m58s
+pod/sandbox-pool-5d96d5785b-6p4fc: last pool line: 
+pod/sandbox-pool-5d96d5785b-6p4fc: pool-path acquires so far: 1928
+pod/sandbox-pool-5d96d5785b-tnkqk: last pool line: 
+pod/sandbox-pool-5d96d5785b-tnkqk: pool-path acquires so far: 1965
+=== sweep rate 20
+rate 20/s x 2 hosts: fired 1200 of 1200 requests, 0 late ticks (max lateness 0 ms)
+rate 20: 1200 rows (0 non-200) -> /work/raw/sweep-rate20.csv
+rc=0
+--- pool state before sweep-rate40
+sandbox-pool-5d96d5785b-6p4fc   2/2   Running   0     11m
+sandbox-pool-5d96d5785b-tnkqk   2/2   Running   0     11m
+pod/sandbox-pool-5d96d5785b-6p4fc: last pool line: 
+pod/sandbox-pool-5d96d5785b-6p4fc: pool-path acquires so far: 2506
+pod/sandbox-pool-5d96d5785b-tnkqk: last pool line: 
+pod/sandbox-pool-5d96d5785b-tnkqk: pool-path acquires so far: 2587
+=== sweep rate 40
+rate 40/s x 2 hosts: fired 2400 of 2400 requests, 0 late ticks (max lateness 0 ms)
+rate 40: 2400 rows (0 non-200) -> /work/raw/sweep-rate40.csv
+rc=0
+--- pool state before sweep-rate80
+sandbox-pool-5d96d5785b-6p4fc   2/2   Running   0     12m
+sandbox-pool-5d96d5785b-tnkqk   2/2   Running   0     12m
+pod/sandbox-pool-5d96d5785b-6p4fc: last pool line: 
+pod/sandbox-pool-5d96d5785b-6p4fc: pool-path acquires so far: 3498
+pod/sandbox-pool-5d96d5785b-tnkqk: last pool line: 
+pod/sandbox-pool-5d96d5785b-tnkqk: pool-path acquires so far: 3523
+=== sweep rate 80
+rate 80/s x 2 hosts: fired 4800 of 4800 requests, 6 late ticks (max lateness 4 ms)
+rate 80: 4800 rows (2334 non-200) -> /work/raw/sweep-rate80.csv
+rc=0
+--- pool state before sweep-rate160
+sandbox-pool-5d96d5785b-6p4fc   2/2   Running   0     14m
+sandbox-pool-5d96d5785b-tnkqk   2/2   Running   0     14m
+pod/sandbox-pool-5d96d5785b-6p4fc: last pool line: 
+pod/sandbox-pool-5d96d5785b-6p4fc: pool-path acquires so far: 3649
+pod/sandbox-pool-5d96d5785b-tnkqk: last pool line: 
+pod/sandbox-pool-5d96d5785b-tnkqk: pool-path acquires so far: 3674
+=== sweep rate 160
+rate 160/s x 2 hosts: fired 9600 of 9600 requests, 1171 late ticks (max lateness 5 ms)
+rate 160: 9600 rows (7251 non-200) -> /work/raw/sweep-rate160.csv
+rc=0
+--- host state (after) 14:40:18
+ 14:40:18 up  6:06,  6 users,  load average: 15.78, 7.25, 4.48
+Mem:           62156        5750       28334          96       28732       56405
+MATRIX-DONE

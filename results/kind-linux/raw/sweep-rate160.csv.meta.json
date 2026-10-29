@@ -1,0 +1,14 @@
+{
+  "mode": "rate",
+  "rate": 160,
+  "host_pods": 2,
+  "duration_s": 30,
+  "expected": 9600,
+  "fired": 9600,
+  "late": 1171,
+  "max_late_ms": 5,
+  "request_timeout_ms": 30000,
+  "aborted_requests": 0,
+  "aborted_cleanups": 0,
+  "malformed_timing": 0
+}
