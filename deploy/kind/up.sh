@@ -96,6 +96,32 @@ else
   vm kind create cluster --config "$KIND_DIR/kind.yaml" --wait 5m
 fi
 
+# After a VM restart Docker may give the nodes other IPs (it restarts them in
+# any order). kind then rewrites a node's old IP in its manifests, but not in
+# the control plane's own kubelet.conf, where kubeadm wrote the node's IP:
+# that kubelet would lose the API server and its node go NotReady. Point it
+# at the control plane's hostname instead, as the workers' kubelets are
+# (the API server's certificate covers it).
+for node in $(vm kind get nodes --name "$CLUSTER"); do
+  case $node in *-control-plane) ;; *) continue ;; esac
+  # Exits 0 when it changed the file, 3 when it already used the hostname.
+  rc=0
+  # shellcheck disable=SC2016 # expanded in the node
+  vm docker exec -e NODE="$node" "$node" sh -c '
+    conf=/etc/kubernetes/kubelet.conf
+    grep -q "server: https://$NODE:6443\$" $conf && exit 3
+    sed -i -E "s#server: https://[0-9.]+:6443\$#server: https://$NODE:6443#" $conf
+    grep -q "server: https://$NODE:6443\$" $conf' || rc=$?
+  case $rc in
+  0)
+    log "$node: its kubelet now reaches the API server as $node:6443; restarting it"
+    vm docker exec "$node" systemctl restart kubelet
+    ;;
+  3) ;;
+  *) die "$node: cannot point its kubelet.conf at $node:6443" ;;
+  esac
+done
+
 # --- the kubeconfig -------------------------------------------------------
 mkdir -p "$(dirname "$KUBECONFIG_FILE")"
 (
