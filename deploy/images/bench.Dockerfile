@@ -1,8 +1,8 @@
 # The caller pod's image (deploy/kind/manifests/caller.yaml): the latency
 # harness sandbox-bench (bench/), plus curl and jq for deploy/kind/smoke.sh.
-# Built for the build host's architecture (linux/arm64), from the repo root,
-# inside the Lima VM that deploy/kind/up.sh starts; deploy/kind/build-images.sh
-# builds it and loads it into the kind nodes:
+# Built for the build host's architecture, from the repo root, inside the Lima
+# VM that deploy/kind/up.sh starts (on a Linux host, directly with docker);
+# deploy/kind/build-images.sh builds it and loads it into the kind nodes:
 #
 #   limactl shell --workdir <repo> sandbox \
 #     docker build -f deploy/images/bench.Dockerfile -t sandbox-bench:dev .

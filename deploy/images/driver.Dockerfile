@@ -1,7 +1,7 @@
 # The microVM sandbox driver, dapr-sandbox-microvm, with its microsandbox
 # runtime pair (msb, libkrunfw). Built for the build host's architecture
-# (linux/arm64), from the repo root, inside the Lima VM that
-# deploy/kind/up.sh starts:
+# from the repo root, inside the Lima VM that deploy/kind/up.sh starts
+# (on a Linux host, directly with docker):
 #
 #   limactl shell --workdir <repo> sandbox \
 #     docker build -f deploy/images/driver.Dockerfile -t dapr-sandbox-microvm:dev .
@@ -20,7 +20,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends protobuf-compiler \
  && rm -rf /var/lib/apt/lists/*
 # The `microsandbox` crate's build script (feature `download-binaries`)
-# downloads the runtime pair for the target (linux-aarch64 here) into
+# downloads the runtime pair for the target (the build host's architecture) into
 # $MSB_HOME/{bin,lib}, and driver/build.rs bakes that directory into the
 # binary (DSB_MSB_BUILD_HOME), where the driver looks for the pair at run
 # time. The repo's .cargo/config.toml (which forces MSB_HOME to
