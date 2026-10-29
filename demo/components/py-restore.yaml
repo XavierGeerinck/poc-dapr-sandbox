@@ -12,3 +12,6 @@ spec:
     value: python:3.12-slim
   - name: warmPoolSize
     value: "0"
+  # Cgroup migration waits an RCU grace period after idle; favordynmods avoids it.
+  - name: setup
+    value: mount -o remount,favordynmods /sys/fs/cgroup

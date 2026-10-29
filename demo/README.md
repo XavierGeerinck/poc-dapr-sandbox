@@ -58,6 +58,8 @@ raised limit. Over the limit, a client would get a 429 instead of `truncated: tr
 | `py-restore` | no pool | `RESTORE`: a snapshot restore on demand |
 | `py-boot` | no pool, `template: none` | `BOOT`: a cold boot on demand |
 
+Each component also sets `setup: mount -o remount,favordynmods /sys/fs/cgroup`: after a VM has been idle, moving an exec into the guest cgroup would wait an RCU grace period (~28 ms), and `favordynmods` avoids that wait.
+
 `actorstore` is the in-memory actor state store; sandboxes are Dapr actors.
 
 `up` waits only for `py-fast`. Right after `up`, the other two components may answer 429 for a

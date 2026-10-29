@@ -14,3 +14,6 @@ spec:
     value: "0"
   - name: template
     value: none
+  # Cgroup migration waits an RCU grace period after idle; favordynmods avoids it.
+  - name: setup
+    value: mount -o remount,favordynmods /sys/fs/cgroup
