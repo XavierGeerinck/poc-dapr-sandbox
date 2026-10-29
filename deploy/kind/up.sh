@@ -7,8 +7,9 @@
 #     (deploy/kind/kind.yaml). Reboots the VM at most once in its life, to
 #     switch to the HWE kernel.
 #   Linux with /dev/kvm: docker and kind run directly on the host, no VM.
-#     Tools are not installed for you: docker, kind, kubectl and helm must
-#     exist, and the user must be able to run docker.
+#     Tools are not installed for you: docker, kind, kubectl, helm and curl
+#     must exist, the user must be able to run docker, and /dev/kvm must be
+#     readable and writable by the user.
 #
 # Idempotent: reuses a VM or cluster that exists.
 #
@@ -47,9 +48,21 @@ else
   vm() { limactl shell --workdir / "$VM" "$@"; }
 fi
 host_kubectl() { KUBECONFIG=$KUBECONFIG_FILE kubectl --context "$CONTEXT" "$@"; }
+# port_in_use PORT: whether something listens on TCP PORT on this host.
+port_in_use() {
+  if command -v lsof >/dev/null; then
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+  elif command -v ss >/dev/null; then
+    ss -Hltn "sport = :$1" 2>/dev/null | grep -q .
+  else
+    (: <"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+  fi
+}
 
 if [ $MODE = linux ]; then
   [ -c /dev/kvm ] || die "no /dev/kvm on this host (needs KVM)"
+  [ -r /dev/kvm ] && [ -w /dev/kvm ] ||
+    die "/dev/kvm is not readable and writable by ${USER:-$(id -un)} (add the user to its group, often kvm, and log in again): $(ls -l /dev/kvm)"
 else
   [ "$(uname -s)/$(uname -m)" = Darwin/arm64 ] || die "needs macOS on Apple silicon (M3 or later), or Linux with /dev/kvm"
 fi
@@ -59,10 +72,10 @@ esac
 [ -n "$API_PORT" ] || die "no apiServerPort in $KIND_DIR/kind.yaml"
 command -v kubectl >/dev/null || die "kubectl is not installed"
 if [ $MODE = linux ]; then
-  for tool in docker kind helm; do
+  for tool in docker kind helm curl; do
     command -v "$tool" >/dev/null || die "$tool is not installed (Linux mode installs nothing)"
   done
-  docker info >/dev/null 2>&1 || die "cannot talk to docker (is the daemon running, is $USER in the docker group?)"
+  docker info >/dev/null 2>&1 || die "cannot talk to docker (is the daemon running, is ${USER:-$(id -un)} in the docker group?)"
 else
   for tool in limactl helm; do
     if ! command -v "$tool" >/dev/null; then
@@ -132,15 +145,18 @@ if vm kind get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
   # kind nodes do not restart on their own after the VM restarts.
   vm sh -c "docker start \$(kind get nodes --name $CLUSTER)" >/dev/null
 else
+  if port_in_use "$API_PORT"; then
+    if [ $MODE = linux ]; then
+      die "host port $API_PORT (the cluster's API server) is in use"
+    fi
+    die "host port $API_PORT (the cluster's API server, forwarded by Lima) is in use"
+  fi
   if [ $MODE = linux ]; then
     # Never write ~/.kube/config: kind puts the context only in this file.
     mkdir -p "$(dirname "$KUBECONFIG_FILE")"
     log "creating kind cluster $CLUSTER"
     vm kind create cluster --config "$KIND_DIR/kind.yaml" --kubeconfig "$KUBECONFIG_FILE" --wait 5m
   else
-    if lsof -nP -iTCP:"$API_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-      die "host port $API_PORT (the cluster's API server, forwarded by Lima) is in use"
-    fi
     log "creating kind cluster $CLUSTER"
     vm kind create cluster --config "$KIND_DIR/kind.yaml" --wait 5m
   fi
@@ -158,6 +174,7 @@ for node in $(vm kind get nodes --name "$CLUSTER"); do
   rc=0
   # shellcheck disable=SC2016 # expanded in the node
   vm docker exec -e NODE="$node" "$node" sh -c '
+    set -e
     conf=/etc/kubernetes/kubelet.conf
     grep -q "server: https://$NODE:6443\$" $conf && exit 3
     sed -i -E "s#server: https://[0-9.]+:6443\$#server: https://$NODE:6443#" $conf
@@ -179,6 +196,7 @@ for node in $(vm kind get nodes --name "$CLUSTER"); do
   rc=0
   # shellcheck disable=SC2016 # expanded in the node
   vm docker exec "$node" sh -c '
+    set -e
     conf=/var/lib/kubelet/config.yaml
     grep -qx "singleProcessOOMKill: true" $conf && exit 3
     sed -i "/^singleProcessOOMKill:/d" $conf

@@ -11,6 +11,10 @@
 #           wraps each one in a distroless image,
 #           localhost/dapr/<binary>:dev-linux-<arch>, which is also tagged
 #           localhost/dapr/<binary>:dev (deploy/kind/helm-values.yaml uses it).
+#           A cluster on a Mac whose images were built before helm-values.yaml
+#           switched to `tag: dev` has only the :dev-linux-<arch> tags loaded:
+#           run `deploy/kind/build-images.sh dapr` once before the next helm
+#           install or upgrade.
 #   driver  dapr-sandbox-microvm:dev (deploy/images/driver.Dockerfile).
 #   bench   sandbox-bench:dev, the caller pod's image (deploy/images/bench.Dockerfile).
 #
@@ -19,8 +23,8 @@
 #
 # macOS: needs Go (the version in upstream/dapr/go.mod) and make on the Mac.
 # Docker and kind run only inside the Lima VM; the repo is mounted there at
-# its own path. Linux (with /dev/kvm): needs make, docker and kind on the host;
-# no Go. Nothing is installed for you.
+# its own path. Linux (with /dev/kvm): needs make, docker, kind and curl on the
+# host; no Go. Nothing is installed for you.
 # Pods use these images with imagePullPolicy: Never, so a rebuilt image takes
 # effect for new pods only.
 set -euo pipefail
@@ -65,18 +69,25 @@ vm_in() {
 }
 # build_dapr_linux: `make build-linux` in a golang container, as the invoking
 # uid/gid, with a persistent Go cache, so the host needs no Go. The image tag
-# is the go line of upstream/dapr/go.mod, or the newest 1.26.x if that tag
-# does not exist.
+# is the go line of upstream/dapr/go.mod, or the newest <major>.<minor>.x if
+# Docker Hub has no such tag. Any other pull failure (the network, the
+# daemon) stops the build.
 build_dapr_linux() {
-  local gover cache=${DSB_GO_CACHE:-$HOME/.cache/dsb-go}
+  local gover minor out newest cache=${DSB_GO_CACHE:-$HOME/.cache/dsb-go}
   gover=$(awk '/^go / {print $2; exit}' "$DAPR_SRC/go.mod")
   [ -n "$gover" ] || die "no go line in $DAPR_SRC/go.mod"
-  if ! docker image inspect "golang:$gover" >/dev/null 2>&1 && ! docker pull -q "golang:$gover" >/dev/null 2>&1; then
-    log "golang:$gover does not exist; looking for the newest ${gover%.*}.x"
-    local newest
-    newest=$(curl -fsS "https://registry.hub.docker.com/v2/repositories/library/golang/tags?name=${gover%.*}.&page_size=100" |
-      grep -o "\"name\":\"${gover%.*}\.[0-9]*\"" | sed 's/.*:"//;s/"//' | sort -V | tail -n 1) || true
-    [ -n "$newest" ] || die "no golang:${gover%.*}.x image found"
+  # The go line may be 1.26 or 1.26.10.
+  minor=$(printf '%s\n' "$gover" | cut -d. -f1-2)
+  if ! docker image inspect "golang:$gover" >/dev/null 2>&1 && ! out=$(docker pull -q "golang:$gover" 2>&1); then
+    case $out in
+    *'manifest unknown'* | *"manifest for golang:$gover not found"*) ;;
+    *) die "cannot pull golang:$gover: $out" ;;
+    esac
+    log "golang:$gover does not exist; looking for the newest $minor.x"
+    out=$(curl -fsS "https://registry.hub.docker.com/v2/repositories/library/golang/tags?name=$minor.&page_size=100") ||
+      die "cannot list the golang tags on Docker Hub"
+    newest=$(printf '%s\n' "$out" | grep -o "\"name\":\"${minor//./\\.}\.[0-9]*\"" | sed 's/.*:"//;s/"//' | sort -V | tail -n 1) || true
+    [ -n "$newest" ] || die "no golang:$minor.x image found"
     gover=$newest
     docker pull -q "golang:$gover" >/dev/null || die "cannot pull golang:$gover"
   fi
@@ -110,7 +121,7 @@ want() {
 }
 
 if [ $MODE = linux ]; then
-  for tool in docker kind make; do
+  for tool in docker kind make curl; do
     command -v "$tool" >/dev/null || die "$tool is not installed (Linux mode installs nothing)"
   done
 else
