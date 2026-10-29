@@ -1,0 +1,23 @@
+# kind cluster "sandbox", created inside the Lima VM by deploy/kind/up.sh.
+# Every node gets the VM's /dev/kvm, so pods on any node can run microVMs.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: sandbox
+networking:
+  # A fixed port, published on the VM's loopback, which Lima forwards to the
+  # host's loopback; up.sh checks that the host port is free.
+  apiServerAddress: 127.0.0.1
+  apiServerPort: 36443
+nodes:
+- role: control-plane
+  extraMounts:
+  - hostPath: /dev/kvm
+    containerPath: /dev/kvm
+- role: worker
+  extraMounts:
+  - hostPath: /dev/kvm
+    containerPath: /dev/kvm
+- role: worker
+  extraMounts:
+  - hostPath: /dev/kvm
+    containerPath: /dev/kvm

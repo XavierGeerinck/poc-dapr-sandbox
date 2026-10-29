@@ -1,0 +1,84 @@
+# Lima VM "sandbox": the Linux host for the kind cluster (deploy/kind/up.sh).
+#
+# kind nodes are Docker containers, and the driver's microVMs need KVM, so the
+# VM itself must offer /dev/kvm: vz with nested virtualization (Apple M3 or
+# later, macOS 15 or later). Docker and kind run inside this VM only; nothing
+# here touches the host's Docker, its contexts or ~/.kube/config.
+#
+# The repo is mounted writable at its own path, but its path is not portable,
+# so this file mounts nothing: up.sh adds the mount (`--mount <repo>:w`).
+minimumLimaVersion: 2.0.0
+
+base:
+- template:_images/ubuntu-24.04
+
+vmType: vz
+arch: aarch64
+nestedVirtualization: true
+# Sized by the user ("to start with"); change only with their agreement.
+cpus: 4
+memory: 6GiB
+
+mountType: virtiofs
+mounts: []
+
+# Docker brings its own containerd; skip Lima's nerdctl/containerd setup.
+containerd:
+  system: false
+  user: false
+
+provision:
+# Written before the system script runs (see Lima's provisioning order), so
+# the socket Docker's package starts already belongs to the Lima user:
+# `limactl shell sandbox docker ...` and `... kind ...` work without sudo.
+- mode: data
+  path: /etc/systemd/system/docker.socket.d/override.conf
+  content: |
+    [Socket]
+    SocketUser={{.User}}
+# kind's "known issues": a multi-node cluster exhausts Ubuntu's default
+# inotify instance limit (128).
+- mode: data
+  path: /etc/sysctl.d/90-kind.conf
+  content: |
+    fs.inotify.max_user_watches = 524288
+    fs.inotify.max_user_instances = 512
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    sysctl --system >/dev/null
+
+    # Docker (and BuildKit, for the cache mounts in deploy/images/*.Dockerfile)
+    # from the Ubuntu archive.
+    if ! command -v docker >/dev/null 2>&1 || ! docker buildx version >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends docker.io docker-buildx
+    fi
+    systemctl daemon-reload
+    if [ "$(stat -c %U /run/docker.sock 2>/dev/null)" != "{{.User}}" ]; then
+      systemctl restart docker.socket docker.service
+    fi
+
+    # kind, pinned and checksummed (kubernetes-sigs/kind release assets).
+    KIND_VERSION=v0.29.0
+    KIND_SHA256=03d45095dbd9cc1689f179a3e5e5da24b77c2d1b257d7645abf1b4174bebcf2a
+    if [ "$(kind version 2>/dev/null | awk '{print $2}')" != "$KIND_VERSION" ]; then
+      tmp=$(mktemp)
+      curl -fsSLo "$tmp" "https://github.com/kubernetes-sigs/kind/releases/download/$KIND_VERSION/kind-linux-arm64"
+      echo "$KIND_SHA256  $tmp" | sha256sum -c -
+      install -m 0755 "$tmp" /usr/local/bin/kind
+      rm -f "$tmp"
+    fi
+
+probes:
+- description: Docker and kind installed
+  script: |
+    #!/bin/bash
+    set -eu -o pipefail
+    if ! timeout 300s bash -c 'until docker info >/dev/null 2>&1 && command -v kind >/dev/null; do sleep 3; done'; then
+      echo >&2 "Docker or kind is not ready"
+      exit 1
+    fi
+  hint: See /var/log/cloud-init-output.log in the guest.

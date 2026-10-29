@@ -1,0 +1,4 @@
+# The driver image needs only the driver's sources (context: the repo root).
+*
+!driver/
+driver/target/

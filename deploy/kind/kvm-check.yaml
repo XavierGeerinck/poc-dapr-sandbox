@@ -1,0 +1,43 @@
+# Feasibility check: can a pod on the kind cluster run the driver's microVMs?
+# Runs `dapr-sandbox-microvm --selftest` once (boot a template VM, snapshot,
+# restore, exec `echo ok`) and exits; its log ends in `selftest: ok`.
+#
+#   KUBECONFIG=<repo>/.kube/kind-sandbox.yaml kubectl --context kind-sandbox apply -f deploy/kind/kvm-check.yaml
+#   KUBECONFIG=<repo>/.kube/kind-sandbox.yaml kubectl --context kind-sandbox logs -f kvm-check
+#
+# Needs the image dapr-sandbox-microvm:dev loaded into the cluster
+# (deploy/images/driver.Dockerfile).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kvm-check
+  labels:
+    app.kubernetes.io/name: kvm-check
+spec:
+  restartPolicy: Never
+  containers:
+  - name: selftest
+    image: dapr-sandbox-microvm:dev
+    imagePullPolicy: Never
+    args: ["--selftest", "python:3.12-slim", "--msb-home", "/var/lib/dsb/msb"]
+    securityContext:
+      # Opening /dev/kvm needs it: an unprivileged container's device cgroup
+      # denies the device even when it is mounted (open fails with EPERM),
+      # and kind has no KVM device plugin. microsandbox needs no other
+      # device: its VM networking is an in-process userspace (smoltcp)
+      # stack, not a TAP device (/dev/net/tun).
+      privileged: true
+    volumeMounts:
+    - name: kvm
+      mountPath: /dev/kvm
+    # The microsandbox home (images, VM disks, snapshots, sockets): on the
+    # node's disk rather than the container's overlay filesystem.
+    - name: dsb
+      mountPath: /var/lib/dsb
+  volumes:
+  - name: kvm
+    hostPath:
+      path: /dev/kvm
+      type: CharDevice
+  - name: dsb
+    emptyDir: {}
