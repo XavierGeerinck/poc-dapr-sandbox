@@ -15,6 +15,28 @@
 //! up to `refillConcurrency` workers. Every claim tops the pool up again.
 //! [`Pool::shutdown`] destroys every VM and waits, bounded, for in-flight work.
 //!
+//! # Warm-up
+//!
+//! A refill worker runs the component's `warmupCommand`
+//! ([`Config::warmup_command`], default `true`) once in each VM it spawns,
+//! after the spawn and before the VM joins the warm pool, so the warm pool,
+//! and so `ready`, holds only VMs that have run a command. A warm-up that
+//! fails (error, non-zero exit, or no result within
+//! [`PoolOptions::warmup_timeout`]) destroys the VM and counts as a failed
+//! refill: same backoff, same `ready` reason. An on-demand spawn skips it,
+//! since its caller's own exec comes next; one whose caller went away is
+//! warmed up before it joins the warm pool. [`PoolStats`] counts warm-ups
+//! and their time; each is logged at debug level.
+//!
+//! It was meant to take the slow first exec of a fresh VM (~30 ms on an
+//! Apple-silicon Mac, against ~1 ms for the next ones) off the request path.
+//! On microsandbox 0.7.11 that cost is not the first exec's, though, but that
+//! of any exec on a VM idle for more than ~25 ms, so a pooled VM pays it
+//! again at its handout. What the warm-up buys is that a VM which cannot run
+//! commands is replaced before it is handed out; it costs one exec (~30 ms)
+//! of each refill's time. Running the command in the template VM before its
+//! snapshot does not help either (results/mac/notes.md, "Task 15a").
+//!
 //! # Replacement
 //!
 //! Pools of one component share VM names and the template name. A pool that
@@ -35,13 +57,15 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
-use crate::backend::{BackendError, VmBackend};
+use crate::backend::{BackendError, ExecSpec, VmBackend};
 use crate::config::{Config, Template};
 
 /// Default for [`PoolOptions::reconcile_grace`] (ruling R9).
 pub const DEFAULT_RECONCILE_GRACE: Duration = Duration::from_secs(60);
 /// Default for [`PoolOptions::shutdown_timeout`].
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
+/// Default for [`PoolOptions::warmup_timeout`].
+pub const DEFAULT_WARMUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// First and last delay between retries of a failed spawn or template.
 const BACKOFF_MIN: Duration = Duration::from_millis(100);
@@ -56,6 +80,10 @@ pub struct PoolOptions {
     pub reconcile_grace: Duration,
     /// How long `shutdown` waits for in-flight spawns and destroys.
     pub shutdown_timeout: Duration,
+    /// Bound on one warm-up exec. It is also the exec's `timeout_ms`, for a
+    /// backend to kill the command; the pool gives up at the bound either
+    /// way.
+    pub warmup_timeout: Duration,
 }
 
 impl Default for PoolOptions {
@@ -63,6 +91,7 @@ impl Default for PoolOptions {
         Self {
             reconcile_grace: DEFAULT_RECONCILE_GRACE,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            warmup_timeout: DEFAULT_WARMUP_TIMEOUT,
         }
     }
 }
@@ -115,6 +144,14 @@ pub struct PoolStats {
     pub filling: usize,
     /// On-demand spawns in flight.
     pub inline: usize,
+    /// Successful warm-ups so far.
+    pub warmups: u64,
+    /// Failed warm-ups so far (error, non-zero exit or timeout).
+    pub warmup_failures: u64,
+    /// Total time of the successful warm-ups.
+    pub warmup_total: Duration,
+    /// Longest successful warm-up.
+    pub warmup_max: Duration,
 }
 
 fn component_hash(component: &str) -> String {
@@ -180,6 +217,10 @@ struct State {
     /// Consecutive failed refills, for backoff and `ready`.
     spawn_failures: u32,
     last_spawn_error: Option<String>,
+    warmups: u64,
+    warmup_failures: u64,
+    warmup_total: Duration,
+    warmup_max: Duration,
 }
 
 /// Warm pool of VMs for one component.
@@ -227,6 +268,10 @@ impl Pool {
                 inline: 0,
                 spawn_failures: 0,
                 last_spawn_error: None,
+                warmups: 0,
+                warmup_failures: 0,
+                warmup_total: Duration::ZERO,
+                warmup_max: Duration::ZERO,
             }),
             stage: watch::Sender::new(Stage::Starting),
             tasks: TaskTracker::new(),
@@ -537,38 +582,58 @@ impl Pool {
             .spawn(&self.cfg, &name, self.template_ref())
             .await;
 
-        let destroy = {
+        let (destroy, abandoned) = {
             let mut st = self.lock();
             st.inline -= 1;
             match res {
                 Ok(()) if st.phase == Phase::Closed => {
                     let _ = tx.send(Err(PoolError::Closed));
-                    true
+                    (true, false)
                 }
                 Ok(()) => {
-                    // Hand it over, or keep it warm if the caller went away.
-                    // Sending under the lock: the caller cannot use the VM
-                    // before it is recorded as live.
+                    // Hand it over, or keep it for the pool if the caller
+                    // went away. Sending under the lock: the caller cannot
+                    // use the VM before it is recorded as live.
                     match tx.send(Ok(name.clone())) {
                         Ok(()) => {
                             st.live.insert(name.clone(), tokio::time::Instant::now());
+                            (false, false)
                         }
-                        Err(_) => {
-                            debug!(vm = %name, "acquire caller went away; keeping the VM warm");
-                            st.warm.push_back(name.clone());
-                        }
+                        Err(_) => (false, true),
                     }
-                    false
                 }
                 Err(e) => {
                     warn!(component = %self.component, vm = %name, "on-demand spawn failed: {e}");
                     let _ = tx.send(Err(e.into()));
-                    true
+                    (true, false)
                 }
             }
         };
         if destroy {
             self.destroy_now(&name).await;
+        } else if abandoned {
+            self.keep_abandoned(&name).await;
+        }
+    }
+
+    /// An on-demand VM whose caller went away joins the warm pool, warmed up
+    /// like a refill; destroyed if the warm-up fails or the pool closed.
+    async fn keep_abandoned(&self, name: &str) {
+        debug!(vm = %name, "acquire caller went away; keeping the VM warm");
+        let warmed = self.warm_up(name).await;
+        let keep = {
+            let mut st = self.lock();
+            let keep = warmed.is_ok() && st.phase != Phase::Closed;
+            if keep {
+                st.warm.push_back(name.to_string());
+            }
+            keep
+        };
+        if !keep {
+            if let Err(e) = warmed {
+                warn!(component = %self.component, vm = %name, "not keeping an on-demand VM: {e}");
+            }
+            self.destroy_now(name).await;
         }
     }
 
@@ -600,7 +665,8 @@ impl Pool {
         self.spawn_refills(n);
     }
 
-    /// One refill worker: spawns one warm VM, then tops up again.
+    /// One refill worker: spawns one VM, warms it up, adds it to the warm
+    /// pool, then tops up again.
     async fn fill_one(self: Arc<Self>) {
         // Boot nothing once the pool is closing.
         {
@@ -611,10 +677,14 @@ impl Pool {
             }
         }
         let name = self.next_name();
-        let res = self
+        let mut res = self
             .backend
             .spawn(&self.cfg, &name, self.template_ref())
             .await;
+        if res.is_ok() {
+            // Before the VM joins the warm pool; a failure is a failed refill.
+            res = self.warm_up(&name).await;
+        }
         match res {
             Ok(()) => {
                 let closed = {
@@ -651,6 +721,65 @@ impl Pool {
                 self.lock().filling -= 1;
                 self.refill();
             }
+        }
+    }
+
+    /// Runs the `warmupCommand` once in VM `name`, bounded by
+    /// `warmup_timeout`, and records it in the stats. Ok at once without a
+    /// command, and as soon as the pool closes (the caller then sees the
+    /// pool closed and destroys the VM). Any failure is `Internal`.
+    async fn warm_up(&self, name: &str) -> Result<(), BackendError> {
+        let Some((command, args)) = self.cfg.warmup_command.split_first() else {
+            return Ok(());
+        };
+        let limit = self.opts.warmup_timeout;
+        let spec = ExecSpec {
+            command: command.clone(),
+            args: args.to_vec(),
+            timeout_ms: u32::try_from(limit.as_millis()).unwrap_or(u32::MAX),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        // Dropping an exec is cancel-safe (backend contract).
+        let res = tokio::select! {
+            r = tokio::time::timeout(limit, self.backend.exec(name, spec)) => r,
+            () = self.cancel.cancelled() => return Ok(()),
+        };
+        let elapsed = start.elapsed();
+        let failure = match res {
+            Ok(Ok(r)) if r.timed_out => Some(format!("timed out after {limit:?}")),
+            Ok(Ok(r)) if r.exit_code != 0 => {
+                let tail = &r.stderr[r.stderr.len().saturating_sub(256)..];
+                Some(format!(
+                    "exited with {}: {}",
+                    r.exit_code,
+                    String::from_utf8_lossy(tail).trim_end()
+                ))
+            }
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(_) => Some(format!("timed out after {limit:?}")),
+        };
+        {
+            let mut st = self.lock();
+            // Saturating: nothing may panic under the lock.
+            if failure.is_none() {
+                st.warmups = st.warmups.saturating_add(1);
+                st.warmup_total = st.warmup_total.saturating_add(elapsed);
+                st.warmup_max = st.warmup_max.max(elapsed);
+            } else {
+                st.warmup_failures = st.warmup_failures.saturating_add(1);
+            }
+        }
+        match failure {
+            None => {
+                debug!(component = %self.component, vm = %name,
+                    elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX), "warmed up");
+                Ok(())
+            }
+            Some(why) => Err(BackendError::Internal(format!(
+                "warm-up {command:?} in {name:?}: {why}"
+            ))),
         }
     }
 
@@ -755,6 +884,10 @@ impl Pool {
             live: st.live.len(),
             filling: st.filling as usize,
             inline: st.inline as usize,
+            warmups: st.warmups,
+            warmup_failures: st.warmup_failures,
+            warmup_total: st.warmup_total,
+            warmup_max: st.warmup_max,
         }
     }
 

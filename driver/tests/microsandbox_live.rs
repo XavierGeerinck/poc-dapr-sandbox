@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use dapr_sandbox_microvm::backend::{BackendError, ExecSpec, OUTPUT_CAP, VmBackend};
 use dapr_sandbox_microvm::config::Config;
 use dapr_sandbox_microvm::microsandbox_backend::{MAX_MSB_HOME_LEN, MicrosandboxBackend};
-use dapr_sandbox_microvm::pool::{template_name, vm_name, vm_prefix};
+use dapr_sandbox_microvm::pool::{AcquirePath, Pool, template_name, vm_name, vm_prefix};
 use dapr_sandbox_microvm::selftest::{ms, percentile};
 use dapr_sandbox_microvm::service::SandboxService;
 use sha2::Digest;
@@ -659,5 +659,159 @@ while True:
     for vm in &vms {
         b.destroy(vm).await.unwrap();
     }
+    b.remove_template(&t).await.unwrap();
+}
+
+/// Waits until `pool` is ready (its warm pool full), at most 120 s.
+async fn wait_full(pool: &Pool) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let (ready, reason) = pool.ready();
+        if ready {
+            return;
+        }
+        assert!(Instant::now() < deadline, "not ready: {reason}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Task 15a: the pool's warm-up on real VMs, with the default
+/// `warmupCommand` (`true`) and with `warmupCommand: ""`. With it, every VM
+/// the pool spawns runs it once, successfully, before it joins the warm
+/// pool; without it, none does. Prints, for both, the first exec on a VM the
+/// pool hands out (each acquire waits for a full pool, so refills do not
+/// overlap it), later execs, the warm-up's cost and the time to refill 8
+/// VMs.
+///
+/// It does not assert that the first exec is close to later ones, because
+/// on microsandbox 0.7.11 it is not. An exec on a VM that has been idle for
+/// more than ~25 ms costs ~28 ms on this Mac, however many execs ran before
+/// (see `live_exec_latency_vs_idle`). A pooled VM always idles longer than
+/// that before its handout, so the warm-up does not show in the first exec
+/// (results/mac/notes.md, "Task 15a").
+#[tokio::test]
+#[ignore = "boots microVMs"]
+async fn live_pool_warmup() {
+    const N: usize = 10;
+    const STEADY: usize = 3;
+    const SIZE: usize = 8;
+    let _g = LOCK.lock().await;
+    let b = backend().await;
+    for (component, warmup) in [("live-warmup-on", None), ("live-warmup-off", Some(""))] {
+        let size = SIZE.to_string();
+        let mut kv = vec![("warmPoolSize", size.as_str()), ("refillConcurrency", "4")];
+        if let Some(v) = warmup {
+            kv.push(("warmupCommand", v));
+        }
+        let pool = Pool::new(component, cfg(&kv), b.clone());
+        pool.start();
+
+        let (mut first, mut steady) = (Vec::new(), Vec::new());
+        for _ in 0..N {
+            wait_full(&pool).await;
+            let a = pool.acquire().await.unwrap();
+            assert_eq!(a.path, AcquirePath::Pool);
+            let start = Instant::now();
+            let r = b.exec(&a.instance_id, spec("echo", &["ok"])).await.unwrap();
+            first.push(start.elapsed());
+            assert_eq!(r.stdout, b"ok\n");
+            for _ in 0..STEADY {
+                let start = Instant::now();
+                let r = b.exec(&a.instance_id, spec("echo", &["ok"])).await.unwrap();
+                steady.push(start.elapsed());
+                assert_eq!(r.stdout, b"ok\n");
+            }
+            pool.release(&a.instance_id).unwrap();
+        }
+
+        // Empty the pool at once and time its refill.
+        wait_full(&pool).await;
+        let mut taken = Vec::new();
+        for _ in 0..SIZE {
+            let a = pool.acquire().await.unwrap();
+            assert_eq!(a.path, AcquirePath::Pool);
+            taken.push(a.instance_id);
+        }
+        let start = Instant::now();
+        wait_full(&pool).await;
+        let refill = start.elapsed();
+        for id in &taken {
+            pool.release(id).unwrap();
+        }
+
+        let s = pool.stats();
+        pool.shutdown().await;
+        assert!(b.list(&vm_prefix(component)).await.unwrap().is_empty());
+        b.remove_template(&template_name(component)).await.unwrap();
+
+        let label = if s.warmups > 0 {
+            format!(
+                "{} warm-ups, mean {:.1} ms, max {:.1} ms",
+                s.warmups,
+                ms(s.warmup_total) / s.warmups as f64,
+                ms(s.warmup_max)
+            )
+        } else {
+            "no warm-up".to_string()
+        };
+        println!(
+            "{component} ({label}): first exec after handout p50 {:.1} / p90 {:.1} / max {:.1} ms \
+             (n = {N}); later execs p50 {:.1} / p90 {:.1} ms; refilling {SIZE} VMs \
+             (refillConcurrency 4) took {:.0} ms",
+            ms(percentile(&first, 50.0)),
+            ms(percentile(&first, 90.0)),
+            ms(percentile(&first, 100.0)),
+            ms(percentile(&steady, 50.0)),
+            ms(percentile(&steady, 90.0)),
+            ms(refill),
+        );
+        assert_eq!(s.warmup_failures, 0, "{s:?}");
+        // The initial fill, the refill after each of the N acquires (each
+        // waited for a full pool), and the final refill of SIZE.
+        let spawned = (SIZE + N + SIZE) as u64;
+        let want = if warmup.is_none() { spawned } else { 0 };
+        assert_eq!(s.warmups, want, "{s:?}");
+    }
+}
+
+/// Task 15a: exec latency against how long the VM was idle before the
+/// exec, on one restored VM after a warm-up exec. Prints a table; asserts
+/// only that the execs work. On this Mac (microsandbox 0.7.11, HVF), up to
+/// ~20 ms of idle costs ~1–2 ms; from ~25–30 ms on, ~28 ms, flat up to
+/// seconds.
+#[tokio::test]
+#[ignore = "boots microVMs; prints timings"]
+async fn live_exec_latency_vs_idle() {
+    const SAMPLES: usize = 6;
+    let _g = LOCK.lock().await;
+    let b = backend().await;
+    let c = cfg(&[]);
+    let t = prepare(&b, "live-idle", &c).await;
+    let vm = vm_name("live-idle", 1);
+    b.spawn(&c, &vm, Some(&t)).await.unwrap();
+    let start = Instant::now();
+    let r = b.exec(&vm, spec("true", &[])).await.unwrap();
+    assert_eq!(r.exit_code, 0);
+    println!(
+        "first exec (true) after restore: {:.1} ms",
+        ms(start.elapsed())
+    );
+    for idle_ms in [0u64, 5, 10, 15, 20, 25, 30, 50, 100, 500, 2000] {
+        let mut s = Vec::new();
+        for _ in 0..SAMPLES {
+            tokio::time::sleep(Duration::from_millis(idle_ms)).await;
+            let start = Instant::now();
+            let r = b.exec(&vm, spec("echo", &["ok"])).await.unwrap();
+            s.push(start.elapsed());
+            assert_eq!(r.stdout, b"ok\n");
+        }
+        let all: Vec<String> = s.iter().map(|d| format!("{:.1}", ms(*d))).collect();
+        println!(
+            "idle {idle_ms:4} ms, then exec echo ok: p50 {:5.1} ms  [{}]",
+            ms(percentile(&s, 50.0)),
+            all.join(" ")
+        );
+    }
+    b.destroy(&vm).await.unwrap();
     b.remove_template(&t).await.unwrap();
 }

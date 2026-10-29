@@ -10,7 +10,8 @@
 //!   spawns), `exec`s on different VMs and on the same VM, and a `destroy` of
 //!   a VM that has an `exec` in flight. No pool lock is held across a call.
 //! - **Cancellation.** The gRPC layer may drop an `exec`/`session_*` future
-//!   when the caller goes away; those must be cancel-safe. The pool never
+//!   when the caller goes away, and the pool drops a warm-up `exec` at its
+//!   timeout or on shutdown; those must be cancel-safe. The pool never
 //!   drops `spawn`, `prepare_template`, `destroy` or `list` futures.
 //! - **Errors.** [`BackendError::NotFound`] is reserved for an unknown VM or
 //!   session on `exec`, `session_*` and `destroy` (daprd turns it into
@@ -162,6 +163,9 @@ pub mod fake {
         prepared: Vec<String>,
         spawned: Vec<(String, Option<String>)>,
         spawns_entered: usize,
+        /// `None` until `record_execs`: the binary serves this backend too,
+        /// and an exec log would grow without bound there.
+        execs: Option<Vec<(String, ExecSpec)>>,
         destroyed: Vec<String>,
         sessions: HashSet<(String, String)>,
         session_seq: u64,
@@ -175,6 +179,7 @@ pub mod fake {
         fail_prepares: u32,
         fail_list: bool,
         spawn_gate: Option<Arc<Semaphore>>,
+        exec_gate: Option<Arc<Semaphore>>,
         exec_handler: Option<ExecHandler>,
     }
 
@@ -182,7 +187,8 @@ pub mod fake {
     ///
     /// Without an exec handler, `exec` emulates `echo`, `true`, `false`,
     /// `cat` (stdin to stdout) and `sleep <secs>` (honours `timeout_ms`);
-    /// anything else exits 127. Sessions echo their input back.
+    /// anything else exits 127. Once [`record_execs`](Self::record_execs)
+    /// is called, every exec is recorded. Sessions echo their input back.
     #[derive(Default)]
     pub struct FakeBackend {
         inner: Mutex<Inner>,
@@ -268,6 +274,64 @@ pub mod fake {
             if let Some(gate) = self.lock().spawn_gate.take() {
                 gate.close();
             }
+        }
+
+        /// From now on every exec blocks, after its VM check, until
+        /// [`allow_execs`] lets it through (or [`resume_execs`] lifts the
+        /// gate).
+        ///
+        /// [`allow_execs`]: Self::allow_execs
+        /// [`resume_execs`]: Self::resume_execs
+        pub fn pause_execs(&self) {
+            let mut st = self.lock();
+            if st.exec_gate.is_none() {
+                st.exec_gate = Some(Arc::new(Semaphore::new(0)));
+            }
+        }
+
+        /// Lets `n` paused execs through.
+        pub fn allow_execs(&self, n: usize) {
+            if let Some(gate) = &self.lock().exec_gate {
+                gate.add_permits(n);
+            }
+        }
+
+        /// Lifts the gate: blocked and future execs proceed.
+        pub fn resume_execs(&self) {
+            if let Some(gate) = self.lock().exec_gate.take() {
+                gate.close();
+            }
+        }
+
+        /// From now on, records every `exec` (see [`execs`](Self::execs)).
+        pub fn record_execs(&self) {
+            self.lock().execs.get_or_insert_with(Vec::new);
+        }
+
+        /// Every `exec` on an existing VM since
+        /// [`record_execs`](Self::record_execs), in order, recorded on entry:
+        /// including ones still blocked by
+        /// [`pause_execs`](Self::pause_execs) and ones that fail.
+        ///
+        /// # Panics
+        ///
+        /// If `record_execs` was never called, so that a test cannot read an
+        /// empty log as "no execs".
+        pub fn execs(&self) -> Vec<(String, ExecSpec)> {
+            self.lock()
+                .execs
+                .clone()
+                .expect("FakeBackend::record_execs was not called")
+        }
+
+        /// The specs of the execs on VM `name` so far (see
+        /// [`execs`](Self::execs), which also says when it panics).
+        pub fn execs_on(&self, name: &str) -> Vec<ExecSpec> {
+            self.execs()
+                .into_iter()
+                .filter(|(vm, _)| vm == name)
+                .map(|(_, spec)| spec)
+                .collect()
         }
 
         /// Existing VMs, sorted.
@@ -389,7 +453,22 @@ pub mod fake {
         }
 
         async fn exec(&self, name: &str, spec: ExecSpec) -> Result<ExecResult> {
-            self.has_vm(name)?;
+            let gate = {
+                let mut st = self.lock();
+                if !st.vms.contains(name) {
+                    return Err(BackendError::NotFound(format!("unknown VM {name:?}")));
+                }
+                if let Some(log) = &mut st.execs {
+                    log.push((name.to_string(), spec.clone()));
+                }
+                st.exec_gate.clone()
+            };
+            if let Some(gate) = gate {
+                // A closed gate (resume_execs) lets everyone through.
+                if let Ok(permit) = gate.acquire().await {
+                    permit.forget();
+                }
+            }
             let start = Instant::now();
             let (delay, handler) = {
                 let st = self.lock();

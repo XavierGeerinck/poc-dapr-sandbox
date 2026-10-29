@@ -149,3 +149,78 @@ Facts:
 1. Path a p99 total is 41.2 ms (sequential n=500) against 100 ms; 42.9 ms in the 60 s rate-20 run.
 2. Path a exec_us p50/p99 is 33.8 / 41.0 ms; path b exec_us p50/p99 is 0.8 / 22.0 ms; difference 33.0 ms at p50 and 19.0 ms at p99. Path a exec_us is 33.8 of 34.1 ms total at p50.
 3. The highest sweep rate with path a rows at least 99% POOL and at most 1% errors is 20/s (10/s and 20/s: 100% POOL, 0% errors; 40/s: 84.7% non-POOL of 200 rows, 16.8% errors).
+
+## Task 15a: warm-up experiment
+
+Machine: the Task 14 Mac (Mac16,7, Apple M4 Pro). Load average 3–11 during the runs; the kind Lima VM was running. Repo 9cfae44 plus the Task 15a working tree; microsandbox 0.7.11; `python:3.12-slim`, 1 vCPU, 512 MiB, no `setup` (as in the demo components); debug builds (`cargo test`). All times are host wall-clock around `VmBackend::exec`, in ms. "p50 / p90" are nearest-rank.
+
+### 1. Does a warm-up before the template snapshot help? No.
+
+**Method**
+- There were two templates:
+  - one prepared as today (`warmupCommand: ""`);
+  - one that ran `true` in the template VM after boot, before the snapshot. That step took 37.8 and 34.9 ms; the snapshot size was unchanged at 58540032 bytes.
+- Each round restored one VM per group, in turn, so that host load drifted evenly across the groups.
+- In each VM, I timed:
+  - an optional per-VM warm-up exec right after the restore;
+  - the first `echo ok`;
+  - then 5 more `echo ok`.
+- There were 15 VMs per group in each of 2 runs.
+
+| Group | Pre-snapshot warm-up | Per-VM warm-up | First exec | Run 1: warm-up p50 | Run 1: first exec p50 / p90 | Run 2: warm-up p50 | Run 2: first exec p50 / p90 | Later execs p50 |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| off | no | no | `echo ok` | – | 34.0 / 35.9 | – | 30.6 / 37.1 | 1.3–1.5 |
+| pre | yes | no | `echo ok` | – | 30.1 / 36.6 | – | 30.4 / 31.1 | 1.3–1.5 |
+| pre-true | yes | no | `true` (the command the template ran) | – | 27.6 / 28.2 | – | 28.5 / 29.2 | 1.4 |
+| off+vm | no | `true` | `echo ok`, right after | 32.9 | 2.9 / 4.4 | 33.6 | 2.6 / 3.1 | 1.4 |
+| pre+vm | yes | `true` | `echo ok`, right after | 27.7 | 3.3 / 3.7 | 28.7 | 3.6 / 5.4 | 1.3–1.4 |
+| off+vm-echo | no | `echo ok` | `echo ok`, right after | – | – | 35.5 | 1.6 / 1.9 | 1.3 |
+
+**Result**
+- The pre-snapshot warm-up leaves a restored VM's first exec at 28–30 ms, even for the very command the template ran.
+- It is therefore not in `prepare_template`.
+- A per-VM warm-up makes the exec right after it fast: 2.6–3.6 ms, and 1.6 ms when it is the same binary.
+
+### 2. The cost is not the first exec's: it is an exec after idle
+
+**Live pool test.** `live_pool_warmup`, `warmPoolSize` 8, `refillConcurrency` 4, n = 10 handouts per setting. The pool was refilled before each acquire.
+
+| Run | Setting | First exec after handout, p50 / p90 | Later execs, p50 | Warm-ups, mean / max | Refill of 8 VMs |
+|---|---|---:|---:|---:|---:|
+| 1 | warm-up (`true`) | 31.0 / 34.5 | 1.4 | 29.8 / 33.4 ms (26) | 320 ms |
+| 1 | `warmupCommand: ""` | 32.0 / 35.5 | 1.5 | – | 281 ms |
+| 2 (full live suite) | warm-up (`true`) | 29.6 / 33.1 | 1.6 | 31.7 / 36.9 ms (26) | 310 ms |
+| 2 (full live suite) | `warmupCommand: ""` | 32.7 / 37.7 | 1.7 | – | 302 ms |
+| 3 (final code) | warm-up (`true`) | 30.3 / 34.9 | 1.6 | 33.0 / 44.5 ms (26) | 325 ms |
+| 3 (final code) | `warmupCommand: ""` | 32.3 / 36.3 | 1.7 | – | 261 ms |
+
+An earlier version, with `warmPoolSize` 2 and n = 12, gave the same: warmed VMs, first exec after handout p50 31.2 ms.
+
+**Exec latency against idle time.** `live_exec_latency_vs_idle`: one VM, already warmed, sleeps for the given idle time, then runs `echo ok`. 6 samples per idle time; p50 shown.
+
+| Idle before the exec (ms) | 0 | 5 | 10 | 15 | 20 | 25 | 30 | 50 | 100 | 500 | 2000 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Run 1 | 1.4 | 1.6 | 1.4 | 1.5 | 1.7 | 24.5 | 28.1 | 28.3 | 28.1 | 28.6 | 27.9 |
+| Run 2 (full live suite) | 1.3 | 1.7 | 1.9 | 1.7 | 1.9 | 31.5 | 27.9 | 28.2 | 27.8 | 28.0 | 27.9 |
+
+- An earlier probe gave 1.0–2.0 ms up to 20 ms of idle, and 27.5–28.8 ms from 30 ms up to 2000 ms.
+- From about 10 ms of idle, single samples already hit 25–34 ms.
+
+**Where the time goes.** I added temporary timing to the backend's `run` (since removed):
+- **Back-to-back execs:** connecting and sending the request takes 0.4–0.7 ms, and the guest's `ExecStarted` arrives at 0.8–1.4 ms.
+- **After 300 ms idle:** the connection still takes 0.9–1.3 ms, but `ExecStarted` arrives at 25.7–27.2 ms.
+- **First exec after a restore:** `ExecStarted` at 32.9 ms.
+
+**Probes that narrowed it down**
+- **Not the guest vCPU's idle depth.** A guest loop of `sleep 0.01` keeps the vCPU waking every 10 ms, yet `ExecStarted` still came at 22–28 ms after 300 ms of host idle.
+- **Per VM.** After 300 ms of idle, an exec on VM B (27–34 ms) did not make the next exec on VM A fast (25–28 ms).
+- **Not a background QoS.** The `msb` processes run at normal priority (pri 31, nice 0).
+
+### Conclusion
+
+1. A no-op before the snapshot does not make restored VMs' first exec fast. It is not in `prepare_template`.
+2. The ~30 ms of path (a) is not a first-exec cost. Any exec on a VM that has been idle for more than about 25 ms pays ~28 ms, from the request to the guest's `ExecStarted`. The cause sits somewhere in microsandbox 0.7.11's per-VM exec path, not yet identified.
+3. A pooled VM always idles longer than that before its handout. The per-VM refill warm-up (R22, implemented, default `true`) therefore does not lower the first exec after a handout: 29.6–31.0 ms with it, 32.0–32.7 ms without (p50, 3 runs).
+   - What it costs: one exec, ~30–33 ms (mean), per refill. Refilling 8 VMs took 310–325 ms with it against 261–302 ms without (one sample per run).
+   - What it buys: a VM that cannot run commands is replaced before its handout.
+4. Not verified: whether the nested-KVM numbers from Task 15 (first exec 260–425 ms, repeated execs ~9.5–16 ms) are the same idle effect. The Step 5 daemon's 25 ms mode may be this effect too; that is untested as well.

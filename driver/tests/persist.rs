@@ -146,6 +146,78 @@ async fn a_new_service_restores_persisted_pools_without_init() {
     svc.shutdown().await;
 }
 
+/// `warmupCommand` is persisted with the other properties, and a restored
+/// pool keeps the difference between an absent key (`true`) and an empty one
+/// (disabled).
+#[tokio::test]
+async fn restored_pools_keep_their_warmup_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = state(tmp.path());
+    let (_fake, svc) = service(dir.path());
+    let cases = [
+        ("absent", props(&[("image", "img"), ("warmPoolSize", "1")])),
+        (
+            "empty",
+            props(&[
+                ("image", "img"),
+                ("warmPoolSize", "1"),
+                ("warmupCommand", ""),
+            ]),
+        ),
+        (
+            "custom",
+            props(&[
+                ("image", "img"),
+                ("warmPoolSize", "1"),
+                ("warmupCommand", "echo warm"),
+            ]),
+        ),
+    ];
+    for (component, p) in &cases {
+        init(&svc, component, p.clone()).await;
+    }
+    svc.shutdown().await;
+    drop(svc);
+    let persisted = StateDir::new(dir.path()).load().unwrap();
+    let empty = persisted.iter().find(|p| p.component == "empty").unwrap();
+    assert_eq!(
+        empty.properties.get("warmupCommand").map(String::as_str),
+        Some("")
+    );
+    let absent = persisted.iter().find(|p| p.component == "absent").unwrap();
+    assert!(!absent.properties.contains_key("warmupCommand"));
+
+    let (fake, svc) = service(dir.path());
+    fake.record_execs();
+    assert_eq!(svc.restore_persisted(), 3);
+    for (component, want) in [
+        ("absent", vec!["true"]),
+        ("empty", vec![]),
+        ("custom", vec!["echo", "warm"]),
+    ] {
+        let pool = svc.pool(component).unwrap();
+        assert_eq!(pool.config().warmup_command, want, "{component}");
+        wait_ready(&svc, component).await;
+        let vm = fake
+            .vms()
+            .into_iter()
+            .find(|vm| vm.starts_with(pool.prefix()))
+            .unwrap();
+        let argvs: Vec<Vec<String>> = fake
+            .execs_on(&vm)
+            .into_iter()
+            .map(|s| std::iter::once(s.command).chain(s.args).collect())
+            .collect();
+        let expected: Vec<Vec<String>> = if want.is_empty() {
+            vec![]
+        } else {
+            vec![want.iter().map(|w| w.to_string()).collect()]
+        };
+        assert_eq!(argvs, expected, "{component}");
+    }
+    svc.shutdown().await;
+}
+
 #[tokio::test]
 async fn restore_skips_bad_files() {
     let tmp = tempfile::tempdir().unwrap();

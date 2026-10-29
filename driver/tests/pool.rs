@@ -2,10 +2,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use dapr_sandbox_microvm::backend::VmBackend;
 use dapr_sandbox_microvm::backend::fake::FakeBackend;
+use dapr_sandbox_microvm::backend::{BackendError, ExecResult, ExecSpec, VmBackend};
 use dapr_sandbox_microvm::config::Config;
 use dapr_sandbox_microvm::pool::{
     AcquirePath, Pool, PoolError, PoolOptions, template_name, vm_name, vm_prefix,
@@ -596,4 +597,298 @@ async fn names_are_valid() {
     assert_eq!(vm_name("comp", 7), "dsb-f562267f-000007");
     assert_eq!(vm_prefix("comp"), "dsb-f562267f-");
     assert_eq!(template_name("comp"), "dsb-f562267f");
+}
+
+// Warm-up (`warmupCommand`): every VM the refill path adds to the warm pool
+// has run the warm-up exactly once; inline spawns skip it.
+
+/// The VM's execs, as argv.
+fn argvs(fake: &FakeBackend, vm: &str) -> Vec<Vec<String>> {
+    fake.execs_on(vm)
+        .into_iter()
+        .map(|s: ExecSpec| std::iter::once(s.command).chain(s.args).collect())
+        .collect()
+}
+
+fn argv(words: &[&str]) -> Vec<String> {
+    words.iter().map(|w| w.to_string()).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refilled_vms_are_warmed_up_once_before_handout() {
+    let fake = Arc::new(FakeBackend::new());
+    fake.record_execs();
+    fake.pause_execs();
+    let p = pool(
+        &fake,
+        "comp",
+        &[("warmPoolSize", "2"), ("warmupCommand", " echo warm\tup ")],
+    );
+    p.start();
+    // Both VMs spawned, both warm-ups blocked: neither can be handed out.
+    eventually("two warm-ups started", || fake.execs().len() == 2).await;
+    let warming: Vec<String> = fake.execs().into_iter().map(|(vm, _)| vm).collect();
+    assert_eq!(fake.spawned().len(), 2);
+    assert_eq!(p.stats().warm, 0);
+    let inline = p.acquire().await.unwrap();
+    assert_eq!(inline.path, AcquirePath::Restore);
+    assert!(!warming.contains(&inline.instance_id));
+
+    fake.resume_execs();
+    eventually("ready", || p.ready().0).await;
+    for vm in &warming {
+        assert_eq!(
+            argvs(&fake, vm),
+            vec![argv(&["echo", "warm", "up"])],
+            "{vm}"
+        );
+        // Bounded, and nothing else in the spec.
+        let spec = &fake.execs_on(vm)[0];
+        assert!(spec.timeout_ms > 0, "{spec:?}");
+        assert!(spec.env.is_empty() && spec.cwd.is_empty() && spec.stdin.is_empty());
+    }
+    // A pool hit hands out a warmed VM; the inline VM ran no warm-up.
+    let hit = p.acquire().await.unwrap();
+    assert_eq!(hit.path, AcquirePath::Pool);
+    assert!(warming.contains(&hit.instance_id));
+    assert!(fake.execs_on(&inline.instance_id).is_empty());
+    p.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_warmup_is_true() {
+    let fake = Arc::new(FakeBackend::new());
+    fake.record_execs();
+    fake.set_exec_delay(Duration::from_millis(20));
+    let p = started(&fake, "comp", &[("warmPoolSize", "3")]).await;
+    let warm = fake.vms();
+    assert_eq!(warm.len(), 3);
+    for vm in &warm {
+        assert_eq!(argvs(&fake, vm), vec![argv(&["true"])], "{vm}");
+    }
+    let s = p.stats();
+    assert_eq!((s.warm, s.warmups, s.warmup_failures), (3, 3, 0));
+    assert!(s.warmup_max >= Duration::from_millis(20), "{s:?}");
+    assert!(s.warmup_total >= 3 * Duration::from_millis(20), "{s:?}");
+    assert!(s.warmup_total >= s.warmup_max, "{s:?}");
+
+    // Every refill is warmed up too.
+    fake.set_exec_delay(Duration::ZERO);
+    p.acquire().await.unwrap();
+    eventually("refilled", || p.stats().warm == 3).await;
+    assert_eq!(p.stats().warmups, 4);
+    for vm in fake.vms() {
+        assert_eq!(argvs(&fake, &vm), vec![argv(&["true"])], "{vm}");
+    }
+    p.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inline_spawns_skip_the_warmup() {
+    for template in ["snapshot", "none"] {
+        let fake = Arc::new(FakeBackend::new());
+        fake.record_execs();
+        let p = started(
+            &fake,
+            "comp",
+            &[("warmPoolSize", "0"), ("template", template)],
+        )
+        .await;
+        let a = p.acquire().await.unwrap();
+        assert_ne!(a.path, AcquirePath::Pool);
+        assert!(fake.execs().is_empty(), "{template}: {:?}", fake.execs());
+        assert_eq!(p.stats().warmups, 0);
+        p.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn empty_warmup_command_disables_it() {
+    for v in ["", " \t "] {
+        let fake = Arc::new(FakeBackend::new());
+        fake.record_execs();
+        let p = started(
+            &fake,
+            "comp",
+            &[("warmPoolSize", "2"), ("warmupCommand", v)],
+        )
+        .await;
+        assert_eq!(p.stats().warm, 2);
+        assert_eq!(p.acquire().await.unwrap().path, AcquirePath::Pool);
+        eventually("refilled", || p.stats().warm == 2).await;
+        assert!(fake.execs().is_empty(), "{v:?}: {:?}", fake.execs());
+        assert_eq!(p.stats().warmups, 0);
+        p.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ready_waits_for_warmed_vms() {
+    let fake = Arc::new(FakeBackend::new());
+    fake.record_execs();
+    fake.pause_execs();
+    let p = pool(&fake, "comp", &[("warmPoolSize", "2")]);
+    p.start();
+    eventually("both spawned and warming", || fake.execs().len() == 2).await;
+    assert_eq!(fake.spawned().len(), 2);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(p.ready(), (false, "warm pool 0/2".to_string()));
+    fake.allow_execs(1);
+    eventually("one warm", || p.stats().warm == 1).await;
+    assert_eq!(p.ready(), (false, "warm pool 1/2".to_string()));
+    fake.allow_execs(1);
+    eventually("ready", || p.ready().0).await;
+    assert_eq!(p.ready().1, "warm pool 2/2");
+    p.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_warmup_destroys_the_vm_and_is_retried() {
+    let fake = Arc::new(FakeBackend::new());
+    fake.record_execs();
+    // The first three warm-ups fail: a non-zero exit, a backend error, a
+    // timeout; later ones succeed.
+    let calls = Arc::new(AtomicU32::new(0));
+    let c = calls.clone();
+    fake.set_exec_handler(Arc::new(move |_, _| {
+        match c.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(ExecResult {
+                exit_code: 1,
+                stderr: b"boom\n".to_vec(),
+                ..Default::default()
+            }),
+            1 => Err(BackendError::Internal("agent went away".into())),
+            2 => Ok(ExecResult {
+                exit_code: -1,
+                timed_out: true,
+                ..Default::default()
+            }),
+            _ => Ok(ExecResult::default()),
+        }
+    }));
+    let p = pool(
+        &fake,
+        "comp",
+        &[("warmPoolSize", "2"), ("refillConcurrency", "1")],
+    );
+    let start = Instant::now();
+    p.start();
+    eventually("the failure is reported", || {
+        let (ready, reason) = p.ready();
+        !ready && reason.contains("last spawn failed: warm-up")
+    })
+    .await;
+    eventually("ready after retries", || p.ready().0).await;
+    // Counted as failed refills: the usual backoff, 100 + 200 + 400 ms.
+    assert!(
+        start.elapsed() >= Duration::from_millis(700),
+        "{:?}",
+        start.elapsed()
+    );
+
+    let spawned: Vec<String> = fake.spawned().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(spawned.len(), 5, "{spawned:?}");
+    // Each VM whose warm-up failed was destroyed; only warmed VMs are left.
+    assert_eq!(fake.destroyed(), spawned[..3]);
+    assert_eq!(fake.vms(), spawned[3..]);
+    let s = p.stats();
+    assert_eq!((s.warm, s.warmups, s.warmup_failures), (2, 2, 3));
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    p.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn warmup_timeout_fails_the_refill() {
+    let fake = Arc::new(FakeBackend::new());
+    fake.record_execs();
+    let opts = PoolOptions {
+        warmup_timeout: Duration::from_millis(50),
+        ..Default::default()
+    };
+    // The backend hangs, ignoring the spec's timeout.
+    fake.set_exec_delay(Duration::from_secs(30));
+    let p = pool_with(
+        &fake,
+        "comp",
+        &[("warmPoolSize", "1"), ("refillConcurrency", "1")],
+        opts,
+    );
+    p.start();
+    eventually("the timeout is reported", || {
+        p.ready().1.contains("timed out")
+    })
+    .await;
+    let first = fake.spawned()[0].0.clone();
+    eventually("its VM destroyed", || fake.destroyed().contains(&first)).await;
+    assert!(p.stats().warmup_failures >= 1);
+    // The spec carries the bound too, for a backend that honours it.
+    assert_eq!(fake.execs()[0].1.timeout_ms, 50);
+
+    fake.set_exec_delay(Duration::ZERO);
+    eventually("ready", || p.ready().0).await;
+    assert_eq!(fake.vms().len(), 1);
+    assert!(!fake.vms().contains(&first));
+    p.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_during_warmup_leaks_nothing() {
+    let fake = Arc::new(FakeBackend::new());
+    fake.record_execs();
+    fake.pause_execs();
+    let p = pool(&fake, "comp", &[("warmPoolSize", "2")]);
+    p.start();
+    eventually("warming", || fake.execs().len() == 2).await;
+    let start = Instant::now();
+    p.shutdown().await;
+    // The warm-ups are abandoned, not waited for (the bound is 20 s).
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(fake.vms().is_empty(), "left behind: {:?}", fake.vms());
+    assert_eq!(fake.destroyed().len(), 2);
+    assert_eq!(p.stats().warmups, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_inline_vm_is_warmed_before_it_joins_the_pool() {
+    let fake = Arc::new(FakeBackend::new());
+    fake.record_execs();
+    let p = started(
+        &fake,
+        "comp",
+        &[("warmPoolSize", "0"), ("maxSandboxesPerHost", "1")],
+    )
+    .await;
+    fake.set_spawn_delay(Duration::from_millis(100));
+    // The caller gives up while the VM is being created: the VM is kept for
+    // the pool, and so warmed up first, like a refill.
+    let r = tokio::time::timeout(Duration::from_millis(20), p.acquire()).await;
+    assert!(r.is_err());
+    eventually("vm kept warm", || p.stats().warm == 1).await;
+    let vm = fake.vms()[0].clone();
+    assert_eq!(argvs(&fake, &vm), vec![argv(&["true"])]);
+    let a = p.acquire().await.unwrap();
+    assert_eq!(
+        (a.path, a.instance_id.as_str()),
+        (AcquirePath::Pool, vm.as_str())
+    );
+    p.release(&a.instance_id).unwrap();
+
+    // If that warm-up fails, the VM is destroyed instead.
+    fake.set_exec_handler(Arc::new(|_, _| {
+        Ok(ExecResult {
+            exit_code: 1,
+            ..Default::default()
+        })
+    }));
+    let r = tokio::time::timeout(Duration::from_millis(20), p.acquire()).await;
+    assert!(r.is_err());
+    eventually("failure counted", || p.stats().warmup_failures == 1).await;
+    let s = p.stats();
+    assert_eq!((s.warm, s.live, s.inline), (0, 0, 0));
+    eventually("vm destroyed", || fake.vms().is_empty()).await;
+    p.shutdown().await;
 }

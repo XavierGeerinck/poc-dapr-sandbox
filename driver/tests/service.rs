@@ -229,6 +229,67 @@ async fn two_components_get_separate_pools() {
     h.stop().await;
 }
 
+/// `warmupCommand` from Init: each warm VM ran it once before handout;
+/// empty disables it. A warm-up that keeps failing leaves the component
+/// not ready, with the reason, and Acquire still works (on demand, no
+/// warm-up, never FAILED_PRECONDITION).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn init_warmup_command() {
+    let mut h = Harness::new().await;
+    h.fake.record_execs();
+    h.init(
+        "a",
+        &[("warmPoolSize", "2"), ("warmupCommand", "echo warm")],
+    )
+    .await;
+    h.init("b", &[("warmPoolSize", "2"), ("warmupCommand", "")])
+        .await;
+    h.wait_ready("a").await;
+    h.wait_ready("b").await;
+    for vm in h.fake.vms() {
+        let execs = h.fake.execs_on(&vm);
+        if vm.starts_with(&vm_prefix("a")) {
+            assert_eq!(execs.len(), 1, "{vm}: {execs:?}");
+            assert_eq!(
+                (execs[0].command.as_str(), &execs[0].args[..]),
+                ("echo", &["warm".to_string()][..])
+            );
+        } else {
+            assert!(execs.is_empty(), "{vm}: {execs:?}");
+        }
+    }
+    // The caller's exec is the VM's second.
+    let a = h.acquire("a").await.unwrap();
+    assert_eq!(a.path, SandboxAcquirePath::Pool as i32);
+    h.exec("a", &a.instance_id, cmd("echo", &["hi"]))
+        .await
+        .unwrap();
+    assert_eq!(h.fake.execs_on(&a.instance_id).len(), 2);
+
+    // A warm-up that cannot succeed: never ready, and the reason says why.
+    h.init("c", &[("warmPoolSize", "1"), ("warmupCommand", "false")])
+        .await;
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let r = h.ready("c").await;
+        assert!(!r.ready, "{}", r.reason);
+        if r.reason.contains("warm-up") {
+            assert!(r.reason.contains("exited with 1"), "{}", r.reason);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no warm-up failure: {}",
+            r.reason
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let c = h.acquire("c").await.unwrap();
+    assert_eq!(c.path, SandboxAcquirePath::Restore as i32);
+    assert!(h.fake.execs_on(&c.instance_id).is_empty());
+    h.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_unknown_instance_is_not_found() {
     let mut h = Harness::new().await;

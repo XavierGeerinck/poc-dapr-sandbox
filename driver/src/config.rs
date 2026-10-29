@@ -4,6 +4,11 @@
 //! daprd parses the same properties with the Go parser before it calls the
 //! driver's `Init`, so this parser must accept everything the Go one accepts
 //! and reject the same inputs.
+//!
+//! One key is the driver's own: `warmupCommand` (see
+//! [`Config::warmup_command`]). The Go parser ignores keys it does not know,
+//! and daprd passes every metadata item to `Init`, an empty value included,
+//! so an absent key and an empty one differ. Any value parses.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -32,7 +37,28 @@ pub struct Config {
     /// not the driver, enforces the idle timeout.
     pub idle_timeout: Duration,
     pub template: Template,
+    /// `warmupCommand`: the argv the pool runs once in each VM it refills
+    /// the warm pool with, after spawning it and before handing it out; a
+    /// VM whose warm-up fails is destroyed and replaced. Empty disables the
+    /// warm-up. See the pool's module docs (`pool`, "Warm-up") for what it
+    /// does and does not save.
+    ///
+    /// The value is split on whitespace into argv, which maps onto
+    /// `ExecSpec { command: argv[0], args: argv[1..] }` with no shell, no
+    /// quoting and no expansion: the default `true` runs the image's `true`
+    /// directly, without a shell. A value of only whitespace splits to
+    /// nothing and also disables it. Work that needs a shell belongs in
+    /// `setup`. The command must exist in the image and exit 0 within the
+    /// pool's warm-up timeout (30 s by default); otherwise every refill
+    /// fails and the pool never becomes ready, so an image without `true`
+    /// needs another command or an empty value.
+    ///
+    /// Absent: [`DEFAULT_WARMUP_COMMAND`]. Explicitly empty: disabled.
+    pub warmup_command: Vec<String>,
 }
+
+/// The `warmupCommand` when the key is absent: a no-op.
+pub const DEFAULT_WARMUP_COMMAND: &str = "true";
 
 /// A metadata error. The messages match the Go ones.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -63,6 +89,13 @@ impl Config {
             refill_concurrency: 2,
             idle_timeout: Duration::from_secs(5 * 60),
             template: Template::Snapshot,
+            // Absent and empty differ here, unlike the Go keys.
+            warmup_command: props
+                .get("warmupCommand")
+                .map_or(DEFAULT_WARMUP_COMMAND, String::as_str)
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
         };
         if c.image.is_empty() {
             return Err(ConfigError::MissingImage);
@@ -294,7 +327,31 @@ mod tests {
                 refill_concurrency: 2,
                 idle_timeout: Duration::from_secs(300),
                 template: Template::Snapshot,
+                warmup_command: vec!["true".to_string()],
             }
+        );
+    }
+
+    #[test]
+    fn warmup_command() {
+        let argv = |v: &str| {
+            Config::from_properties(&props(&[("image", "x"), ("warmupCommand", v)]))
+                .unwrap()
+                .warmup_command
+        };
+        // Absent: `true`, run as argv ["true"].
+        let c = Config::from_properties(&props(&[("image", "x")])).unwrap();
+        assert_eq!(c.warmup_command, vec!["true"]);
+        // Explicitly empty, or only whitespace: disabled.
+        assert!(argv("").is_empty());
+        assert!(argv(" \t\n ").is_empty());
+        // Split on whitespace into argv; no shell, no quoting.
+        assert_eq!(argv("true"), vec!["true"]);
+        assert_eq!(argv("  echo  warm\tup \n"), vec!["echo", "warm", "up"]);
+        assert_eq!(
+            argv(r#"sh -c "true""#),
+            vec!["sh", "-c", r#""true""#],
+            "quotes are not interpreted"
         );
     }
 
